@@ -1,0 +1,50 @@
+// core/index.ts — 公开 API 入口（全量收口，01 原则10 不豁免）
+// 组件经 index.ts 聚合导出（UnifiedMap / AppLayout / GCSPanel 等），消费方一律走 @/core，禁止深路径穿透。
+// renderers 内部实现（P8 后 CesiumRenderer 单文件，无拆分辅助文件）不 re-export
+// renderers 里**只有工厂与预载**经入口对外（createRenderer / preloadCesium，见文件末尾的
+// export 段）；实现类 OLRenderer / CesiumRenderer 不对外。
+export * from './config'
+export * from './layout/navConfig'
+export * from './layout/routeReadiness'
+export * from './layout/taskIndicator'
+export * from './layout/useMobileDrawer'
+export * from './layout/useSliderFocus'
+export * from './layout/useStackablePanels'
+export * from './map/BusinessLayerManager'
+export * from './map/composables/useBoundaryLayer'
+export * from './map/composables/useBusinessLayers'
+export * from './map/composables/useMapControls'
+export * from './map/composables/useOwnedLayers'
+export * from './map/composables/usePortLayer'
+export * from './map/layerAdapters'
+export * from './map/renderers/MapRenderer'
+// 3D Tiles 分组派生（通用能力，零业务语义）：按谓词从瓦片集裁子树 + uri 绝对化 + Data URI。
+// 业务分组定义由调用方（business）提供，见 business/route-analysis/constants/pingluTiles.ts
+export * from './map/tiles3dGroups'
+export * from './map/ir/LayerIR'
+export * from './provideKeys'
+// Q4 收口：渲染器工厂/预载经入口对外（App.vue 使用；OLRenderer/CesiumRenderer 实现类不对外）
+export { createRenderer, preloadCesium } from './map/renderers'
+// 收口：组件聚合导出（README 已述、index 补齐）
+export { default as AppLayout } from './layout/AppLayout.vue'
+export { default as BottomNavBar } from './layout/components/BottomNavBar.vue'
+export { default as GCSButton } from './layout/components/GCSButton.vue'
+export { default as GCSPanel } from './layout/components/GCSPanel.vue'
+export { default as MobileDrawer } from './layout/components/MobileDrawer.vue'
+export { default as NavButton } from './layout/components/NavButton.vue'
+// v4 任务体系（S5/S6）：投递区 / 进度环 / 可拖面板包装
+// 🔴 2026-09-19 语义修正后删除：
+//    · TaskDockHost + TaskCard —— 后台任务浮层卡片（用户否定：不另造承载物）
+//    · TaskPlaceholder —— 原位占位条（用户澄清：面板不消失，拖走的是任务优先级）
+//    任务状态一律由导航按钮上「绕按钮一圈」的进度环表达。
+export { default as TaskDropZone } from './layout/components/TaskDropZone.vue'
+export { default as TaskResultChip } from './layout/components/TaskResultChip.vue'
+export { default as TaskDock } from './layout/components/TaskDock.vue'
+export type { TaskDockCard } from './layout/components/TaskDock.vue'
+export { default as TaskPanelSlot } from './layout/components/TaskPanelSlot.vue'
+export { default as StackSlot } from './layout/components/StackSlot.vue'
+export { default as TaskProgressRing } from './layout/components/TaskProgressRing.vue'
+export { default as LayerControlPanel } from './map/components/LayerControlPanel.vue'
+export { default as UnifiedMap } from './map/UnifiedMap.vue'
+// DEV 调试层（DebugToggle / GCSDebugOverlay）已于 2026-10-26 删除：二者仅
+// `import.meta.env.DEV` 下动态挂载、生产构建本就被 tree-shake，且无业务消费方。

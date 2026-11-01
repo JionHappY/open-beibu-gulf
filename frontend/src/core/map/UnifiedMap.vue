@@ -1,0 +1,898 @@
+<script setup lang="ts">
+// 统一地图容器：OL/Cesium双引擎，v-show切换，渲染器实例复用不销毁
+import type { Feature, FeatureCollection, Point } from 'geojson'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
+
+import MapFacilityBubble from '@/core/map/components/MapFacilityBubble.vue'
+import MapFeatureBubble from '@/core/map/components/MapFeatureBubble.vue'
+import { BOUNDARY_STYLE, loadBoundaryGeoJson } from '@/core/map/composables/useBoundaryLayer'
+import { useBusinessLayers } from '@/core/map/composables/useBusinessLayers'
+import { buildPortGeoJson, loadPorts, PORT_STYLE } from '@/core/map/composables/usePortLayer'
+import { createRenderer } from '@/core/map/renderers'
+import type { MapRenderer } from '@/core/map/renderers/MapRenderer'
+import { CELL_PIXEL } from '@/shared'
+import { LAYER_KEYS } from '@/shared'
+import { useGCS } from '@/shared'
+import { logger } from '@/shared'
+import { useMapStore } from '@/stores'
+import type {
+  FlyToOptions,
+  FlyToTarget,
+  GeoPoint,
+  MapRendererEventMap,
+  PointFeature,
+  Port,
+  RendererState,
+} from '@/types'
+
+const { cell8px } = useGCS()
+
+interface Props {
+  mapType?: '2d' | '3d'
+}
+const props = withDefaults(defineProps<Props>(), {
+  mapType: '2d',
+})
+
+// 两个容器引用（OL始终存在，Cesium首次创建后保留）
+const olContainerRef = ref<HTMLElement | null>(null)
+const cesiumContainerRef = ref<HTMLElement | null>(null)
+
+const loading = ref(true)
+const switching = ref(false)
+const pendingSwitchType = ref<'2d' | '3d' | null>(null)
+const loadError = ref('')
+const boundaryWarning = ref('')
+// 港口数据为空（接口 fulfilled 但 0 条）时，港口图层不注册——若无提示，
+// 用户看到的是「图层开关在哪、图上看不到点」，无从判断是没数据还是坏了
+const portEmptyWarning = ref('')
+// 渲染器实例必须 shallowRef：深度 ref 会把 OL Map/Cesium Viewer 包成 reactive Proxy，
+// 引擎内部身份比较（getSource()===、事件 target）与拖拽帧性能都被 proxy/raw 双身份破坏；
+// store 层（mapStore）同用 shallowRef，全系统渲染器保持 raw 单一身份
+const currentRenderer = shallowRef<MapRenderer | null>(null)
+const mapStore = useMapStore()
+const olRenderer = shallowRef<MapRenderer | null>(null)
+const cesiumRenderer = shallowRef<MapRenderer | null>(null)
+const cesiumInitialized = ref(false)
+
+// ── 要素气泡（2D）：悬浮即显移开即隐，点击钉住并随 POI 跟随；同一时刻仅一个 ──
+const bubblePinned = ref<Port | null>(null)
+const bubbleHover = ref<Port | null>(null)
+const bubbleAnchor = ref<[number, number] | null>(null)
+const bubbleHostRef = ref<HTMLElement | null>(null)
+const bubblePort = computed<Port | null>(() => bubblePinned.value ?? bubbleHover.value)
+
+// 附近设施气泡（2D）：只走点击通道（无 hover），与港口气泡共用同一宿主——
+// 全图永远最多一个气泡，点其他要素即切换、点空白即关闭
+interface FacilityBubbleData {
+  id?: string
+  name: string
+  poiType: string
+  lng: number
+  lat: number
+}
+const bubbleFacilityPinned = ref<FacilityBubbleData | null>(null)
+const bubbleVisible = computed(
+  () => bubblePort.value !== null || bubbleFacilityPinned.value !== null
+)
+
+// 显隐/锚点同步给渲染器 Overlay（OL 随地图移动自动跟随；3D 无此能力，可选链跳过）
+watch([bubbleVisible, bubbleAnchor], ([visible, anchor]) => {
+  currentRenderer.value?.setBubbleAnchor?.(visible ? anchor : null)
+})
+
+function closeBubble(): void {
+  bubblePinned.value = null
+  bubbleHover.value = null
+  bubbleFacilityPinned.value = null
+}
+
+/**
+ * 指针离开地图容器：只清「未钉住」的悬浮气泡。
+ * 悬浮通道的唯一事件源是 pointermove（OLRenderer 只在移动时 emit hover），
+ * 指针直接移出容器后不再有事件，bubbleHover 会停在最后一个港口且悬浮态无关闭钮；
+ * 已钉住的港口/设施气泡是用户显式固定，离开地图不等于关闭它，必须保留。
+ */
+function handleMapPointerLeave(): void {
+  if (bubblePinned.value || bubbleFacilityPinned.value) return
+  bubbleHover.value = null
+}
+
+// mapStore 已由 App.vue 统一 provide，此处不重复
+
+// 底图注册走 mapStore.registerBaseLayer（互斥切换由 setBaseLayer + baseLayerKey 管理）；
+// 核心常驻层（boundary/ports）收口到业务图层管理器（BLM），与业务图层统一管理
+const { manager: businessLayerManager } = useBusinessLayers()
+
+const spinnerSizeCss = computed(() => `${Math.round(CELL_PIXEL * 0.5)}px`)
+
+/** 遮罩文案：3D 未就绪时明确说在加载 3D（首进空白窗口必须可见） */
+const mapLoadingLabel = computed(() => {
+  const t = currentRenderer.value?.getType()
+  if (props.mapType === '3d' && t !== '3d') return '正在加载 3D 场景…'
+  return switching.value ? '切换视图中...' : '地图加载中...'
+})
+
+let portGeoJson: FeatureCollection | null = null
+let boundaryGeoJson: FeatureCollection | null = null
+
+const LOAD_TIMEOUT_MS = 10000
+
+/** 组件级 abort：卸载后阻止异步回调继续写 ref（仅卸载/切换时 abort，超时不得全局 abort——
+ *  曾因 withTimeout 超时误 abort 导致后续加载全部静默失效且错误提示被吞） */
+const loadAbort = new AbortController()
+
+/**
+ * 初始引擎构建过程（onMounted 的 loadData → initRenderer）：
+ * 路由在窗口内切到 3D 时，switchMapType 必须等它落地再判/再切，避免
+ * ① 与其并发二次 initRenderer；② 用 store 值当"已有该引擎"而提前跳过切换（首进竞态根因）。
+ */
+let initialInit: Promise<void> | null = null
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout>
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(errorMessage))
+    }, timeoutMs)
+  })
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId))
+}
+
+/** 错误归一化：非 Error 的抛出值（字符串/对象/null）统一包成 Error，保证 .message 可读 */
+function toError(reason: unknown): Error {
+  return reason instanceof Error ? reason : new Error(String(reason))
+}
+
+// v-show切换后浏览器未必完成layout，用rAF等待容器有实际尺寸再初始化渲染器
+// rafIds 收集器供 onUnmounted 取消，防止组件卸载后回调仍执行
+const _pendingRafIds = new Set<number>()
+
+function waitForContainerVisible(container: HTMLElement | null): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (container && container.offsetWidth > 0 && container.offsetHeight > 0) {
+      resolve()
+      return
+    }
+    let attempts = 0
+    const maxAttempts = 10
+    let currentRafId: number
+    const check = () => {
+      attempts++
+      if (container && container.offsetWidth > 0 && container.offsetHeight > 0) {
+        _pendingRafIds.delete(currentRafId)
+        resolve()
+      } else if (attempts < maxAttempts) {
+        _pendingRafIds.delete(currentRafId)
+        currentRafId = requestAnimationFrame(check)
+        _pendingRafIds.add(currentRafId)
+      } else {
+        _pendingRafIds.delete(currentRafId)
+        logger.warn('waitForContainerVisible: 容器尺寸检查超时，继续执行')
+
+        resolve()
+      }
+    }
+    currentRafId = requestAnimationFrame(check)
+    _pendingRafIds.add(currentRafId)
+  })
+}
+
+/** 数据加载：ports 与 boundary 均为前端静态文件（/data/*.json，后端无关），并行加载、独立失败——
+ *  曾串行 await 使一方失败阻断另一方加载。boundary 内部自带 3 次退避重试；
+ *  ports 走 loadStatic（TTL 缓存 + in-flight 去重，不重试）；
+ *  boundary 链路透传 loadAbort.signal——卸载即取消 fetch/跳过续试，
+ *  结果消费前仍由 aborted 守卫拦截 */
+async function loadData() {
+  const [portsResult, boundaryResult] = await Promise.allSettled([
+    withTimeout(loadPorts(loadAbort.signal), LOAD_TIMEOUT_MS, '港口数据加载超时'),
+    withTimeout(
+      loadBoundaryGeoJson((msg: string) => {
+        boundaryWarning.value = msg
+      }, loadAbort.signal),
+      LOAD_TIMEOUT_MS,
+      '边界数据加载超时'
+    ),
+  ])
+  if (loadAbort.signal.aborted) return
+
+  if (portsResult.status === 'fulfilled') {
+    portGeoJson = buildPortGeoJson(portsResult.value) as FeatureCollection
+    if (portsResult.value.length === 0) {
+      portEmptyWarning.value = '港口数据为空：未获取到任何港口，港口位置图层未显示'
+    }
+  } else {
+    const err = toError(portsResult.reason)
+    logger.error('港口数据加载失败:', err)
+
+    loadError.value = err.message.includes('超时') ? err.message : '港口图层加载失败，请刷新重试'
+  }
+
+  if (boundaryResult.status === 'fulfilled' && boundaryResult.value) {
+    boundaryGeoJson = boundaryResult.value
+  } else if (boundaryResult.status === 'rejected') {
+    const err = toError(boundaryResult.reason)
+    logger.error('边界数据加载失败:', err)
+
+    loadError.value = err.message.includes('超时') ? err.message : '行政区划图层加载失败'
+  }
+
+  // 数据就绪后补一次 setupLayers：boundary/ports 注册依赖数据已加载，
+  // 若路由/引擎切换先于 loadData 执行会跳过注册导致图层缺失；补注册幂等
+  if (currentRenderer.value) {
+    void nextTick(() => setupLayers())
+  }
+}
+
+/**
+ * 重绘业务图层，并把"未上屏"清单汇总留痕（a029）。
+ * BLM 逐层跳过只写 logger.debug（dev-only），生产侧一条痕迹都没有——引擎切换后
+ * 到底哪些图层没挂上，必须留得下可聚合的 warn；面板另经 isNotMounted 标灰提示。
+ */
+function reapplyBusinessLayers(renderer: MapRenderer): void {
+  const notMounted = businessLayerManager.reapplyAll(renderer)
+  if (notMounted.length > 0) {
+    logger.warn(
+      `[UnifiedMap] 有 ${notMounted.length} 个图层未上屏（图层面板已标灰）: ${notMounted
+        .map((l) => l.key)
+        .join(', ')}`
+    )
+  }
+}
+
+/** 初始化指定类型的渲染器（首次创建或复用） */
+async function initRenderer(type: '2d' | '3d', container: HTMLElement | null) {
+  if (!container) {
+    logger.error(`initRenderer: ${type}容器为空`)
+
+    return
+  }
+
+  await waitForContainerVisible(container)
+
+  try {
+    let existingRenderer = type === '2d' ? olRenderer.value : cesiumRenderer.value
+
+    // 3D 复用前检查 viewer 是否存活：闲置超时销毁后旧渲染器实例已失效，直接复用会白屏。
+    // 不调 destroy()——viewer 已被 Cesium 销毁，destroy 内部访问 this.viewer 会抛错；
+    // 丢弃引用交给 GC 即可
+    if (existingRenderer && type === '3d') {
+      const { cesiumViewerManager } = await import('@/core/map/renderers/CesiumRenderer')
+      if (!cesiumViewerManager.getInstance()) {
+        existingRenderer = null
+        cesiumRenderer.value = null
+      }
+    }
+
+    if (existingRenderer) {
+      // 复用已有渲染器
+      currentRenderer.value = existingRenderer
+
+      if (type === '3d') {
+        const { cesiumViewerManager } = await import('@/core/map/renderers/CesiumRenderer')
+        cesiumViewerManager.mount(container)
+      }
+
+      existingRenderer.updateSize()
+      // 顺序关键：先 setCurrentRenderer（setupLayers 的底图重放依赖 mapStore.currentRenderer），
+      // 再 setupLayers（含底图重放），最后 reapplyAll 重建业务图层——顺序反了面板与屏幕脱节
+      mapStore.setCurrentRenderer(existingRenderer)
+      setupLayers()
+      reapplyBusinessLayers(existingRenderer)
+    } else {
+      const renderer = await createRenderer(type, container)
+
+      if (type === '2d') {
+        olRenderer.value = renderer
+      } else {
+        cesiumRenderer.value = renderer
+      }
+
+      currentRenderer.value = renderer
+      // 顺序关键：setCurrentRenderer 必须先于 setupLayers（底图重放读 mapStore.currentRenderer），
+      // 否则首次进引擎时底图指令发射给 null/旧实例，屏幕保持默认底图而面板显示新选择
+      mapStore.setCurrentRenderer(renderer)
+      renderer.updateSize()
+      setupLayers()
+      setupEvents()
+      // 气泡宿主挂给 OL Overlay（元素由本组件模板提供；3D 渲染器无此能力跳过）
+      if (type === '2d' && bubbleHostRef.value) {
+        renderer.attachBubbleElement?.(bubbleHostRef.value)
+      }
+      reapplyBusinessLayers(renderer)
+    }
+  } catch (error) {
+    const err = toError(error)
+    logger.error(`Renderer ${type} 初始化失败:`, err)
+
+    loadError.value = err.message || '地图初始化失败'
+    // 上抛给 switchMapType 统一回滚（mapType + currentRenderer）；吞错会导致
+    // UI 已切新引擎但渲染器仍是旧实例的撕裂态
+    throw err
+  }
+}
+
+// 每次切换引擎时重建图层目录（绑定当前渲染器实例）
+
+function setupLayers() {
+  const renderer = currentRenderer.value
+  if (!renderer) return
+  // 先清空图层目录，再按当前引擎重建
+  mapStore.clearLayerCatalog()
+
+  // 底图条目仅建目录（互斥切换由 setBaseLayer + baseLayerKey 管理）
+  mapStore.registerBaseLayer(LAYER_KEYS.baseImage, '影像底图')
+  mapStore.registerBaseLayer(LAYER_KEYS.baseVector, '矢量底图')
+
+  // 底图初始化：统一经 mapStore.setBaseLayer 写回权威键并驱动渲染器——
+  // 直接 setBaseLayer 给渲染器而不写回 store，会让图层控制面板的互斥判定
+  // 全部落空（baseLayerKey 为 null 时两个底图按钮都不亮）
+  mapStore.setBaseLayer(mapStore.baseLayerKey ?? LAYER_KEYS.baseImage)
+
+  // 核心常驻层（boundary/ports）走业务图层管理器统一注册；
+  // 引擎切换时 registry 持久、此处注册幂等跳过，由 reapplyAll 重绘到新渲染器
+  logger.debug(
+    `[UnifiedMap] setupLayers: boundaryGeoJson=${!!boundaryGeoJson} hasBoundary=${businessLayerManager.has(LAYER_KEYS.boundary)} portGeoJson=${!!portGeoJson} hasPorts=${businessLayerManager.has(LAYER_KEYS.ports)}`
+  )
+  if (boundaryGeoJson && !businessLayerManager.has(LAYER_KEYS.boundary)) {
+    businessLayerManager.register(LAYER_KEYS.boundary, {
+      label: '行政区划',
+      layerType: 'geojson',
+      data: boundaryGeoJson,
+      options: BOUNDARY_STYLE,
+    })
+  }
+
+  if (portGeoJson && !businessLayerManager.has(LAYER_KEYS.ports)) {
+    const validFeatures = (portGeoJson.features as Feature<Point>[]).filter((f) => {
+      if (!f?.geometry?.coordinates) return false
+      if (!Array.isArray(f.geometry.coordinates) || f.geometry.coordinates.length < 2) return false
+      const [lng, lat] = f.geometry.coordinates
+      return !(lng === 0 && lat === 0)
+    })
+    if (validFeatures.length > 0) {
+      const portFeatures: PointFeature[] = validFeatures
+        .map((f) => ({
+          ...f.properties,
+          lng: f.geometry.coordinates[0],
+          lat: f.geometry.coordinates[1],
+        }))
+        .filter(Boolean) as PointFeature[]
+      businessLayerManager.register(LAYER_KEYS.ports, {
+        label: '港口位置',
+        layerType: 'points',
+        data: portFeatures,
+        options: PORT_STYLE,
+      })
+    }
+  }
+
+  // 真地形（3D Only）：作为**可选图层**注册进图层面板，默认关。
+  // 用户实测真地形与 3D Tiles 同时开启时模型落位错乱，二者互斥（见 BLM 互斥处理）。
+  // registry 持久、此处幂等跳过；2D 引擎无该能力，adapter 的引擎面会跳过。
+  if (!businessLayerManager.has(LAYER_KEYS.terrain)) {
+    businessLayerManager.register(LAYER_KEYS.terrain, {
+      label: '3D 真地形',
+      layerType: 'terrain',
+      data: {},
+      visible: false,
+    })
+  }
+}
+
+// 类型谓词替代双重断言——featureType==='port' 时 data 应为港口属性，
+// 谓词做运行期最小形状校验（判别来源：usePortLayer properties = {...port, featureType}）
+function isPortEventData(data: unknown): data is Port {
+  if (!data || typeof data !== 'object') return false
+  const p = data as Record<string, unknown>
+  return (
+    typeof p.id === 'string' &&
+    typeof p.name === 'string' &&
+    typeof p.lng === 'number' &&
+    typeof p.lat === 'number'
+  )
+}
+
+// 附近设施要素校验（properties = PointFeature 数据 + featureType；id 可选——无 id 不出收藏钮）
+function isFacilityEventData(data: unknown): data is FacilityBubbleData {
+  if (!data || typeof data !== 'object') return false
+  const p = data as Record<string, unknown>
+  return (
+    typeof p.name === 'string' &&
+    typeof p.poiType === 'string' &&
+    typeof p.lng === 'number' &&
+    typeof p.lat === 'number'
+  )
+}
+
+// 具名回调，保存引用供 off 解绑（MapRenderer 事件注册/移除配对契约）
+function handleRendererClick(event: CustomEvent<MapRendererEventMap['click']>): void {
+  const { featureType, data } = event.detail
+  // 气泡是 2D Overlay 能力，3D 点击一律只走关闭分支
+  const is2D = props.mapType === '2d'
+  if (is2D && featureType === 'port' && data && isPortEventData(data)) {
+    // 气泡钉住/撤销：同 POI 再点关闭，其他 POI 切换（锚点取 POI 自身经纬度，精确跟随）
+    bubbleFacilityPinned.value = null
+    if (bubblePinned.value && bubblePinned.value.id === data.id) {
+      closeBubble()
+    } else {
+      bubblePinned.value = data
+      bubbleAnchor.value = [data.lng, data.lat]
+    }
+  } else if (
+    is2D &&
+    // 业务前缀防跨模块 featureType 冲突；与各业务域 layer composable 的
+    // NEARBY_FACILITY_LAYER_ID 同值，core 不引 business（分层铁律），此处字面同步
+    featureType === 'site-nearby-facility' &&
+    data &&
+    isFacilityEventData(data)
+  ) {
+    // 设施气泡：仅点击驱动；同点再点关闭，异点切换（与港口气泡互斥——同一时刻仅一个）
+    bubblePinned.value = null
+    bubbleHover.value = null
+    if (
+      bubbleFacilityPinned.value &&
+      data.id !== undefined &&
+      bubbleFacilityPinned.value.id === data.id
+    ) {
+      closeBubble()
+    } else {
+      bubbleFacilityPinned.value = {
+        id: typeof data.id === 'string' ? data.id : undefined,
+        name: data.name,
+        poiType: data.poiType,
+        lng: data.lng,
+        lat: data.lat,
+      }
+      bubbleAnchor.value = [data.lng, data.lat]
+    }
+  } else {
+    // 空白/非气泡要素/3D（无气泡能力）：关闭气泡
+    closeBubble()
+  }
+}
+
+/** 悬停驱动气泡：命中港口即显、移开即隐；任一气泡钉住时悬浮不打扰（含设施气泡） */
+function handleRendererHover(event: CustomEvent<MapRendererEventMap['hover']>): void {
+  if (bubblePinned.value || bubbleFacilityPinned.value) return
+  const { featureType, data } = event.detail
+  if (featureType === 'port' && data && isPortEventData(data)) {
+    bubbleHover.value = data
+    bubbleAnchor.value = [data.lng, data.lat]
+  } else {
+    bubbleHover.value = null
+  }
+}
+
+function setupEvents() {
+  const renderer = currentRenderer.value
+  if (!renderer) return
+  renderer.on('click', handleRendererClick)
+  renderer.on('hover', handleRendererHover)
+}
+
+function getContainer(type: '2d' | '3d') {
+  return type === '2d' ? olContainerRef.value : cesiumContainerRef.value
+}
+
+// 双引擎切换：v-show控制显示，渲染器实例保留复用，失败时回滚mapType
+// 重入保护：切换进行中时排队最新请求，完成后自动执行（仅保留最后一个）
+async function switchMapType(newType: '2d' | '3d') {
+  if (switching.value) {
+    pendingSwitchType.value = newType
+    return
+  }
+
+  // 🔴 判据只能用「实际渲染器类型」：currentRenderer 为空（初始引擎仍在建）时拿
+  // mapStore.mapType 当"已有该引擎"，会命中"类型相同，跳过切换"——遮罩被提前关掉、
+  // 正式初始化仍在跑（首进 3D 实测：0.62s 关遮罩、5.5s 才出 Cesium，中间地图区全空无反馈）。
+  const actualType = currentRenderer.value?.getType() ?? null
+  if (actualType === newType) {
+    logger.debug('[UnifiedMap] 实际渲染器已是目标类型，跳过切换')
+    // 同类型提前返回时清空排队请求，避免悬挂
+    pendingSwitchType.value = null
+    return
+  }
+
+  switching.value = true
+  loading.value = true
+  // 气泡是 2D Overlay 能力，引擎切换即收（3D 无跟随能力）
+  closeBubble()
+
+  let oldType: '2d' | '3d' | null = null
+
+  try {
+    // 初始引擎仍在建：等它落地；落地后若已是目标类型即完成（遮罩由 finally 统一收）。
+    if (!currentRenderer.value && initialInit) {
+      await initialInit
+    }
+
+    const currentType = currentRenderer.value?.getType() ?? null
+    if (currentType === newType) {
+      logger.debug(`[UnifiedMap] 初始引擎已成为 ${newType}，无需再切`)
+      return
+    }
+
+    // 用渲染器实际类型而非mapStore.mapType，后者可能已被route.meta.engine提前更新
+    oldType = (currentType ?? mapStore.mapType) as '2d' | '3d'
+    logger.debug(`[UnifiedMap] switchMapType: ${oldType} → ${newType}`)
+    logger.debug(
+      `[UnifiedMap] mapStore.mapType=${mapStore.mapType}, currentRenderer.type=${currentRenderer.value?.getType()}`
+    )
+
+    let cameraState: RendererState | null = null
+    if (currentRenderer.value) {
+      cameraState = currentRenderer.value.exportState()
+    }
+
+    // 3D→2D 时先停两种呼吸灯 rAF（都挂在 Cesium 渲染器上，不停止会泄漏动画循环），再 unmount Cesium
+    //（暂停渲染 + 启动闲置销毁；短时切回由 mount 取消销毁）
+    if (oldType === '3d' && newType === '2d') {
+      // 方法级可选调用：切换重入/渲染器实例瞬时未就绪时，缺方法不应抛错中断整个切换
+      // （曾在高负载并行单测下 currentRenderer 瞬时指向未就绪实例而级联回滚）
+      currentRenderer.value?.stopBreathing?.()
+      currentRenderer.value?.stopFacilityBreathing?.()
+      // 取消在途相机防抖：切走后到期只会在后台对已 unmount 的实例
+      // 空触发一次渲染，复用窗口内还可能顶撞下一次挂载的初始状态。
+      currentRenderer.value?.cancelPendingCameraDebounce?.()
+      const { cesiumViewerManager } = await import('@/core/map/renderers/CesiumRenderer')
+      cesiumViewerManager.unmount()
+    }
+
+    // mapStore.mapType 是切换的「输入事实源」：本函数由 watch(props.mapType) 触发，
+    // 进入时 store 已等于 newType。这里【绝不能】再把 newType 写回 store——
+    // 异步切换跨多个 await，期间用户/路由可能已把 store 改成更新的引擎；
+    // 旧切换收尾时回写会用过期值覆盖新意图（浸没↔航线互切掉回 2D 的根因之一）。
+    // 失败回滚由 catch 分支显式 setMapType(oldType) 处理，带两个前置（见 catch）。
+
+    if (newType === '3d' && !cesiumInitialized.value) {
+      cesiumInitialized.value = true
+      await nextTick()
+      await nextTick()
+    }
+
+    const container = getContainer(newType)
+    if (!container) {
+      throw new Error(`${newType}容器未就绪（ref绑定失败）`)
+    }
+
+    // initRenderer 内部 waitForContainerVisible 等待浏览器 layout
+    await initRenderer(newType, container)
+
+    if (cameraState && currentRenderer.value) {
+      currentRenderer.value.importState(cameraState)
+    }
+  } catch (error) {
+    const err = toError(error)
+    logger.error(`切换到 ${newType} 失败:`, err)
+
+    loadError.value = err.message || '地图切换失败'
+
+    // 初始化失败时回滚 currentRenderer 与 mapStore.mapType（含 store 悬空引用），
+    // 避免 v-show 容器与渲染器实例类型撕裂。
+    // 回滚带两个前置——
+    // ① 仅当 store 仍等于 newType（切换在飞期间没人改过意图）才写回 oldType，
+    //    否则 store 里已是更新的意图，无条件回滚会用过期值覆盖它；
+    // ② 有排队意图（pendingSwitchType 非空）时不回滚 store：finally 的补跑会以
+    //    最新意图重试，它自己的 catch 才会回滚；此处回滚会把 store 写成 oldType，
+    //    与即将补跑的目标撕裂（补跑成功后 store 与渲染器类型不一致）。
+    if (oldType !== null && oldType !== newType) {
+      const fallback = oldType === '2d' ? olRenderer.value : cesiumRenderer.value
+      if (fallback && currentRenderer.value !== fallback) {
+        currentRenderer.value = fallback
+        mapStore.setCurrentRenderer(fallback)
+      }
+      if (mapStore.mapType === newType && pendingSwitchType.value === null) {
+        mapStore.setMapType(oldType)
+      }
+    }
+  } finally {
+    switching.value = false
+    loading.value = false
+    // 处理切换期间排队的最新请求（仅保留最后一个）
+    const pending = pendingSwitchType.value
+    pendingSwitchType.value = null
+    if (pending !== null) {
+      void nextTick(() => {
+        // 补跑以排队意图为准。store 只作参考——catch 的回滚可能已把 store
+        // 写成 oldType（过期值），而 pending 是切换窗口内最后一次意图。
+        // 判据必须比对**渲染器实际类型**而非 store：早先用 `mapStore.mapType ?? pending`
+        // 时，MapType 永不为空 ⇒ 恒取 store ⇒ 失败路径上判据恒假、补跑永不触发
+        // （当时那段队列因此形同死代码）。此处已改为按渲染器实况比对，判据有效。
+        const target = pending
+        if (target !== currentRenderer.value?.getType()) {
+          void switchMapType(target)
+        }
+      })
+    }
+  }
+}
+
+function flyTo(target: FlyToTarget, options: FlyToOptions = {}) {
+  currentRenderer.value?.flyTo(target, options)
+}
+
+function getRenderer() {
+  return currentRenderer.value
+}
+
+function startBreathing(target: GeoPoint | GeoPoint[], color?: string) {
+  currentRenderer.value?.startBreathing(target, color)
+}
+
+function stopBreathing() {
+  currentRenderer.value?.stopBreathing()
+}
+
+// 监听 mapType 变化触发切换；两引擎容器常驻（v-show），渲染器实例保留复用
+watch(
+  () => props.mapType,
+  async (newType) => {
+    await switchMapType(newType)
+  }
+)
+
+// 挂 ResizeObserver 观察地图容器尺寸变化（侧栏折叠/抽屉后 canvas 失配）：
+// 窗口尺寸可能不变，只有容器级观察能捕获；v-show 切回时同样触发，顺带修复 canvas 尺寸
+let resizeObserver: ResizeObserver | null = null
+
+function watchContainerSize(container: HTMLElement | null): void {
+  // 防御：环境不支持 ResizeObserver（jsdom/老浏览器）时静默跳过，避免反复重试报错
+  if (!container || typeof ResizeObserver === 'undefined') return
+  // 同一个 ResizeObserver 观察 OL + Cesium 两个常驻容器。
+  // 旧实现「resizeObserver 已存在就 return」只会观察到首个（OL）容器，
+  // Cesium 容器 v-show 由 none→block 的尺寸变化无人监听，Viewer 在 0×0 创建后
+  // 不会自动 resize，表现为黑屏/无底图直到手动交互——这里必须对每个容器都 observe。
+  try {
+    if (!resizeObserver) {
+      resizeObserver = new ResizeObserver(() => {
+        // 容器尺寸变化 → 当前渲染器 updateSize（Cesium resize 有布局开销）
+        currentRenderer.value?.updateSize()
+      })
+    }
+    resizeObserver.observe(container)
+  } catch {
+    // 构造/观察失败（个别环境）→ 复位并退出，下次触发仍可重试，但不抛错
+    resizeObserver = null
+  }
+}
+
+onMounted(async () => {
+  // 初始引擎构建收进 initialInit：路由切换若落在本窗口内，switchMapType 等它落地（见上）
+  initialInit = (async () => {
+    await loadData()
+    if (loadAbort.signal.aborted) return
+    // 兜底：初始 3D 时容器尚未渲染（v-if 依赖 cesiumInitialized），
+    // 先置标志并等 nextTick 让容器挂载后再初始化，避免白图
+    if (props.mapType === '3d' && !cesiumInitialized.value) {
+      cesiumInitialized.value = true
+      await nextTick()
+      await nextTick()
+    }
+    // 首次挂载：v-if已渲染当前意图类型的容器（props.mapType 可能已被路由改过）
+    const container = getContainer(props.mapType)
+    try {
+      await initRenderer(props.mapType, container)
+    } catch {
+      // initRenderer 内部已设置 loadError；rethrow 仅服务 switchMapType 回滚，
+      // 首次挂载路径无回滚目标，此处吞掉防止 mounted hook unhandled rejection
+    }
+    loading.value = false
+  })()
+  await initialInit
+
+  // 观察 OL 容器（常驻）；Cesium 容器由下方 watch 在出现后观察
+  watchContainerSize(olContainerRef.value)
+})
+
+// Cesium 容器首次创建（cesiumInitialized → true）后观察其尺寸变化
+watch(cesiumInitialized, (init) => {
+  if (init) {
+    void nextTick(() => watchContainerSize(cesiumContainerRef.value))
+  }
+})
+
+onUnmounted(() => {
+  // 卸载时 abort，阻止未完成的异步回调继续写 ref
+  loadAbort.abort()
+
+  // 断开容器尺寸观察（注册/移除配对契约，防泄漏）
+  resizeObserver?.disconnect()
+  resizeObserver = null
+
+  // 取消所有待执行的 rAF 回调，防止组件卸载后仍操作 DOM
+  _pendingRafIds.forEach((id) => cancelAnimationFrame(id))
+  _pendingRafIds.clear()
+
+  // 停止可能排队的引擎切换（卸载后不再执行异步 initRenderer）
+  switching.value = false
+  pendingSwitchType.value = null
+
+  // 引擎切换/卸载前解绑 click 与 hover 监听（注册/移除配对契约；两个缓存渲染器都解绑，
+  // 仅解绑当前渲染器会在复用旧实例时残留监听；hover 与 click 同源于 setupEvents 成对注册）
+  ;[olRenderer.value, cesiumRenderer.value].forEach((r) => {
+    r?.off?.('click', handleRendererClick)
+    r?.off?.('hover', handleRendererHover)
+  })
+
+  // 遍历销毁两个缓存渲染器（而非只销毁当前渲染器），销毁后 ref 显式置空。
+  // 两类渲染器统一走 destroy：Cesium 的 destroy 内含「保留 Viewer 复用的卸载语义 +
+  // 30s 空闲销毁窗口」（类上无 unmount 方法，误调是 no-op ⇒ 事件清理/水面清理/
+  // 空闲销毁定时器全部跳过，WebGL 永久泄漏）；OL 无复用设计，正常销毁。
+  // （考古 P10：原 if/else 两支代码逐字相同仅注释不同，已折叠）
+  const cachedRenderers = [olRenderer.value, cesiumRenderer.value]
+  cachedRenderers.forEach((r) => {
+    if (r) {
+      try {
+        r.destroy()
+      } catch (e) {
+        logger.warn('[UnifiedMap] 渲染器卸载失败:', e)
+      }
+    }
+  })
+  olRenderer.value = null
+  cesiumRenderer.value = null
+  currentRenderer.value = null
+  cesiumInitialized.value = false
+
+  // store 悬空引用清除
+  mapStore.setCurrentRenderer(null)
+})
+
+defineExpose({
+  flyTo,
+  getRenderer,
+  startBreathing,
+  stopBreathing,
+})
+</script>
+
+<template>
+  <div class="unified-map-wrapper" @pointerleave="handleMapPointerLeave">
+    <div v-show="mapType === '2d'" ref="olContainerRef" class="map-container"></div>
+
+    <div
+      v-if="cesiumInitialized"
+      v-show="mapType === '3d'"
+      ref="cesiumContainerRef"
+      class="map-container"
+    ></div>
+
+    <!-- 要素气泡（2D）：宿主元素交给 OL Overlay 定位，港口悬浮/钉住 + 设施点击钉住共用，同一时刻仅一个 -->
+    <div v-show="bubbleVisible" ref="bubbleHostRef" class="map-bubble-host">
+      <MapFeatureBubble
+        v-if="bubblePort"
+        :port="bubblePort"
+        :pinned="bubblePinned !== null"
+        @close="closeBubble"
+      />
+      <MapFacilityBubble
+        v-else-if="bubbleFacilityPinned"
+        :facility="bubbleFacilityPinned"
+        @close="closeBubble"
+      />
+    </div>
+
+    <!-- 以下为地图自身状态条：已在错误反馈通道例外清单登记，不重复走 toast -->
+    <Transition name="fade">
+      <div v-if="loading || switching" class="map-loading">
+        <div class="loading-spinner"></div>
+        <span>{{ mapLoadingLabel }}</span>
+      </div>
+    </Transition>
+
+    <p v-if="loadError" class="map-error map-status-tip">{{ loadError }}</p>
+    <div v-if="boundaryWarning" class="boundary-warning map-status-tip">{{ boundaryWarning }}</div>
+    <div v-if="portEmptyWarning" class="port-empty-warning map-status-tip">
+      {{ portEmptyWarning }}
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.unified-map-wrapper {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  z-index: var(--GCS-z-map);
+}
+
+.map-container {
+  width: 100%;
+  height: 100%;
+  transition: opacity var(--GCS-duration-slow) ease;
+
+  /* 确保地图容器可以接收鼠标事件，即使父元素设置了 pointer-events: none */
+  pointer-events: auto;
+}
+
+.map-bubble-host {
+  /* 定位由 OL Overlay 接管（绝对定位于地图容器内），此层只承载气泡内容与交互 */
+  pointer-events: auto;
+}
+
+.map-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+  /* S7 P1-1：硬编码白遮罩 → 面板半透明 token（暗色随主题变深蓝，不再亮白刺眼） */
+  background: var(--GCS-bg-panel-translucent);
+  z-index: var(--GCS-z-map-status);
+  gap: 12px; /* 12px 非8的整数倍，保留 */
+}
+
+.loading-spinner {
+  width: v-bind(spinnerSizeCss);
+  height: v-bind(spinnerSizeCss);
+  border: 4px solid var(--GCS-bg-container);
+  border-top: 4px solid var(--GCS-color-primary);
+  border-radius: var(--GCS-radius-round);
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* 地图状态提示条公共盒子（加载失败 / 边界告警 / 港口空态）：
+   定位方式、内边距、圆角、字号三处同构，统一在此声明；
+   方向偏移、语义配色、层级与个例内边距等差异，留在各自类里单独覆盖 */
+.map-status-tip {
+  position: absolute;
+  padding: 6px 12px; /* 6px/12px 非8的整数倍，保留（复核：已登记取舍项） */
+  border-radius: var(--GCS-radius-sm);
+  font-size: 13px;
+}
+
+.map-error {
+  top: 10px; /* 10px 非8的整数倍，保留 */
+  left: 10px; /* 10px 非8的整数倍，保留 */
+  color: var(--GCS-color-error);
+
+  /* 本元素原无 font-size（继承 body 16px），公共类 13px 会缩小字号并带高盒子高度；
+     显式写回继承语义，保持渲染等价（比硬编码 16px 更抗基准字号变更） */
+  font-size: inherit;
+
+  /* S7 P1-1：硬编码白底 → 浮层背景 token（暗色随主题） */
+  background: var(--GCS-bg-elevated);
+  padding: v-bind(cell8px) 12px; /* 覆盖公共 6px：纵向用 cell8px token；12px 非8的整数倍，保留 */
+  z-index: var(--GCS-z-map-status);
+}
+
+.boundary-warning {
+  bottom: 10px; /* 10px 非8的整数倍，保留 */
+  left: 10px; /* 10px 非8的整数倍，保留 */
+
+  /* S7 P1-1：硬编码黄 → 语义警告色 token（暗色下柔和橙替代刺眼亮黄） */
+  background: var(--GCS-color-warning);
+  z-index: var(--GCS-z-map-overlay);
+}
+
+.port-empty-warning {
+  bottom: 10px; /* 10px 非8的整数倍，保留 */
+  right: 10px; /* 与 boundary-warning 同高度分置左右，避免两条提示重叠 */
+  background: var(--GCS-bg-elevated);
+  color: var(--GCS-color-warning);
+  z-index: var(--GCS-z-map-overlay);
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--GCS-duration-slow) ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+</style>

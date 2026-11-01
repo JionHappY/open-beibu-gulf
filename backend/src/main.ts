@@ -1,0 +1,133 @@
+import fs from 'node:fs'
+import path from 'node:path'
+
+import { Logger } from '@nestjs/common'
+import { NestFactory } from '@nestjs/core'
+import type { NestExpressApplication } from '@nestjs/platform-express'
+import { SwaggerModule } from '@nestjs/swagger'
+import cookieParser from 'cookie-parser'
+import express from 'express'
+
+import { AppModule } from './app.module'
+import { ConfigService } from './infra/config/config.service'
+import { buildSwaggerConfig } from './swagger'
+
+async function bootstrap() {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule)
+  const http = app.getHttpAdapter().getInstance() as express.Express
+  // 配置集中读取（d058）：反代跳数也在 ConfigService 出口里，此处不再直读 process.env
+  // ——直读会绕过 validateStartup() 的生产必填断言（原失效形态：配 0 或漏配都静默起服务）
+  const config = app.get(ConfigService)
+  // 关闭框架指纹：Nest 默认 Express adapter 会给每个响应带 X-Powered-By: Express，
+  // 属低成本可消除的信息泄露（2026-09-10 实测线上 /nest-api/* 全部携带）。
+  // 必须在首个请求前设置（此处为 listen 前），否则已发出的响应已带该头。
+  http.disable('x-powered-by')
+  // trust proxy（老 Express 迁移回归）：生产经 nginx 反代时不信任代理会让
+  // rateLimit 按 127.0.0.1 统一计数（限流失效）——三个 throttler 桶全站共享，
+  // 任一客户端即可把 route/plans/favorites 打成 429。
+  // （auth cookie 的 Secure 自 z054 起由 ConfigService.cookieSecure 显式决定，
+  //   不再经 x-forwarded-proto 推定，故与本处 trust proxy 无耦合。）
+  // 跳数取部署拓扑（nginx→nest 一跳）而非 true：true 等于任何人都能伪造 XFF。
+  // 解析与生产必填断言见 common/utils/trust-proxy.ts 与 ConfigService.validateStartup()。
+  http.set('trust proxy', config.trustProxyHops)
+  // listen 前必填校验（缺 JWT_SECRET / 生产缺 PG_* 或 TRUST_PROXY_HOPS 直接 fail fast，不带弱配置上线）
+  config.validateStartup()
+  // 停机钩子（1004-04）：Nest 默认不监听进程信号 ⇒ 容器 SIGTERM/recreate 时
+  // onModuleDestroy 不可达（DbService.pool.end() 不执行、TaskService.registry.dispose()
+  // 不执行）——滚动发布会挂住直到被强杀。此处开启 PID1 信号→生命周期钩子链；
+  // 在飞任务的三态取消判定见 task.service.ts（缺失条目=已销毁 ⇒ 同判取消）。
+  app.enableShutdownHooks()
+  // 全局前缀 nest-api：Nest 独立端口时代（3100）的反代路径惯用，
+  // Express 退役后端口回切 3000，nginx 反代目标不变（/api、/nest-api 均可代理到本服务）
+  app.setGlobalPrefix('nest-api')
+  // cookie 解析：认证守卫读 HttpOnly auth_token（对齐 Express cookieParser）
+  app.use(cookieParser())
+
+  // CSP 违规上报体解析（审查 z153）：浏览器的 Content-Type 是 `application/csp-report`
+  // （report-uri）或 `application/reports+json`（report-to/Reporting API）——**都不是**
+  // `application/json`，Nest 默认 json 解析器不会碰它们，req.body 会恒为 {}（静默收不到报告）。
+  //
+  // ⚠️ 必须写成"按类型分流 + 其余纯透传"，**不能**直接 `app.use(express.json({ type: [...] }))`：
+  // 本项目 express 是 5.x（body-parser 2.x），其 json 中间件对**不匹配的类型也会打上
+  // `req._body = true`**；而 Nest 内置解析器（body-parser 1.x）见到 `_body` 即跳过 ⇒
+  // 全局 `application/json` 全部不再解析（实测：畸形 JSON 打到 /nest-api/auth/login 得到的是
+  // 业务"用户名和密码不能为空"而非解析报错 = 解析器根本没跑）。此处只在 Content-Type 命中
+  // CSP 两种类型时调用解析器，其余请求原样 next()，不触碰任何 request 状态。
+  const CSP_REPORT_TYPES = ['application/csp-report', 'application/reports+json']
+  // ⚠️ type 必须显式放开：`express.json()` 默认只认 `application/json`，若此处不给
+  // `type`，解析器会对本分支放进来的 CSP 请求再跳过一次（隔离复现：中间件命中，handler
+  // 里 req.body 仍是 undefined）。类型判定已由外层分支完成，这里 `() => true` 即"已放行"。
+  const parseCspReportBody = express.json({ limit: '16kb', type: () => true })
+  app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const contentType = (req.headers['content-type'] ?? '').split(';')[0]?.trim().toLowerCase()
+    if (!CSP_REPORT_TYPES.includes(contentType)) return next()
+    parseCspReportBody(req, res, next)
+  })
+
+  // 静态资源托管：backend/static（CTB 地形瓦片 /static/terrain、DEM hillshade /static/dem）。
+  // Express 退役后该职责迁移至 Nest（vite proxy /static → 3000 与生产 nginx /static/ 同口径）；
+  // 目录从 dataDir 兄弟位解析（backend/data → backend/static），复用 DATA_DIR 解析链的 cwd 容错。
+  // .terrain 专用分支：瓦片本身是 gzip 压缩流（CTB 产出），须声明 Content-Encoding——
+  // 不走 express.static（send 流式发送 + setHeaders 组合在并发地形请求下偶发 500，实测实锤），
+  // 自管流式发送完全掌控响应头；layer.json 无扩展头正常 JSON
+  const staticRoot = path.resolve(path.dirname(config.dataDir), 'static')
+  const terrainRoot = path.join(staticRoot, 'terrain')
+  app.use(
+    '/static/terrain',
+    (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      // decodeURIComponent 对残缺百分序列（裸 %）抛 URIError：该异常发生在 try 外，
+      // 会穿过 router 直达 finalhandler ⇒ HTML 500 绕过信封与全局过滤器，且服务端零日志。
+      // 畸形路径按「无此资源」走 next()，与下方 statSync 失败同口径。
+      let rel: string
+      try {
+        rel = decodeURIComponent(req.path).replace(/^\/+/, '')
+      } catch {
+        return next()
+      }
+      const file = path.resolve(terrainRoot, rel)
+      if (!file.startsWith(terrainRoot + path.sep)) return next() // 防路径穿越
+      let stat: fs.Stats
+      try {
+        stat = fs.statSync(file)
+      } catch {
+        return next()
+      }
+      if (!stat.isFile()) return next()
+      res.setHeader('Content-Type', 'application/octet-stream')
+      res.setHeader('Cache-Control', 'public, max-age=604800, immutable')
+      if (file.endsWith('.terrain')) res.setHeader('Content-Encoding', 'gzip')
+      fs.createReadStream(file)
+        .on('error', () => res.destroy())
+        .pipe(res)
+    }
+  )
+  app.use('/static', express.static(staticRoot, { maxAge: '7d', immutable: true }))
+
+  // OpenAPI 契约底座：DTO 注解为单一事实源，/nest-api/docs-json 供契约对比
+  // 漂移校验脚本拉取（与前端 zod 形状比对，契约先行方案）；UI 仅供开发调试，
+  // 生产环境关闭暴露面（契约比对脚本在开发环境运行，不受影响）
+  if (!config.isProduction) {
+    const swaggerConfig = buildSwaggerConfig()
+    const document = SwaggerModule.createDocument(app, swaggerConfig)
+    SwaggerModule.setup('nest-api/docs', app, document)
+  }
+
+  await app.listen(config.port)
+  Logger.log(`nest up on :${config.port}`, 'Bootstrap')
+}
+
+// 接线回归闸（test/trust-proxy.spec.ts）需要真跑一遍 bootstrap 才能看见"调用行被注释掉"
+// 或"被包进 dev 门控"（R4-02 PC-A/PC-C：源码子串匹配两种都看不见，却对等价重构过敏）。
+// 故导出 bootstrap 供用例直接 await；测试环境（vitest 注入 VITEST）不自动执行，
+// 免得起真服务/连库。
+export { bootstrap }
+
+// 启动失败必须带原因退出（1004-04）：原先裸 `void bootstrap()` 的 rejection 无人接管，
+// 容器里表现为「进程静默退出/npm 层报错丢失原始 cause」，排障只能猜。显式落日志再标死退出码。
+if (!process.env.VITEST) {
+  void bootstrap().catch((e: unknown) => {
+    const err = e instanceof Error ? e : new Error(String(e))
+    Logger.error(`bootstrap 失败：${err.message}`, err.stack, 'Bootstrap')
+    process.exitCode = 1
+  })
+}

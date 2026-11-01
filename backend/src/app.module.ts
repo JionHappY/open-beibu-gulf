@@ -1,0 +1,64 @@
+import { Module } from '@nestjs/common'
+import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core'
+import { ThrottlerModule } from '@nestjs/throttler'
+
+import {
+  THROTTLER_AUTH_LIMIT,
+  THROTTLER_GLOBAL_LIMIT,
+  THROTTLER_TTL_MS,
+} from './common/constants/throttling.constants'
+import { BusinessErrorFilter } from './common/filters/business-error.filter'
+import { EnvelopeThrottlerGuard } from './common/guards/envelope-throttler.guard'
+import { EnvelopeInterceptor } from './common/interceptors/envelope.interceptor'
+import { CspReportModule } from './csp-report/csp-report.module'
+import { HealthModule } from './health/health.module'
+import { ConfigModule } from './infra/config/config.module'
+import { DbModule } from './infra/db/db.module'
+import { DataFilesModule } from './infra/files/data-files.module'
+import { AuthModule } from './modules/auth/auth.module'
+import { FavoritesModule } from './modules/favorites/favorites.module'
+import { FloodModule } from './modules/flood/flood.module'
+import { ForecastModule } from './modules/forecast/forecast.module'
+import { PlansModule } from './modules/plans/plans.module'
+import { RouteModule } from './modules/route/route.module'
+import { DiversionModule } from './modules/diversion/diversion.module'
+import { SiteSuitabilityModule } from './modules/site-suitability/site-suitability.module'
+import { TaskModule } from './modules/task/task.module'
+
+// 限流对齐 Express：命名桶 global 1000/15min + login/register 各 50/15min；
+// 路由经 @SkipThrottle 选择归属桶；forecast 为合法高频交互（时间轴轮播）豁免。
+// health 探针计入全局限流（部署整合时统一对齐；5s 间隔约 180 次/15min，远低于 1000 上限）
+@Module({
+  imports: [
+    ConfigModule,
+    ThrottlerModule.forRoot([
+      { name: 'global', ttl: THROTTLER_TTL_MS, limit: THROTTLER_GLOBAL_LIMIT },
+      { name: 'login', ttl: THROTTLER_TTL_MS, limit: THROTTLER_AUTH_LIMIT },
+      { name: 'register', ttl: THROTTLER_TTL_MS, limit: THROTTLER_AUTH_LIMIT },
+    ]),
+    DbModule,
+    DataFilesModule,
+    AuthModule,
+    FavoritesModule,
+    PlansModule,
+    FloodModule,
+    ForecastModule,
+    SiteSuitabilityModule,
+    DiversionModule,
+    RouteModule,
+    HealthModule,
+    // v4 异步任务域：把「提交 → 后台跑 → 回来取结果」的能力独立成域，
+    // 使任务生命周期长于 HTTP 请求（跨路由保活的实现基础）。
+    // 它 imports 四个业务模块取 exports，自身不含业务计算（见 TaskModule 注释）
+    TaskModule,
+    // CSP 违规上报接收（z153）：已豁免限流（@SkipThrottle，见控制器注释），
+    // 不改命名桶配置——命名桶会作用于全部路由，新增即等于给全站多套一道闸
+    CspReportModule,
+  ],
+  providers: [
+    { provide: APP_GUARD, useClass: EnvelopeThrottlerGuard },
+    { provide: APP_INTERCEPTOR, useClass: EnvelopeInterceptor },
+    { provide: APP_FILTER, useClass: BusinessErrorFilter },
+  ],
+})
+export class AppModule {}

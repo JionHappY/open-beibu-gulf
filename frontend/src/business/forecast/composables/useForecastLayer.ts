@@ -1,0 +1,209 @@
+/**
+ * useForecastLayer — 预测分析图层管理：每个指标对应独立图层
+ * （key 由 `forecastLayerId(indicator)` 派生，见 shared/constants/layers），
+ * 切换指标时自动显隐，LayerControlPanel 按指标清单列出。
+ *
+ * 注：此处刻意不复述图层条目**数量** —— 原文写"全部 4 个条目"而 INDICATORS 实为 3 个，
+ * 数量一变注释就成失实宣称（z040 那类漂移）。条目数一律由 INDICATORS 派生。
+ */
+import type { ComputedRef } from 'vue'
+import { computed, nextTick, onScopeDispose, watch } from 'vue'
+import { useRouter } from 'vue-router'
+
+import { type BusinessLayerManager, useBusinessLayers, useOwnedLayers } from '@/core'
+import type { LayerDescriptor } from '@/core'
+import { ApiError, BoundedMap, ENDPOINTS, showError, useApiRequest } from '@/shared'
+import { logger } from '@/shared'
+import { DEFAULT_CONFIDENCE, FORECAST_INDICATORS, forecastLayerId, LAYER_DEFAULTS } from '@/shared'
+import { scenarioParam } from '@/shared'
+import { useForecastStore } from '@/stores'
+import { useMapStore } from '@/stores'
+import type { LayerOptions, LayerType, MapRenderer } from '@/types'
+import type { ForecastMapData } from '@/types'
+import { forecastMapDataSchema } from '@/types/schemas'
+
+import { guardForecastAuth, useForecastRequest } from './useForecastRequest'
+
+const INDICATOR_LABELS: Record<string, string> = {
+  cargo: '货物吞吐量热力',
+  container: '集装箱吞吐量热力',
+  activity: '港口吞吐活跃度',
+}
+const LAYER_TYPES: Record<string, LayerType> = {
+  cargo: 'heatmap',
+  container: 'heatmap',
+  activity: 'heatmap',
+}
+
+/** 热力图色带：单源 LAYER_DEFAULTS.heatmapGradient（D21-4，原手抄与选址层逐位重复） */
+const FORECAST_HEATMAP_GRADIENT = [...LAYER_DEFAULTS.heatmapGradient]
+
+/** useForecastLayer 返回值 */
+interface UseForecastLayerReturn {
+  updateForecastLayer: (transactionId: number, signal: AbortSignal) => Promise<void>
+  renderer: ComputedRef<MapRenderer | null>
+}
+
+export function useForecastLayer(): UseForecastLayerReturn {
+  const router = useRouter()
+  const forecastState = useForecastStore()
+  const mapStore = useMapStore()
+  const { manager } = useBusinessLayers() as { manager: BusinessLayerManager }
+  const { runInTransaction, isTransactionValid } = useForecastRequest()
+  const { apiRequest } = useApiRequest()
+
+  const renderer = computed<MapRenderer | null>(() => mapStore.currentRenderer)
+
+  // 卸载标志：watch 回调里 nextTick 后组件可能已卸载，
+  // 拦截防止注册孤儿图层（图层无宿主，跨路由残留）
+  const owned = useOwnedLayers('forecast')
+  let disposed = false
+  onScopeDispose(() => {
+    disposed = true
+  })
+
+  /** 注册体（唯一一份）：watch 与 update 共用，免五字段字面量两处漂移 */
+  const layerDescriptor = (indicator: string, visible: boolean): LayerDescriptor => ({
+    label: INDICATOR_LABELS[indicator],
+    layerType: LAYER_TYPES[indicator],
+    data: null,
+    options: getLayerOptions(),
+    visible,
+  })
+
+  // 合并 watch：同时监听 renderer 和 activeIndicator，确保图层状态同步
+  watch(
+    [() => renderer.value, () => forecastState.activeIndicator],
+    async ([r, newInd], [_oldR, oldInd]) => {
+      if (!r) return
+
+      // 延迟到下一帧，确保渲染器完全初始化
+      await nextTick()
+      if (disposed) return
+
+      // 渲染器就绪时注册全部指标图层（数量由 FORECAST_INDICATORS 派生，不写死——见文件头注）
+      for (const indicator of FORECAST_INDICATORS) {
+        const key = forecastLayerId(indicator)
+        if (!manager.has(key)) {
+          owned.register(key, layerDescriptor(indicator, indicator === newInd))
+        }
+      }
+
+      // 可见性只在**指标真的切换**时调整；引擎切换（oldInd === newInd）一律不动 ——
+      // registry.visible 是用户意图，实例由 reapplyAll 按该意图重建。
+      // 旧实现拿「新渲染器上有没有实例」当「用户是否隐藏过」的代理：引擎切换后实例必然不在，
+      // 于是被用户关掉的层会被这里误开（D6 复现用例坐实 —— 2D↔3D 切一次，关掉的层自己回来了）。
+      if (oldInd !== newInd) {
+        if (oldInd) {
+          const oldKey = forecastLayerId(oldInd)
+          if (manager.has(oldKey)) manager.setVisible(oldKey, false)
+        }
+        // 指标切换时 new 尊重 registry——用户手动隐藏过的层（renderer 已有实例）不强制重开，
+        // 仅首次激活（无实例）自动显示
+        const newKey = forecastLayerId(newInd)
+        if (manager.has(newKey)) {
+          const renderedBefore = r.hasLayer?.(newKey) ?? false
+          if (!renderedBefore) manager.setVisible(newKey, true)
+        }
+      }
+    },
+    { immediate: true }
+  )
+
+  function getLayerOptions(): LayerOptions {
+    // 全部指标均走热力图：显式传入 gradient，使热力图色带可配置（不再依赖 renderer 默认值）
+    return {
+      weightField: 'value',
+      radius: 20,
+      blur: 15,
+      gradient: FORECAST_HEATMAP_GRADIENT,
+    }
+  }
+
+  /** LAYER_TYPES 三键全为 heatmap ⇒ 恒取 features；非 heatmap 分支不可达已删（D21 批 2） */
+  function getRenderData(geojson: ForecastMapData): ForecastMapData['features'] {
+    return geojson.features || []
+  }
+
+  // 地图数据缓存：同一 (indicator, time, confidence) 只请求一次，播放/拖动重放同时间点零请求。
+  // 上限淘汰由 BoundedMap 按插入序处理（与 floodAdapter 档位缓存同一份实现）
+  const MAX_MAP_CACHE = 100
+  const mapRequestCache = new BoundedMap<string, ForecastMapData>(MAX_MAP_CACHE)
+  function mapCacheKey(indicator: string, time: string, confidence: number, scenario: string) {
+    return `map:${indicator}:${time}:${confidence}:${scenario}`
+  }
+
+  async function updateForecastLayer(transactionId: number, signal: AbortSignal): Promise<void> {
+    const r = renderer.value
+    if (!r) return
+
+    const indicator = forecastState.activeIndicator
+    // 年模式直接传 "YYYY"：后端聚合 12 个月，缓存键也与月模式自然分开
+    const time = forecastState.currentTime
+    const key = forecastLayerId(indicator)
+
+    // 检查图层是否已注册，若未注册则先注册（注册体与 watch 同一份）
+    if (!manager.has(key)) {
+      await nextTick()
+      if (!manager.has(key)) owned.register(key, layerDescriptor(indicator, true))
+    }
+
+    try {
+      const confidence = forecastState.confidenceThresholds[indicator] || DEFAULT_CONFIDENCE
+      // 运河情景仅 cargo 有文献锚点（04-B10）；非 cargo 恒按基线请求与缓存
+      const scenario =
+        indicator === 'cargo' ? forecastState.canalScenario || 'baseline' : 'baseline'
+      const cacheKey = mapCacheKey(indicator, time, confidence, scenario)
+      const options = getLayerOptions()
+
+      // LRU 命中：播放/拖动重放同一时间点，直接渲染缓存，零请求
+      const cached = mapRequestCache.get(cacheKey)
+      if (cached) {
+        // 缓存命中也校验事务有效性（对齐 useForecastTimeseries 同款模式）——
+        // 滑块快速连点（事务 A→B→C）时，旧事务 B 的缓存命中不得写回画面（「最后操作=最新结果」）
+        if (!isTransactionValid(transactionId)) return
+        manager.updateData(key, { data: getRenderData(cached), options })
+        return
+      }
+
+      const geojson = await runInTransaction(
+        // 预测纯 api，直连统一入口 useApiRequest
+        () =>
+          apiRequest<ForecastMapData>(ENDPOINTS.forecast.map, {
+            method: 'GET',
+            params: {
+              indicator,
+              time,
+              confidence,
+              ...scenarioParam(scenario),
+            },
+            signal,
+            schema: forecastMapDataSchema,
+          }),
+        transactionId
+      )
+
+      // 请求被取消或事务过期：不写缓存不上图
+      if (!geojson) return
+
+      // 写缓存（BoundedMap 上限自动淘汰最旧键）
+      mapRequestCache.set(cacheKey, geojson)
+
+      manager.updateData(key, { data: getRenderData(geojson), options })
+    } catch (e) {
+      if (guardForecastAuth(e, router)) return
+      // 播放中命中限流（429）静默降级不弹窗（连续高频交互，弹窗打断演示）；手动操作照常提示
+      if (forecastState.isPlaying && e instanceof ApiError && e.message.includes('过于频繁')) {
+        if (import.meta.env.DEV)
+          logger.debug('[useForecastLayer] 播放中请求被限流，跳过该时间点:', e.message)
+        return
+      }
+      if (import.meta.env.DEV) logger.debug('[useForecastLayer] 更新失败:', e)
+      showError(e, { fallback: '更新地图图层失败' })
+    }
+  }
+
+  // 注销只有一条路径：注册经 useOwnedLayers 登记归属，卸载由 onScopeDispose 统一清。
+  // 不提供「手动清」API —— 那会诱导调用方在 onUnmounted 里手写注销，正是本约束要治的动作。
+  return { updateForecastLayer, renderer }
+}

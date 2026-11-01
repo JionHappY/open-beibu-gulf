@@ -1,0 +1,144 @@
+/**
+ * 渲染层集中色（单一事实源）：canvas/WebGL/SVG 渲染无法解析 CSS 变量（var(--GCS-*)），必须用具体色值，
+ * 故渲染色集中于此，DOM/CSS 层颜色走 style.css 的 Token；业务/渲染/图层代码禁止散落 #hex，一律从此取。
+ */
+
+/**
+ * 品牌主色（品牌蓝）。本文件是渲染色值的单一事实源，而**品牌蓝本身**此前在文件内又手抄了
+ * 六处（含一处大小写不同的 `#409EFF`）——单一事实源内部再分叉，改主色必漏。此常量是它的唯一字面量。
+ */
+const COLOR_PRIMARY =
+  '#2172ca' /* = style.css --GCS-color-primary rgb(33 114 202)；两者同值由 tokenContrast 测试钉住 */
+
+/**
+ * 港口要素渲染色（原 `FACILITY_COLORS[0]` 具名化，2026-10-13 收口 A2）。
+ * 原为 4 元色板 `['#409eff','#67C23A','#e74c3c','#4dabf7']`，实测**只有 [0] 被消费**（usePortLayer）；
+ * [1..3] 零消费，且这三个色在本文件他处各有具名来源（success 绿 → PROFILE_AREA_STOP_* 的 rgba 派生、
+ * 危险红 → FACILITY_COLORS_MAP.hospital、边界蓝 → LAYER_DEFAULTS.stroke）⇒ 色板拆掉。
+ */
+export const PORT_FEATURE_COLOR = COLOR_PRIMARY
+
+// SEMANTIC_COLORS / SEMANTIC_MAP_BACKGROUND / FLOOD_RISK_NEUTRAL_COLOR / withAlpha
+// 已按 Q-C1 B 拆至 ./semantic-colors.ts（单源表独立文件，经 constants/index.ts 汇总导出）。
+
+/**
+ * 设施配色映射：visualization 与 business 两层都需要，集中 shared 避免跨层依赖
+ * （dependency-cruiser 规则 visualization-should-not-import-business 为 warn 级）。
+ * 业务逻辑（半径、权重等）随旧版选址域一并移除（2026-10-02）。
+ */
+export const FACILITY_COLORS_MAP: Record<string, string> = {
+  hospital: '#e74c3c',
+  // 原 #3498db 蓝色与匹配小区/港口蓝无法区分——品红为现有色相环唯一大空档（320°）
+  primary_school: '#eb2f96',
+  middle_school: '#9b59b6',
+  park: '#2ecc71',
+  bus_station: '#f39c12',
+  mall: '#1abc9c',
+}
+
+/** 设施未知 key 兜底色（原两处散落 '#666' 收口；仅图表 fallback 用，未知设施类型按中性灰显示） */
+export const FACILITY_FALLBACK_COLOR = '#666666'
+
+/**
+ * 取设施渲染色：唯一入口，避免图表侧手抄 `FACILITY_COLORS_MAP[key] || FACILITY_FALLBACK_COLOR`
+ * （2026-10-18 收口 RadarScoreTooltip 与 useRadarChart 两处同构实现）。
+ */
+export function facilityColor(key: string): string {
+  return FACILITY_COLORS_MAP[key] || FACILITY_FALLBACK_COLOR
+}
+
+// 水面/覆盖层填充色（COLOR_PRIMARY 的透明度派生，收口两处散落 rgba 硬编码）
+/** 水面填充（FloodAnalysisPage 水面图层） */
+export const LAYER_FILL_WATER = 'rgba(64, 158, 255, 0.5)'
+
+// 剖面面积渐变 stops（success 绿 #67C23A 派生，WaterLevelProfilePanel 面积图）
+/** 剖面面积渐变-强端（近水面） */
+export const PROFILE_AREA_STOP_STRONG = 'rgba(103, 194, 58, 0.3)'
+/** 剖面面积渐变-弱端（远离水面） */
+export const PROFILE_AREA_STOP_WEAK = 'rgba(103, 194, 58, 0.05)'
+
+// 图层默认回退色（renderer 在无 options 覆盖时使用）
+export const LAYER_DEFAULTS = {
+  color: COLOR_PRIMARY, // 默认点 / 要素色
+  stroke: '#4dabf7', // 默认描边（边界 / 多边形）
+  marker: COLOR_PRIMARY, // 默认标记色
+  boundaryFill: 'rgba(77,171,247,0.15)', // 边界图层填充（从 useBoundaryLayer 提取的硬编码字面量）
+  fill: 'rgba(77, 171, 247, 0.2)',
+  outline: '#ffffff', // 描边 / 外框白
+  text: '#000000', // 标注文字黑
+  labelBackground: 'rgba(255, 255, 255, 0.8)', // 点标注白底（Cesium label 收口）
+  heatmapGradient: ['#00f', '#0ff', '#0f0', '#ff0', '#f00'],
+  // 图层叠放层级（OL setZIndex 默认值，消除对 addLayer 调用顺序的依赖）
+  zIndex: 10, // 业务图层默认层级
+  zIndexBase: 0, // 底图
+  zIndexCover: 15, // 覆盖类业务层（淹没范围 / 受影响设施 / 预测图层）：叠在普通业务层之上
+  zIndexOverlay: 100, // 覆盖层（水面 / 呼吸动画 / 淹没）
+} as const
+
+/** 分流页弧线/运河渲染色（canvas 色值，单一来源）。 */
+export const DIVERSION_ARC_COLORS = {
+  arc: '#2f7bff',
+  arcHighlight: '#ffb020',
+  canal: '#12b886',
+  canalHighlight: '#ffd43b',
+} as const
+
+// ===== 拖出图层（LayerIR）与任务结果芯片 =====
+/**
+ * 品牌蓝渲染色（单一来源）：route-analysis 路径线 与 LayerIR flood-areas 域色同值，
+ * 两处都从此取——改一处即两处同变（G3 收口：原两处手抄同值）。
+ */
+export const RENDER_BLUE = '#3b82f6'
+/** 橙色渲染色（单一来源）：LayerIR route-path 域色。 */
+const RENDER_ORANGE = '#f59e0b'
+/** LayerIR 域色表（LayerIR.ts 消费）：域语义标签仍在 LayerIR，颜色只在这里。 */
+export const LAYER_IR_DOMAIN_COLORS = {
+  'flood-areas': RENDER_BLUE,
+  'route-path': RENDER_ORANGE,
+} as const
+/**
+ * 任务结果芯片 / 堆叠卡渲染色兜底（单一来源）：App.vue、TaskResultChip、StackSlot
+ * 三处同值（G3 收口：原三副本零断言）。
+ */
+export const IR_FALLBACK_COLOR = '#8a93a6'
+
+// 水位剖面图系列色
+export const PROFILE_COLORS = {
+  water: COLOR_PRIMARY, // 2026-10-13 收口：原为不同大小写的 '#409EFF'
+  safe: '#67C23A',
+} as const
+
+// ECharts 图表主题色（canvas 渲染无法解析 CSS 变量，亮/暗双主题；收口图表硬编码色）
+export const CHART_COLORS = {
+  textPrimary: { light: '#303133', dark: '#e8edf4' },
+  textSecondary: { light: '#666666', dark: '#a8b2bd' },
+  textMuted: { light: '#999999', dark: '#7a8694' },
+  axisLine: { light: '#dddddd', dark: '#2c4a70' },
+  splitLine: { light: '#eeeeee', dark: '#1f3450' },
+  accent: { light: COLOR_PRIMARY, dark: '#ff7a1a' },
+  // 多分类系列色板，
+  // useChartBase 顶层注入 color，替代 ECharts 默认 #5470c6 系列
+  seriesPalette: {
+    light: [COLOR_PRIMARY, '#67c23a', '#e6a23c', '#f56c6c', '#9b59b6', '#1abc9c'],
+    dark: ['#66b1ff', '#57d97c', '#f0b35a', '#ff7a7d', '#b98ae0', '#3ed0b0'],
+  },
+  // 雷达图 splitArea 叠层（原 useRadarChart 内 rgba 硬编码收敛）
+  radarSplitArea: {
+    light: ['rgba(255,255,255,0.1)', 'rgba(255,255,255,0.3)'],
+    dark: ['rgba(255,255,255,0.04)', 'rgba(255,255,255,0.12)'],
+  },
+} as const
+
+/**
+ * 取图表主题色：唯一入口，避免各图表 option 内手抄 `dark ? CHART_COLORS.x.dark : CHART_COLORS.x.light`。
+ * 亮/暗取值仍以 CHART_COLORS 为权威源，此处只做「按当前主题二选一」；
+ * 形参只收双主题标量键（seriesPalette / radarSplitArea 是数组，不走本入口）。
+ */
+export function chartColor(
+  key: Exclude<keyof typeof CHART_COLORS, 'seriesPalette' | 'radarSplitArea'>,
+  dark: boolean
+): string {
+  return CHART_COLORS[key][dark ? 'dark' : 'light']
+}
+
+// FLOOD_RISK_* 配色已下沉至 business/flood-analysis/constants/colors.ts（仅洪涝业务使用）

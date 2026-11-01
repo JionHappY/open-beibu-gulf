@@ -1,0 +1,166 @@
+import { INestApplication } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import request from 'supertest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import { AppModule } from '../src/app.module'
+
+// forecast e2e：连真实 backend/data/forecast 静态数据（公开只读，免登录）。
+// 覆盖：四端点冒烟、confidence 钳制、缓存一致性、校验文案
+describe('forecast e2e（读真数据文件）', () => {
+  let app: INestApplication
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile()
+    app = moduleRef.createNestApplication()
+    app.setGlobalPrefix('nest-api')
+    await app.init()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  const base = '/nest-api/forecast'
+
+  it('overview → 200 指标索引（含 ports/updatedAt 摘要键）', async () => {
+    const res = await request(app.getHttpServer()).get(`${base}/overview`).expect(200)
+    expect(res.body.code).toBe(200)
+    expect(Object.keys(res.body.data).length).toBeGreaterThan(0)
+  })
+
+  it('/ 根路径与 /overview 同义', async () => {
+    const root = await request(app.getHttpServer()).get(base).expect(200)
+    const ov = await request(app.getHttpServer()).get(`${base}/overview`).expect(200)
+    expect(JSON.stringify(root.body)).toBe(JSON.stringify(ov.body))
+  })
+
+  it('map 缺 indicator → 400 文案逐字节；缺 time 同', async () => {
+    const noIndicator = await request(app.getHttpServer()).get(`${base}/map?time=2025`).expect(400)
+    expect(noIndicator.body).toEqual({
+      code: 400001,
+      error: '缺少参数: indicator, time',
+      data: null,
+    })
+    const noTime = await request(app.getHttpServer()).get(`${base}/map?indicator=cargo`).expect(400)
+    expect(noTime.body).toEqual({ code: 400001, error: '缺少参数: indicator, time', data: null })
+  })
+
+  it('map 合法请求 → FeatureCollection（properties 仅四键）', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=cargo&time=2026-06`)
+      .expect(200)
+    expect(res.body.data.type).toBe('FeatureCollection')
+    expect(res.body.data.indicator).toBe('cargo')
+    expect(res.body.data.features.length).toBeGreaterThan(0)
+    for (const f of res.body.data.features) {
+      expect(Object.keys(f.properties).sort()).toEqual(
+        ['portId', 'portName', 'reliability', 'value'].sort()
+      )
+    }
+  })
+
+  it('confidence 钳制：非法回落 1.0 / 合法原样 / 超 2 钳 2（确定性响应不受值变化影响——cargo 模型基线）', async () => {
+    const fresh = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=cargo&time=2026-06`)
+      .expect(200)
+    const clamped = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=cargo&time=2026-06&confidence=abc`)
+      .expect(200)
+    const over = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=cargo&time=2026-06&confidence=5`)
+      .expect(200)
+    // cargo 为固定基线（scenarioLevel 恒 1.0）：confidence 变化不改变结果
+    expect(JSON.stringify(clamped.body)).toBe(JSON.stringify(fresh.body))
+    expect(JSON.stringify(over.body)).toBe(JSON.stringify(fresh.body))
+  })
+
+  it('真派生指标 activity：文件自带 forecast 透传，锚点落真实港口（北部湾 bbox）', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`${base}/indicator/activity?time=2030-01`)
+      .expect(200)
+    expect(res.body.data.indicator).toBe('activity')
+    expect(Object.keys(res.body.data.ports).length).toBeGreaterThan(0)
+    for (const port of Object.values(res.body.data.ports) as Array<{ forecast: unknown[] }>) {
+      // 预测段由真数据派生（模型预测 + 历史基期归一），非空
+      expect(Array.isArray(port.forecast)).toBe(true)
+    }
+  })
+
+  it('activity map：坐标锚点落在北部湾业务边界内（非 mock 市区越界点）', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=activity&time=2030-01`)
+      .expect(200)
+    expect(res.body.data.unit).toBe('指数')
+    expect(res.body.data.features.length).toBeGreaterThan(0)
+    for (const f of res.body.data.features) {
+      const [lng, lat] = f.geometry.coordinates
+      expect(lng).toBeGreaterThan(105)
+      expect(lng).toBeLessThan(115)
+      expect(lat).toBeGreaterThan(18)
+      expect(lat).toBeLessThan(25)
+    }
+  })
+
+  it('timeseries year 粒度 → YYYY 年度合计（12 个月之和）', async () => {
+    const monthly = await request(app.getHttpServer())
+      .get(`${base}/timeseries?indicator=cargo&granularity=month`)
+      .expect(200)
+    const monthlyByPort = new Map<string, Array<{ time: string; value: number }>>(
+      monthly.body.data.series.map(
+        (s: { portId: string; data: Array<{ time: string; value: number }> }) => [s.portId, s.data]
+      )
+    )
+
+    const res = await request(app.getHttpServer())
+      .get(`${base}/timeseries?indicator=cargo&granularity=year`)
+      .expect(200)
+    expect(res.body.data.granularity).toBe('year')
+    expect(res.body.data.unit).toContain('/年')
+    for (const s of res.body.data.series) {
+      const monthlyPoints = monthlyByPort.get(s.portId)
+      expect(monthlyPoints, `月粒度缺少港口 ${s.portId}`).toBeDefined()
+      for (const d of s.data) {
+        expect(d.time).toMatch(/^\d{4}$/)
+        const months = monthlyPoints!.filter((m) => m.time.startsWith(`${d.time}-`))
+        expect(months.length).toBeGreaterThan(0)
+        const sum = months.reduce((acc, m) => acc + m.value, 0)
+        expect(Math.abs(d.value - sum)).toBeLessThan(1e-6)
+      }
+    }
+  })
+
+  it('未知指标 → 404 未知指标文案', async () => {
+    const res = await request(app.getHttpServer()).get(`${base}/indicator/nope`).expect(404)
+    expect(res.body).toEqual({ code: 404001, error: '未知指标: nope', data: null })
+  })
+
+  it('孤儿路由 /:portId（兼容端点）返回港口双指标', async () => {
+    const index = await request(app.getHttpServer()).get(`${base}/overview`).expect(200)
+    const portId = index.body.data.metadata.ports[0].id
+    const res = await request(app.getHttpServer()).get(`${base}/${portId}`).expect(200)
+    expect(res.body.data.portId).toBe(portId)
+    expect(Object.keys(res.body.data.indicators).sort()).toEqual(['cargo', 'container'])
+  })
+
+  it('缓存命中=重算一致性（连发两次同参数响应逐字节一致）', async () => {
+    const a = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=activity&time=2030-01`)
+      .expect(200)
+    const b = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=activity&time=2030-01`)
+      .expect(200)
+    expect(JSON.stringify(b.body)).toBe(JSON.stringify(a.body))
+  })
+
+  it('berth/traffic 已下架：请求 → 404 未知指标（legacy 不再消费）', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`${base}/map?indicator=berth&time=2026-01`)
+      .expect(404)
+    expect(res.body).toEqual({ code: 404001, error: '未知指标: berth', data: null })
+    const traffic = await request(app.getHttpServer())
+      .get(`${base}/indicator/traffic?time=2026-01`)
+      .expect(404)
+    expect(traffic.body).toEqual({ code: 404001, error: '未知指标: traffic', data: null })
+  })
+})

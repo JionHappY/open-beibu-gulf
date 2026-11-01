@@ -1,0 +1,126 @@
+/**
+ * useForecastTimeseries — 预测趋势（折线图）数据 composable：
+ * 请求经 forecastAdapter（service 层隔离），组件零 HTTP/字段细节；缓存迁入 store
+ * （跨页面快照由 store 统一序列化），事务经 useForecastRequest 保证三路请求原子性。
+ * 错误处理与页面原实现一致：401 软登录、其余 showError 统一出口。
+ */
+import { useRouter } from 'vue-router'
+
+import { forecastAdapter } from '@/services'
+import { logger, showError } from '@/shared'
+import { DEFAULT_CONFIDENCE } from '@/shared'
+import { scenarioParam } from '@/shared'
+import { useForecastStore } from '@/stores'
+import type { ForecastDataSource } from '@/types/schemas'
+
+import { fromMonthOrdinal, toMonthOrdinal } from '../timeline'
+
+import { guardForecastAuth, useForecastRequest } from './useForecastRequest'
+
+interface SeriesItem {
+  portName: string
+  data: Array<{ time: string; value: number }>
+}
+
+/** 返回契约（显式化，防重构时签名静默漂移）。v4-S3：结果写 store.chart，不再持本地 ref——
+ * 请求归属上移面板后，页面模板绑定 store，本 composable 只剩"取数+窗口切片"职责 */
+interface UseForecastTimeseriesReturn {
+  load: (transactionId: number, signal: AbortSignal) => Promise<void>
+}
+
+export function useForecastTimeseries(): UseForecastTimeseriesReturn {
+  const router = useRouter()
+  const forecastState = useForecastStore()
+  const { runInTransaction, isTransactionValid } = useForecastRequest()
+
+  /** 全量数据: 首次 API 获取后缓存，后续只做窗口截取（缓存存 store，快照可恢复） */
+  async function load(transactionId: number, signal: AbortSignal): Promise<void> {
+    try {
+      const indicator = forecastState.activeIndicator
+      const granularity = forecastState.timeGranularity
+      const confidence = forecastState.confidenceThresholds[indicator] || DEFAULT_CONFIDENCE
+      // 运河情景仅 cargo 有文献锚点（04-B10）：非 cargo 一律按基线请求与缓存
+      const scenario =
+        indicator === 'cargo' ? forecastState.canalScenario || 'baseline' : 'baseline'
+      const cacheKey = `ts:${indicator}:${granularity}:${confidence}:${scenario}`
+
+      const cached = forecastState.requestCache.get(cacheKey)
+      if (!cached) {
+        const data = await runInTransaction(
+          () =>
+            forecastAdapter.getTimeSeries(
+              {
+                indicator,
+                granularity,
+                confidence,
+                ...scenarioParam(scenario),
+              },
+              signal
+            ),
+          transactionId
+        )
+        // 事务过期或请求被取消
+        if (data === null) return
+        if (data.series) {
+          forecastState.setRequestCache(cacheKey, {
+            allSeries: data.series,
+            unit: data.unit,
+            // P1-1：降级标记随缓存一起存，缓存命中重建时必须同口径（否则角标只在首帧出现）
+            dataSource: data.dataSource,
+          })
+        }
+      } else {
+        // 与 useForecastComparison 一致——缓存命中也校验事务有效性，
+        // 过期则不渲染旧数据（避免旧状态缓存覆盖新状态窗口）
+        if (!isTransactionValid(transactionId)) return
+      }
+
+      const entry = forecastState.requestCache.get(cacheKey) as
+        | { allSeries?: SeriesItem[]; unit?: string; dataSource?: ForecastDataSource }
+        | undefined
+      // P1-1：降级标记先于空数据判断落 store——本次响应是否降级与窗口内有没有点无关
+      forecastState.chart.lineDataSource = entry?.dataSource ?? null
+      const allData = entry?.allSeries?.[0]?.data || []
+      if (!allData.length) return
+
+      // 12 点窗口（当前时间往前 11 步，月/年粒度通用），钳制在数据范围内防止空白
+      const [sliderYear, sliderMonth] = forecastState.currentTime.split('-').map(Number)
+      const isYear = granularity === 'year'
+      const fmt = (y: number, m: number) =>
+        isYear ? String(y) : `${y}-${String(m || 1).padStart(2, '0')}`
+      const dataMin = allData[0].time
+      const dataMax = allData[allData.length - 1].time
+
+      const rawStart = isYear
+        ? fmt(sliderYear - 11, 1)
+        : (() => {
+            // D4：绝对月序收口 timeline.toMonthOrdinal/fromMonthOrdinal（原第三份内联口径）
+            const [y, m] = fromMonthOrdinal(toMonthOrdinal(sliderYear, sliderMonth) - 11)
+            return fmt(y, m)
+          })()
+      const rawEnd = fmt(sliderYear, sliderMonth)
+      const windowStart = rawStart >= dataMin ? rawStart : dataMin
+      const windowEnd = rawEnd <= dataMax ? rawEnd : dataMax
+
+      forecastState.chart.lineViewportXMin = windowStart
+      forecastState.chart.lineViewportXMax = windowEnd
+
+      const inWindow = (d: { time: string }) => d.time >= windowStart && d.time <= windowEnd
+
+      forecastState.chart.lineXData = allData.filter(inWindow).map((d) => d.time)
+      forecastState.chart.lineSeries = (entry?.allSeries ?? []).map((s) => ({
+        name: s.portName,
+        data: (s.data || []).filter(inWindow).map((d) => d.value),
+      }))
+      // F4：y 轴单位随数据入 store（LineChart :y-unit 消费）；缓存命中同路径
+      forecastState.chart.lineUnit = entry?.unit ?? ''
+    } catch (e) {
+      logger.error('[ForecastTimeseries] load error:', e)
+      if (guardForecastAuth(e, router)) return
+      // 失败用 toast：切换时间/指标即自动重试
+      showError(e, { fallback: '加载趋势数据失败' })
+    }
+  }
+
+  return { load }
+}

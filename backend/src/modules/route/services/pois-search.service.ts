@@ -1,0 +1,18 @@
+import { Injectable } from '@nestjs/common'
+
+import { PoiSearchRepository, type PoiSearchRow } from '../repositories/pois-search.repository'
+
+// POI 多源搜索服务（航线分析选点）。2026-09-30 自旧版选址域迁入；
+// 控制器不得直连 repository（cruise 分层规则），本类为薄编排层。
+
+/** /route/pois 响应：多源合并后的点数组（前端 poiSearchItemSchema） */
+export type PoiSearchResult = PoiSearchRow[]
+
+@Injectable()
+export class PoiSearchService {
+  constructor(private readonly poiSearchRepository: PoiSearchRepository) {}
+
+  async searchPois(keyword: string, limit: number): Promise<PoiSearchResult> {
+    return this.poiSearchRepository.searchPois(keyword, limit)
+  }
+}

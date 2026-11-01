@@ -1,0 +1,137 @@
+import { perfMark, perfMeasure, recordCesium } from '@/shared'
+
+import type { MapRenderer } from './MapRenderer'
+import { OLRenderer } from './OLRenderer'
+import { preloadTerrain } from './terrainPreload'
+
+export { MapRenderer, OLRenderer }
+
+// Cesium 动态加载状态（模块级单例，防止重复加载）
+let _cesiumLoadPromise: Promise<void> | null = null
+let _preloadScheduled = false
+
+/**
+ * Cesium 空闲预热：首屏渲染后经 requestIdleCallback 真正执行加载（下载+解析执行 Cesium.js 5.7MB，
+ * 仅 preload 缓存不解码，实测首次进 3D 仍卡）。
+ * 与 createRenderer 共享同一 _cesiumLoadPromise：已预热则秒回，未预热用户操作优先，无重复下载。
+ * 幂等：window.Cesium 就绪/已调度/已预热均跳过；失败静默（优化手段不阻断功能）。
+ */
+export function preloadCesium(): void {
+  try {
+    // why: Window 无 Cesium 字符串索引；exit: declare global Window.Cesium 后直接读
+    if ((window as unknown as Record<string, unknown>).Cesium) return
+    if (_preloadScheduled) return
+    _preloadScheduled = true
+
+    // why: requestIdleCallback 运行期能力探测；exit: 目标 TS lib 收录后直接调用
+    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void) => void })
+      .requestIdleCallback
+    const doPreload = () => {
+      // 真正执行加载（与 ensureCesiumLoaded 共享 promise，3D 入口幂等秒回）
+      void ensureCesiumLoaded()
+        .then(() => {
+          // 预热 CesiumRenderer 模块 chunk，进 3D 时不再现场拉取
+          // 动态导入失败需自身兜底（外层 catch 只管 ensureCesiumLoaded）
+          return import('./CesiumRenderer').catch(() => {
+            // 预热失败静默——进 3D 时走正式加载路径
+          })
+        })
+        // 地形预热串行在 Cesium（主库 + chunk）之后：先大后小，不抢带宽
+        .then(() => preloadTerrain())
+        .catch(() => {
+          // 预热失败静默——只是优化手段，不影响功能（进 3D 时走正式加载路径）
+        })
+      if (import.meta.env.DEV) {
+        // eslint-disable-next-line no-console -- DEV 门控诊断（logger.debug 级别语义不同）
+        console.debug('[renderers] Cesium 空闲预热（执行加载）已启动')
+      }
+    }
+    if (idle) idle(doPreload)
+    else doPreload()
+  } catch {
+    // 预热失败静默——只是优化手段，不影响功能
+  }
+}
+
+/**
+ * 确保 window.Cesium 就绪（幂等）：**全站只允许存在这一个 Cesium 实例**。
+ *
+ * 两条路径都指向它（2026-09-27 修正，D-J）：
+ * - `vite build`：vite-plugin-cesium 把 `cesium` 标 `external` + 映射到全局 `Cesium`；
+ * - `vite dev`：`vite.config.js` 把 `cesium` 别名到 `core/map/cesium-global.ts`（同样读全局）。
+ *
+ * ⚠ 别再给 dev 单独留一条「走 npm ESM 包」的路：那样页面里会同时出现两个 Cesium，
+ * Cesium 内部 `instanceof` 判可见性失效 ⇒ 3D Tiles 图层全部零渲染且零报错。
+ */
+function ensureCesiumLoaded(): Promise<void> {
+  // why: Window 无 Cesium 字符串索引；exit: declare global Window.Cesium 后直接读
+  if ((window as unknown as Record<string, unknown>).Cesium) return Promise.resolve()
+  if (_cesiumLoadPromise) return _cesiumLoadPromise
+
+  _cesiumLoadPromise = new Promise<void>((resolve, reject) => {
+    // 埋点：脚本开始注入（度量口径为全局脚本 onload，非 import）
+    perfMark('cesium:load-start')
+    // 1. 注入 CSS（幂等：检查是否已存在）
+    if (!document.querySelector('link[href*="Widgets/widgets.css"]')) {
+      const link = document.createElement('link')
+      link.rel = 'stylesheet'
+      link.href = '/cesium/Widgets/widgets.css'
+      document.head.appendChild(link)
+    }
+
+    // 2. 动态加载 Cesium 主库
+    const script = document.createElement('script')
+    script.src = '/cesium/Cesium.js'
+    script.onload = () => {
+      perfMark('cesium:script-onload')
+      _cesiumLoadPromise = null // 重置以支持重试
+      resolve()
+    }
+    script.onerror = () => {
+      _cesiumLoadPromise = null
+      // 失败路径移除残留 <script> 节点，避免重复注入堆积 DOM
+      script.remove()
+      reject(new Error('Cesium.js 加载失败，请检查网络连接'))
+    }
+    document.head.appendChild(script)
+  })
+
+  return _cesiumLoadPromise
+}
+
+/** 创建渲染器：2D 静态导入首屏可用；3D 动态加载 Cesium.js（5.7MB，仅首次切 3D 时加载）+ 动态导入 CesiumRenderer */
+export async function createRenderer(
+  type: '2d' | '3d',
+  container: HTMLElement
+): Promise<MapRenderer> {
+  if (type === '2d') {
+    // OLRenderer extends MapRenderer：子类实例可直接按基类契约返回（类已 implements @/types 契约）
+    return new OLRenderer(container)
+  }
+
+  // 1. 先加载 Cesium.js（5.7MB）→ window.Cesium 就绪
+  perfMark('cesium:load-start') // 幂等：warm 切换时 ensureCesiumLoaded 早返回，保证标记存在
+  await ensureCesiumLoaded()
+
+  // 2. 再动态导入 CesiumRenderer：其 `import … from 'cesium'` 在 dev 被别名到
+  //    core/map/cesium-global.ts、在 build 被 externalGlobals 映射到全局 Cesium，
+  //    两条路都指向上面注入的同一个实例
+  const { CesiumRenderer } = await import('./CesiumRenderer')
+
+  // CesiumRenderer extends MapRenderer：动态导入的类实例与 2D 分支同型，无需桥接断言
+  const renderer = new CesiumRenderer(container)
+  perfMark('cesium:viewer-ready')
+  const scriptLoad = perfMeasure('cesium:script-load', 'cesium:load-start', 'cesium:script-onload')
+  const viewerInit = perfMeasure(
+    'cesium:viewer-init',
+    'cesium:script-onload',
+    'cesium:viewer-ready'
+  )
+  const total = perfMeasure('cesium:total', 'cesium:load-start', 'cesium:viewer-ready')
+  recordCesium({
+    scriptOnloadMs: scriptLoad ?? undefined,
+    viewerReadyMs: viewerInit ?? undefined,
+    totalMs: total ?? undefined,
+  })
+  return renderer
+}

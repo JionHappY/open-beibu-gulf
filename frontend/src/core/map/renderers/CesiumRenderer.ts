@@ -1,0 +1,2308 @@
+// Cesium 3D 渲染器：Viewer 单例复用 + 按需挂载（30s 空闲自动销毁）。
+// 图层/水面/地形/相机/事件等能力以模块级函数组织（本文件下方分区），经 renderer 实例委托调度。
+import {
+  CallbackProperty,
+  Cartesian2,
+  Cartesian3,
+  Cartographic,
+  Cesium3DTileset,
+  CesiumTerrainProvider,
+  ClassificationType,
+  Color,
+  ColorGeometryInstanceAttribute,
+  DataSource,
+  EllipsoidTerrainProvider,
+  Entity,
+  EntityCollection,
+  GeographicTilingScheme,
+  GeoJsonDataSource,
+  GeometryInstance,
+  HeightReference,
+  ImageryLayer,
+  Math as CesiumMath,
+  PerInstanceColorAppearance,
+  PointGraphics,
+  PolygonGeometry,
+  PolygonHierarchy,
+  Primitive,
+  Rectangle,
+  sampleTerrain,
+  ScreenSpaceEventHandler,
+  ScreenSpaceEventType,
+  SingleTileImageryProvider,
+  UrlTemplateImageryProvider,
+  Viewer,
+} from 'cesium'
+import type { FeatureCollection } from 'geojson'
+
+import { breathingAlpha, breathingSize, elapsedSeconds } from '@/core/config'
+import { buildTiandituUrl, defaultCameraCenter, MAP_CONFIG, zoomToHeight } from '@/core/config'
+import type { IndexedItem } from '@/shared'
+import { createSpatialIndex, LAYER_DEFAULTS, showError, showWarning } from '@/shared'
+import { breathingPoints, isStaleToken, logger, normalizePoint } from '@/shared'
+import type {
+  BaseLayerPair,
+  CameraState,
+  FlyToOptions,
+  FlyToTarget,
+  GeoPoint,
+  ImageOverlayData,
+  LayerOptions,
+  PointFeature,
+  PolygonFeature,
+  Tiles3DOptions,
+  WaterSurfaceOptions,
+} from '@/types'
+
+import {
+  isHeavyGeoJson,
+  isHeavyPolygons,
+  isHeavyVertexCount,
+  scheduleLazySkyBox,
+  setupCameraDebounce,
+  unbindPerf,
+} from '../perf/cameraPerf'
+import { type LayerState, MapRenderer } from './MapRenderer'
+
+/** 相机默认俯仰角（度）：-90° 俯视（引擎切换刻意不传递倾斜状态——OL 无 pitch 概念） */
+const DEFAULT_CAMERA_PITCH_DEG = -90
+
+/** 3D 相机缩放限位（米； 提常量，与 OL zoom 6-20 档位对应） */
+const CAMERA_MIN_ZOOM_DISTANCE = 100
+const CAMERA_MAX_ZOOM_DISTANCE = 500000
+
+/**
+ * 根地形瓦片（Level 0）累计失败达到该次数即判定地形不可用、自动降级为平坦椭球（重试兜底阈值）。
+ * 背景：3D 影像必须贴在地形四叉树网格上，根瓦片 404 会导致整张底图请求都不发出（纯黑）。
+ * GeographicTilingScheme 根层仅 2 张瓦片，主判据是"两张不同根瓦片都失败"（见 _setupTerrain），
+ * 本阈值处理同一瓦片重复报错、另一张迟迟不回的边缘情况，可容忍 1~2 次瞬时网络抖动。
+ */
+const TERRAIN_ROOT_ERROR_FALLBACK_THRESHOLD = 3
+
+/**
+ * hillshade 影像固有地理范围（EPSG:4326，[西,南,东,北]； 提常量）。
+ * 注意：与 BEIBU_GULF_BBOX（业务过滤范围 105-115/18-25）不同源属有意——该 PNG 为固定像素影像，
+ * 强行拉伸到业务 bbox 会变形；影像范围由 tools/dem-pipeline 生成时决定，改范围须重出影像。
+ * 惰性求值：模块顶层调用 Cesium API 会使 jsdom 单测（mock cesium 无 fromDegrees）加载即挂，
+ * 仅在使用路径（3D hillshade 图层）触发。
+ */
+function getHillshadeImageBBox(): Rectangle {
+  return Rectangle.fromDegrees(106.9720001, 20.9379894, 110.0783727, 23.0760978)
+}
+
+// CesiumViewer单例：全局唯一Viewer，按需mount/unmount复用，30s空闲自动销毁
+class CesiumViewerManager {
+  viewer: Viewer | null
+  isMounted: boolean
+  _baseLayersInitialized: boolean
+  _idleDestroyTimer: ReturnType<typeof setTimeout> | null
+  IDLE_DESTROY_DELAY: number
+  _baseLayers: BaseLayerPair
+  /** mount 后双 rAF 补 resize/补帧的句柄，destroy 时统一取消防卸载后回调 */
+  _deferredRafIds: Set<number>
+  /**
+   * WebGL 上下文丢失具名回调（CesiumRenderer.destroyEvents 注销用）。
+   * Viewer 单例复用 → scene.canvas 常驻不变，匿名函数无法摘除 ⇒ 重挂会累加
+   * （表现为上下文丢失弹 N 次 toast + 闭包持有已销毁 renderer）。2026-09-11 具名化。
+   */
+  _webglContextLostHandler: ((e: Event) => void) | null
+  /**
+   * 渲染循环错误具名回调（destroyEvents 注销用）。Viewer 单例复用 → scene.renderError
+   * 事件对象常驻不变，匿名监听重挂即累加（同 webglcontextlost 病根）。
+   */
+  _renderErrorHandler: ((_scene: unknown, error: unknown) => void) | null
+  /** 渲染错误 toast 一次性标志（随 register 重置，对齐旧闭包按次挂载的语义） */
+  _renderErrorToastShown: boolean
+
+  constructor() {
+    this.viewer = null
+    this.isMounted = false
+    this._baseLayersInitialized = false
+    this._idleDestroyTimer = null
+    this.IDLE_DESTROY_DELAY = 30000
+    this._baseLayers = { image: [], vector: [] }
+    this._deferredRafIds = new Set<number>()
+    this._webglContextLostHandler = null
+    this._renderErrorHandler = null
+    this._renderErrorToastShown = false
+  }
+
+  // 首次创建Viewer，后续调用返回已有实例
+  create(container: HTMLElement): Viewer | null {
+    this._clearIdleDestroyTimer()
+
+    if (this.viewer) {
+      return this.viewer
+    }
+
+    this.viewer = new Viewer(container, {
+      baseLayer: false,
+      baseLayerPicker: false,
+      skyBox: false, // z038③ 星空懒加载：首帧后 idle 补建（见 cameraPerf.scheduleLazySkyBox）
+      fullscreenButton: false,
+      homeButton: false,
+      // 默认 geocoder 启用会发 Ion 请求（公网依赖+隐私），显式关闭
+      geocoder: false,
+      sceneModePicker: false,
+      navigationHelpButton: false,
+      timeline: false,
+      animation: false,
+      // Cesium 自带错误面板（渲染循环出错弹系统风格错误框）与实体 InfoBox 一并关闭：
+      // 错误走下方 renderError 监听进日志 + GCS toast，不再弹"原生弹窗"
+      showRenderLoopErrors: false,
+      infoBox: false,
+      // requestRenderMode 按需渲染：静止零开销，图层/水面/相机防抖/动画等动态路径均已显式 requestRender
+      // HDR/FXAA 不在此显式传入：Cesium 默认即关（scene.highDynamicRange=false、FXAA 后处理默认禁用），
+      // 与下方 msaaSamples=1 共同构成「关后处理」组合——原注释称"关 HDR/FXAA"但参数从未传过，
+      // 实为默认值兜底，注释已更正（09-11 审计）。cesium 类型未收录这些字段（版本差异），
+      // 如需显式控制须结构化断言后走 scene 属性
+      requestRenderMode: true,
+      maximumRenderTimeChange: Infinity,
+      // cesium 类型未收录 highDynamicRange/fxaa（版本差异），结构化断言保留运行期行为
+    } as unknown as ConstructorParameters<typeof Viewer>[1]) // why: highDynamicRange/fxaa 未进 Cesium d.ts；exit: 类型收录这些 Viewer 选项后删断言
+
+    // 渲染循环错误进日志 + 全局 toast（一次性防刷屏）——具名监听：
+    // Viewer 单例复用下 scene.renderError 常驻不变，匿名监听重挂即累加（同 a085 病根）
+    this.registerRenderErrorHandler()
+
+    // WebGL 上下文丢失检测：开发期频繁 HMR/整页 reload 会累积 WebGL 上下文（浏览器每 tab
+    // 上限约 16 个），超限后新建 canvas 全黑且**无任何报错**——「3D 一片黑/底图丢失」的
+    // 静默形态。此处把黑屏显性化：日志 + toast 明示刷新，不再让用户对着黑屏猜。
+    this.registerWebglContextLostHandler()
+
+    // globe 级性能参数收口（见 _applyGlobePerfTuning：SSE 4 / tileCacheSize 200 / 关 MSAA）
+    this._applyGlobePerfTuning(this.viewer.scene)
+    // 关大气地面散射与雾（240Hz 下每帧计算的视觉开销，非业务必需）
+    this.viewer.scene.globe.showGroundAtmosphere = false
+    this.viewer.scene.fog.enabled = false
+
+    this.isMounted = true
+    scheduleLazySkyBox(this.viewer)
+    return this.viewer
+  }
+
+  /**
+   * 注册 WebGL 上下文丢失监听（具名字段，可摘）。
+   * ⚠️ 不得改回内联匿名箭头函数：Viewer 单例复用 → `scene.canvas` 常驻不变，
+   * 匿名函数没有引用可供 removeEventListener，重挂会持续累加
+   * （表现为上下文丢失弹 N 次 toast + 闭包持有已销毁 renderer）。2026-09-11 修复。
+   * 幂等：已有注册则先摘再挂，防重复调用叠加。
+   */
+  registerWebglContextLostHandler(): void {
+    this.unregisterWebglContextLostHandler()
+    const canvas = this.viewer?.scene?.canvas
+    if (!canvas) return
+    this._webglContextLostHandler = (e: Event): void => {
+      e.preventDefault()
+      logger.error('[Cesium] WebGL 上下文丢失（多标签页/频繁刷新累积所致），需刷新页面恢复')
+      showError('3D 渲染上下文丢失，请关闭多余标签页并刷新页面')
+    }
+    canvas.addEventListener('webglcontextlost', this._webglContextLostHandler)
+  }
+
+  /** 摘除 WebGL 上下文丢失监听（destroy 路径调用；与 register 成对，保证 add/remove 一一对应） */
+  unregisterWebglContextLostHandler(): void {
+    if (!this._webglContextLostHandler) return
+    this.viewer?.scene?.canvas?.removeEventListener(
+      'webglcontextlost',
+      this._webglContextLostHandler
+    )
+    this._webglContextLostHandler = null
+  }
+
+  /**
+   * 注册渲染循环错误监听（具名字段，可摘）。
+   * ⚠️ 不得改回内联匿名箭头：Viewer 单例复用 → `scene.renderError` 事件对象常驻不变，
+   * 匿名函数无引用可摘，重挂持续累加（一次渲染错误弹 N 次 toast）。
+   * 幂等：已有注册则先摘再挂。toast 一次性标志随注册重置（对齐旧闭包语义）。
+   */
+  registerRenderErrorHandler(): void {
+    this.unregisterRenderErrorHandler()
+    const event = this.viewer?.scene?.renderError
+    if (!event) return
+    this._renderErrorToastShown = false
+    this._renderErrorHandler = (_scene: unknown, error: unknown): void => {
+      logger.error('[Cesium] 渲染循环错误（原生错误面板已禁用）:', error)
+      if (!this._renderErrorToastShown) {
+        this._renderErrorToastShown = true
+        showError('地图渲染异常，请刷新页面重试')
+      }
+    }
+    event.addEventListener(this._renderErrorHandler)
+  }
+
+  /** 摘除渲染循环错误监听（destroy 路径调用；与 register 成对，保证 add/remove 一一对应） */
+  unregisterRenderErrorHandler(): void {
+    if (!this._renderErrorHandler) return
+    this.viewer?.scene?.renderError?.removeEventListener(this._renderErrorHandler)
+    this._renderErrorHandler = null
+  }
+
+  /**
+   * globe 级性能参数（交互帧率三件套，09-11 修复收口）。
+   * ⚠️ maximumScreenSpaceError 与 tileCacheSize 都是 **Globe** 的属性（Cesium d.ts Globe 类），
+   * Scene 上不存在——此前 `(scene as unknown as {...}).maximumScreenSpaceError = 4` 实为往
+   * scene 对象挂无用属性，08-11（441f6a0e）引入以来该优化从未生效（真值一直是默认 2，
+   * 09-10 性能测评实测线上 SSE=2 佐证）。本方法集中收口并附测试，防再次挂错对象。
+   */
+  _applyGlobePerfTuning(scene: {
+    globe: { maximumScreenSpaceError: number; tileCacheSize: number }
+    msaaSamples: number
+  }): void {
+    // SSE 4（默认 2）：globe/地形网格细化误差容忍翻倍，网格量约减半，拖拽显著更流畅
+    //（远处地形略简，视觉可接受）
+    scene.globe.maximumScreenSpaceError = 4
+    // 地形瓦片缓存翻倍（默认 100）：缩放/旋转回看时命中缓存，减少瓦片重建
+    scene.globe.tileCacheSize = 200
+    // 关 4xMSAA（Viewer 构造默认 4）：核显填充率开销大；240Hz 屏每帧预算约 6ms，
+    // 抗锯齿走默认关闭的 FXAA 链路（需要时 scene.postProcessStages.fxaa.enabled 按需开）
+    scene.msaaSamples = 1
+  }
+
+  mount(el: HTMLElement): boolean {
+    if (!this.viewer) {
+      return false
+    }
+
+    if (!el) {
+      return false
+    }
+
+    // 清除空闲销毁定时器（用户回来了）
+    this._clearIdleDestroyTimer()
+
+    const viewerContainer = this.viewer.container
+
+    // viewerContainer 即 el 本身：已在正确位置，仅刷新
+    if (viewerContainer === el) {
+      this.isMounted = true
+      this.viewer.resize()
+      // 保持按需渲染（曾无条件持续渲染致 240Hz 屏静止时 GPU 空转掉帧），仅刷新当前帧
+      this.viewer.scene.requestRender()
+      this._enableCameraControls()
+      this._scheduleDeferredResize()
+      return true
+    }
+
+    // viewerContainer 父节点不是 el：移动到新容器
+    if (viewerContainer && viewerContainer.parentNode !== el) {
+      el.appendChild(viewerContainer)
+    }
+
+    // 无论是否移动 DOM，都重置状态，防止复用时的旧 unmount 状态影响交互
+    this.isMounted = true
+    this.viewer.resize()
+    // 同上方：保持按需渲染，仅刷新当前帧
+    this.viewer.scene.requestRender()
+    // 确保相机控制器的交互能力正常（拖拽、旋转、缩放等）
+    this._enableCameraControls()
+    // v-show 切换/appendChild 后浏览器布局可能滞后一两帧，此刻 resize 读到的可能仍是
+    // 0×0（黑屏/无底图的经典入口）。双 rAF 后再补一次 resize+渲染兜底，配合 ResizeObserver 自愈
+    this._scheduleDeferredResize()
+
+    return true
+  }
+
+  /**
+   * 布局滞后兜底：挂载后用双 rAF 再做一次 resize + requestRender。
+   * 按需渲染（requestRenderMode）下只在挂载瞬间发一帧，若那一帧容器还没完成布局，
+   * 后续静止不再绘制就会停在黑帧；这里在布局落定后主动补帧。
+   */
+  _scheduleDeferredResize() {
+    if (typeof requestAnimationFrame !== 'function') return
+    const r1 = requestAnimationFrame(() => {
+      const r2 = requestAnimationFrame(() => {
+        this._deferredRafIds.delete(r1)
+        this._deferredRafIds.delete(r2)
+        if (!this.viewer) return
+        this.viewer.resize()
+        this.viewer.scene.requestRender()
+      })
+      this._deferredRafIds.add(r2)
+    })
+    this._deferredRafIds.add(r1)
+  }
+
+  /** 启用相机控制器全部交互（拖拽/旋转/缩放/倾斜），首次创建与每次挂载时调用防止状态被意外修改 */
+  _enableCameraControls() {
+    if (!this.viewer) return
+    const controller = this.viewer.scene.screenSpaceCameraController
+    controller.enableRotate = true
+    controller.enableTranslate = true
+    controller.enableZoom = true
+    controller.enableTilt = true
+    controller.enableLook = true
+  }
+
+  /** 从 DOM 卸载（不销毁 Viewer 保留状态）：暂停渲染降 GPU 占用，并启动 30s 空闲销毁定时器 */
+  unmount() {
+    if (!this.viewer || !this.isMounted) {
+      return
+    }
+
+    this.isMounted = false
+    // 暂停渲染，降低GPU占用（容器由 Vue v-show 隐藏为 display:none，此处停止渲染循环即可）
+    this.viewer.scene.requestRenderMode = true
+    // 启动空闲销毁定时器（30秒后自动销毁释放内存）
+    this._startIdleDestroyTimer()
+  }
+
+  /** 30s 空闲后自动销毁 Viewer 释放内存 */
+  _startIdleDestroyTimer() {
+    this._clearIdleDestroyTimer()
+    this._idleDestroyTimer = setTimeout(() => {
+      logger.debug('[CesiumViewerManager] 30秒空闲，自动销毁Viewer释放内存')
+      this.destroy()
+    }, this.IDLE_DESTROY_DELAY)
+  }
+
+  /** 清除空闲销毁定时器 */
+  _clearIdleDestroyTimer() {
+    if (this._idleDestroyTimer) {
+      clearTimeout(this._idleDestroyTimer)
+      this._idleDestroyTimer = null
+    }
+  }
+
+  getInstance() {
+    return this.viewer
+  }
+
+  isBaseLayersInitialized() {
+    return this._baseLayersInitialized
+  }
+
+  /** 标记底图已初始化 */
+  markBaseLayersInitialized() {
+    this._baseLayersInitialized = true
+  }
+
+  /** 设置底图引用（供复用的新 CesiumRenderer 实例获取，替代直写私有字段） */
+  setBaseLayers(layers: BaseLayerPair): void {
+    this._baseLayers = layers
+  }
+
+  /** 获取底图引用 */
+  getBaseLayers() {
+    return this._baseLayers || null
+  }
+
+  /** 真正销毁 Viewer（常规卸载不调用，保留复用语义） */
+  destroy() {
+    // 销毁前取消 30s 空闲销毁定时器——unmount() 会重排该定时器，
+    // 不清理则 fire 时 viewer 已为 null 的 no-op 定时器残留
+    this._clearIdleDestroyTimer()
+    // 取消挂载后的延迟补帧回调，防止 Viewer 销毁后仍操作已释放实例
+    this._deferredRafIds.forEach((id) => cancelAnimationFrame(id))
+    this._deferredRafIds.clear()
+    if (this.viewer) {
+      this.unmount()
+      this.viewer.destroy()
+      this.viewer = null
+      this._baseLayersInitialized = false
+    }
+  }
+
+  /** 显式销毁 Viewer（仅应用退出/HMR/测试场景；常规卸载走 unmount() 保留复用） */
+  destroyViewer() {
+    this._clearIdleDestroyTimer()
+    this.destroy()
+  }
+}
+
+// 全局单例管理器
+export const cesiumViewerManager = new CesiumViewerManager()
+
+/**
+ * Cesium 3D 渲染器。
+ * 单例 Viewer + 按需挂载：首次进入 3D 创建，离开仅 unmount，再进入复用状态保留。
+ */
+export class CesiumRenderer extends MapRenderer {
+  viewer: Viewer | null
+  baseLayers: BaseLayerPair
+  _isReusing: boolean
+  _cameraDebounceTimer: ReturnType<typeof setTimeout> | null
+
+  /** 取消在途相机防抖：3D→2D 切换路径调用——防抖回调持有渲染器引用，
+   *  切走后到期只会对已 unmount 的实例空触发一次渲染，且可能顶撞复用窗口。 */
+  cancelPendingCameraDebounce(): void {
+    if (this._cameraDebounceTimer) {
+      clearTimeout(this._cameraDebounceTimer)
+      this._cameraDebounceTimer = null
+    }
+  }
+  _terrainProvider: CesiumTerrainProvider | null
+  _terrainEnabled: boolean
+  /** 地形初始化在途守卫：挂载初始化与开关重试（setTerrainEnabled）并发时复用同一次建连 */
+  _terrainSetupInFlight: Promise<void> | null
+  /** 地形已降级为平坦椭球（根瓦片失败兜底），避免重复降级；setTerrainEnabled(true) 时重置重试 */
+  _terrainDegraded: boolean
+  /** Level 0 根瓦片累计失败次数（仅根层计数，深层瓦片缺失只产生局部空洞、不降级） */
+  _rootTileErrorCount: number
+  /** 已失败的根瓦片坐标集合 "x/y"：两张根瓦片都失败即判定根层不可用（不依赖重试次数） */
+  _rootTileErrorKeys: Set<string>
+  /** 地形 provider.errorEvent 具名回调（destroyEvents 随实例注销，防止闭包持有已销毁 renderer） */
+  _terrainErrorHandler: ((err: unknown) => void) | null
+  _imageryErrorLogged: boolean
+  /** 底图 errorEvent 具名回调（供 destroyEvents 注销；provider 常驻单例 Viewer，须随 renderer 销毁摘除，5.2-1） */
+  _imageryErrorHandler: ((err: unknown) => void) | null
+  /** 挂载了 errorEvent 的底图 provider（destroyEvents 逐个 removeEventListener 用） */
+  _imageryErrorProviders: UrlTemplateImageryProvider[]
+  /**
+   * WebGL 上下文丢失具名回调（destroyEvents 注销用）。
+   * Viewer 单例复用 → scene.canvas 常驻不变，匿名函数无法摘除 ⇒ 重挂会累加
+   * （表现为上下文丢失弹 N 次 toast + 闭包持有已销毁 renderer）。2026-09-11 具名化。
+   */
+  _webglContextLostHandler: ((e: Event) => void) | null
+  _screenSpaceEventHandler: ScreenSpaceEventHandler | null
+  _waterSurfaces: Map<string, WaterSurfaceEntry> | null
+  _breathing: BreathingChannel = { entities: [], animId: null, frame: null }
+  // 设施 POI 专属呼吸（缩放式动效）：独立通道，与 startBreathing（呼吸灯式）同屏并存
+  _facilityBreathing: BreathingChannel = { entities: [], animId: null, frame: null }
+  _geoJsonTokens: Map<string, symbol>
+
+  constructor(container: HTMLElement) {
+    super(container)
+    this.viewer = null
+    this.baseLayers = { image: [], vector: [] }
+    this._isReusing = false // 标记是否复用已有 Viewer
+    this._cameraDebounceTimer = null // 相机变化防抖定时器
+    /** 真地形 provider 引用（setTerrainEnabled 降级重试用）；未就绪为 null —— 即「地形是否就绪」的唯一判据 */
+    this._terrainProvider = null
+    /**
+     * 真地形（z 起伏）期望状态。
+     *
+     * 2026-09-28 起默认 false：真地形改为图层面板里的**可选图层**（layerType 'terrain'），
+     * 挂载时只预加载 CesiumTerrainProvider（_setupTerrain）但不应用，默认保持平坦椭球。
+     * 原因是用户实测真地形与 3D Tiles 同时开启时模型落位错乱，二者不能共存（见
+     * layerAdapters 的 terrain adapter 与 BusinessLayerManager 互斥处理）。
+     * 仅根瓦片连续失败时由 _engageTerrainFallback 走降级路径（切平坦椭球保底图可见）。
+     * 保留该字段而非硬编码，是为开关与降级后重试语义留下单一判据。
+     */
+    this._terrainEnabled = false
+    this._terrainSetupInFlight = null
+    this._terrainDegraded = false
+    this._rootTileErrorCount = 0
+    this._rootTileErrorKeys = new Set<string>()
+    this._terrainErrorHandler = null
+    /** 底图瓦片失败 warn 只打一次（防每个瓦片刷屏） */
+    this._imageryErrorLogged = false
+    this._imageryErrorHandler = null
+    this._imageryErrorProviders = []
+    this._webglContextLostHandler = null
+    this._screenSpaceEventHandler = null
+    this._waterSurfaces = null
+    this._breathing = { entities: [], animId: null, frame: null }
+    this._facilityBreathing = { entities: [], animId: null, frame: null }
+    this._geoJsonTokens = new Map()
+    this._initViewer()
+  }
+
+  _initViewer() {
+    // 复用场景判断（单例已存在）
+    const existingViewer = cesiumViewerManager.getInstance()
+    this._isReusing = !!existingViewer
+
+    // 经单例管理器创建或获取 Viewer
+    this.viewer = cesiumViewerManager.create(this.container)
+
+    // create() 在 Viewer 已存在时直接返回、不会自动挂载，复用场景须显式 mount 到新容器
+    if (this._isReusing) {
+      cesiumViewerManager.mount(this.container)
+    }
+
+    // 仅首次创建时初始化场景
+    if (!this._isReusing) {
+      this._positionCamera()
+      this._initBaseLayers()
+      // 真 3D 地形：CesiumTerrainProvider 按需 LOD 加载 CTB（地形金字塔切片工具）预切瓦片；
+      // 成功置 _terrainProvider（地形就绪的唯一判据），失败静默降级为全量贴图（不阻塞 Viewer）。
+      // 注意：DEM 图层（hillshade）与真地形**互不耦合**——DEM 是用户可独立开关的影像图层，
+      // 真地形是常驻基础能力，故此处不隐藏 hillshade（详见 addGeoTIFFLayer 注释）
+      void this._setupTerrain()
+    } else {
+      // 复用实例从单例管理器取底图引用
+      this.baseLayers = cesiumViewerManager.getBaseLayers()
+    }
+
+    // 事件处理器绑定到当前实例，每次挂载都要重新绑定
+    this._setupClickHandler()
+
+    // 首次创建与复用都必须启用相机控制与缩放限位，否则复用后交互可能失效
+    this._setupZoomLimits()
+
+    // 相机变化 300ms 防抖，避免移动时频繁渲染与状态同步
+    this._setupCameraDebounce()
+  }
+
+  /** 相机变化 300ms 防抖后触发渲染与状态同步（避免拖拽/缩放中频繁更新，降低 CPU/GPU 负载） */
+  _setupCameraDebounce() {
+    // 委托至模块级函数（本文件下方）
+    setupCameraDebounce(this)
+  }
+
+  _setupZoomLimits(): void {
+    const viewer = this.viewer
+    if (!viewer) return
+    const controller = viewer.scene.screenSpaceCameraController
+    // 缩放限位提常量（与 OL zoom 6-20 档位对应，见 CAMERA_*_ZOOM_DISTANCE）
+    controller.minimumZoomDistance = CAMERA_MIN_ZOOM_DISTANCE
+    controller.maximumZoomDistance = CAMERA_MAX_ZOOM_DISTANCE
+    // 显式启用相机控制器全部交互（拖拽/旋转/缩放/倾斜）
+    controller.enableRotate = true
+    controller.enableTranslate = true
+    controller.enableZoom = true
+    controller.enableTilt = true
+    controller.enableLook = true
+  }
+
+  /** 真地形接入：/static/terrain/ 目录 → CesiumTerrainProvider。失败静默降级（不阻塞 Viewer）。 */
+  async _setupTerrain(): Promise<void> {
+    // 在途守卫：首建失败后的开关重试（setTerrainEnabled）与挂载初始化并发时，不重复建连
+    if (this._terrainSetupInFlight) return this._terrainSetupInFlight
+    this._terrainSetupInFlight = this._doSetupTerrain().finally(() => {
+      this._terrainSetupInFlight = null
+    })
+    return this._terrainSetupInFlight
+  }
+
+  private async _doSetupTerrain(): Promise<void> {
+    try {
+      const viewer = this.viewer
+      if (!viewer) return
+      // fromUrl 将传入 URL 视为目录并拼接 layer.json（传文件 URL 会拼错 404），必须传目录 URL
+      const provider = await CesiumTerrainProvider.fromUrl('/static/terrain/', {
+        // CTB（地形金字塔切片工具）输出 gzip 压缩流，Cesium 自动识别解压，无需服务器声明编码
+        requestVertexNormals: true,
+      })
+      // viewer 可能已被 30s 闲置销毁，销毁后属性清空访问即崩
+      if (!viewer || !viewer.scene || viewer.isDestroyed()) return
+      this._terrainProvider = provider
+      // 根瓦片失败守卫：layer.json 200 只代表清单可读，单瓦片（尤其 Level 0 根瓦片）404
+      // 时地形四叉树建不起来，影像瓦片请求不会发出，整张底图被拖黑。监听 provider.errorEvent，
+      // 根瓦片连续失败即自动降级椭球，保证底图永远可见（代价仅是没有 z 起伏）。
+      this._rootTileErrorCount = 0
+      this._rootTileErrorKeys = new Set<string>()
+      this._terrainErrorHandler = (err: unknown): void => {
+        const msg = err instanceof Error ? err.message : String(err ?? '')
+        // 仅 Level 0 根瓦片失败会拖垮全球；深层瓦片缺失只产生局部空洞，不降级
+        const rootMatch = /X:\s*(\d+)\s+Y:\s*(\d+)\s+Level:\s*0\b/.exec(msg)
+        if (!rootMatch) return
+        this._rootTileErrorCount += 1
+        this._rootTileErrorKeys.add(`${rootMatch[1]}/${rootMatch[2]}`)
+        if (this._terrainDegraded) return
+        // 主判据：两张不同根瓦片均失败（Geographic 方案根层固定 2 张）；
+        // 兜底判据：同一瓦片累计失败达阈值（另一张迟迟不回的边缘情况）
+        const rootLayerBroken =
+          this._rootTileErrorKeys.size >= 2 ||
+          this._rootTileErrorCount >= TERRAIN_ROOT_ERROR_FALLBACK_THRESHOLD
+        if (rootLayerBroken) {
+          this._engageTerrainFallback(
+            `根地形瓦片失败（${this._rootTileErrorCount} 次，${this._rootTileErrorKeys.size} 张根瓦片）：${msg}`
+          )
+        }
+      }
+      provider.errorEvent.addEventListener(this._terrainErrorHandler)
+      // 降级态（根瓦片失败）下不覆盖椭球面，等重试成功再启用；正常态恒启用
+      if (this._terrainEnabled !== false) {
+        viewer.terrainProvider = provider
+      }
+      // 不自动隐藏 hillshade：DEM（数字高程模型）是独立图层，显隐由图层面板开关控制
+      viewer.scene.requestRender()
+      logger.debug('[CesiumRenderer] 真地形接入成功: /static/terrain/layer.json')
+    } catch (e) {
+      // 加载失败保持椭球面 + hillshade 回退，记录原因便于排查（常见：dev 未重启 / 后端未起 / 瓦片目录缺失）
+      logger.warn('[CesiumRenderer] 真地形接入跳过:', e instanceof Error ? e.message : e)
+    }
+  }
+
+  /**
+   * 地形根瓦片不可用时的兜底：切回平坦椭球面，让天地图影像正常贴上，避免整屏纯黑。
+   * 保留 _terrainProvider 引用，可经 setTerrainEnabled(true) 重新尝试。
+   */
+  _engageTerrainFallback(reason: string): void {
+    const viewer = this.viewer
+    if (!viewer || !viewer.scene || viewer.isDestroyed() || this._terrainDegraded) return
+    this._terrainDegraded = true
+    viewer.terrainProvider = new EllipsoidTerrainProvider()
+    viewer.scene.requestRender()
+    logger.warn('[CesiumRenderer] 真地形降级为平坦椭球（底图不受影响）:', reason)
+    // 非阻断提示：用户仍可正常使用底图与业务图层，仅缺少地形起伏
+    showWarning('真实地形瓦片加载失败，已临时切换为平面地图（底图与业务功能不受影响）')
+  }
+
+  /**
+   * 切换 terrainProvider（true = CTB 真地形 z 起伏，false = 平坦椭球面）。
+   *
+   * 调用面（2026-09-21 收敛）：**不再是用户开关**，只作降级后的重试入口——
+   * 地形已于挂载时自动加载（_setupTerrain），无面板开关；此前由
+   * layerAdapters 的 geotiff.setVisibility 联动调用，该联动已切断。
+   * 降级后重新打开：重置失败计数再试一次；若根瓦片仍坏，errorEvent 守卫会再次自动降级。
+   */
+  setTerrainEnabled(enabled: boolean): void {
+    this._terrainEnabled = enabled
+    if (!this.viewer || !this.viewer.scene || this.viewer.isDestroyed()) return
+    // provider 未就绪：若仍要求开启（含首建失败的永久 no-op 场景，审查 M-11），
+    // 触发一次重试而非直接返回——否则首会话地形加载失败 + 实例复用不重建，
+    // 本开关永远无效。在途守卫防连点重复建连；成功后 _setupTerrain 按 _terrainEnabled 落位
+    if (!this._terrainProvider) {
+      if (enabled) void this._setupTerrain()
+      return
+    }
+    if (enabled) {
+      this._terrainDegraded = false
+      this._rootTileErrorCount = 0
+      this._rootTileErrorKeys = new Set<string>()
+      this.viewer.terrainProvider = this._terrainProvider
+    } else {
+      this.viewer.terrainProvider = new EllipsoidTerrainProvider()
+    }
+    this.viewer.scene.requestRender()
+  }
+
+  _positionCamera(): void {
+    const viewer = this.viewer
+    if (!viewer) return
+    viewer.scene.globe.enableLighting = true
+    // 首屏必须落在地球上：直接进入 3D（无 2D→3D 状态迁移）时相机默认停在外太空，叠加按需渲染
+    // 会停在纯星空黑帧。这里瞬时 setView 到区域视角保证首帧可见地球；后续业务 flyTo 仍会从该
+    // 视角飞向城市（保留"地球飞转"动画，只是起点从外太空改为区域上空），importState 的相机迁移也会覆盖它。
+    const region = MAP_CONFIG.VIEW_LEVELS.REGION
+    viewer.camera.setView({
+      destination: Cartesian3.fromDegrees(region.center.lng, region.center.lat, region.height),
+      orientation: {
+        heading: 0,
+        pitch: CesiumMath.toRadians(DEFAULT_CAMERA_PITCH_DEG),
+        roll: 0,
+      },
+    })
+  }
+
+  _initBaseLayers(): void {
+    // 防止重复初始化底图
+    if (cesiumViewerManager.isBaseLayersInitialized()) {
+      return
+    }
+    const viewer = this.viewer
+    if (!viewer) return
+
+    // errorEvent 在 ImageryProvider 上而非 ImageryLayerCollection（挂后者抛 TypeError 致 3D 初始化失败）；首次失败 warn 一次
+    // 5.2-1：回调提为具名函数并持到实例字段（_imageryErrorHandler/_imageryErrorProviders），
+    // destroyEvents 逐个 removeEventListener——provider 挂单例 Viewer 常驻，不移除则闭包永久持有首个 renderer 实例
+    this._imageryErrorHandler = (err: unknown) => {
+      if (this._imageryErrorLogged) return
+      this._imageryErrorLogged = true
+      logger.warn(
+        '[CesiumRenderer] 底图瓦片加载失败（首次）:',
+        err instanceof Error ? err.message : err
+      )
+    }
+    const attachImageryErrorLog = (provider: UrlTemplateImageryProvider) => {
+      if (!provider?.errorEvent || !this._imageryErrorHandler) return
+      provider.errorEvent.addEventListener(this._imageryErrorHandler)
+      this._imageryErrorProviders.push(provider)
+    }
+
+    // UrlTemplateImageryProvider 不识别 {layerCode}/{key} 占位符（原样发送致天地图请求失败底图空白，
+    // OL 自实现模板替换所以正常），须预替换为字面值
+    const tiandituUrlForCesium = (layerCode: string) =>
+      buildTiandituUrl(layerCode)
+        .replace('{layerCode}', layerCode)
+        .replace('{key}', MAP_CONFIG.TIANDITU_KEY)
+
+    // 四个底图 Provider 同构（仅 layerCode 不同），maximumLevel 统一 18
+    const tiandituProvider = (layerCode: string) =>
+      new UrlTemplateImageryProvider({
+        url: tiandituUrlForCesium(layerCode),
+        maximumLevel: 18,
+      })
+
+    const imageBaseProvider = tiandituProvider(MAP_CONFIG.BASE_LAYERS.image.layers[0])
+    attachImageryErrorLog(imageBaseProvider)
+    const imageBaseLayer = viewer.imageryLayers.addImageryProvider(imageBaseProvider)
+    const imageAnnotationProvider = tiandituProvider(MAP_CONFIG.BASE_LAYERS.image.layers[1])
+    attachImageryErrorLog(imageAnnotationProvider)
+    const imageAnnotationLayer = viewer.imageryLayers.addImageryProvider(imageAnnotationProvider)
+    const vectorBaseProvider = viewer.imageryLayers.addImageryProvider(
+      tiandituProvider(MAP_CONFIG.BASE_LAYERS.vector.layers[0])
+    )
+    const vectorAnnotationProvider = viewer.imageryLayers.addImageryProvider(
+      tiandituProvider(MAP_CONFIG.BASE_LAYERS.vector.layers[1])
+    )
+    vectorBaseProvider.show = false
+    vectorAnnotationProvider.show = false
+
+    this.baseLayers.image = [imageBaseLayer, imageAnnotationLayer]
+    this.baseLayers.vector = [vectorBaseProvider, vectorAnnotationProvider]
+
+    // 底图引用存入单例管理器，供复用的新实例获取
+    cesiumViewerManager.setBaseLayers({
+      image: this.baseLayers.image,
+      vector: this.baseLayers.vector,
+    })
+
+    cesiumViewerManager.markBaseLayersInitialized()
+  }
+
+  _setupClickHandler() {
+    // 委托至模块级函数（本文件下方）
+    setupClickHandler(this)
+  }
+
+  addPointLayer(id: string, features: PointFeature[], options: LayerOptions = {}): void {
+    // 委托至模块级函数
+    addPointLayer(this, id, features, options)
+  }
+
+  /** 构建 Cesium 点 Entity（含 label/properties），供点图层与视口裁剪复用（构建逻辑单一来源） */
+  _createCesiumPointEntity(
+    id: string,
+    item: PointFeature,
+    index: number,
+    options: LayerOptions
+  ): Entity | null {
+    return createCesiumPointEntity(this, id, item, index, options)
+  }
+
+  /** 相机视口经纬度范围（简化估算）；注意 positionCartographic 为弧度，须 toDegrees 后与要素经纬度比较 */
+  _getViewportBBox(): ViewportBBox | null {
+    return getViewportBBox(this)
+  }
+
+  /** 点是否在视口内 */
+  _isInViewport(lng: number, lat: number, bbox: ViewportBBox | null): boolean {
+    return isInViewport(lng, lat, bbox)
+  }
+
+  /** 注册视口变化监听：相机移动时增量增删视口内外要素（requestAnimationFrame 防抖） */
+  _setupViewportListener(id: string): void {
+    setupViewportListener(this, id)
+  }
+
+  /** 视口变化时增量更新裁剪图层：移除出视口的 Entity，添加新进入的 */
+  _updateCulledLayer(id: string): void {
+    updateCulledLayer(this, id)
+  }
+
+  addPolygonLayer(id: string, features: PolygonFeature[], options: LayerOptions = {}): void {
+    addPolygonLayer(this, id, features, options)
+  }
+
+  async addGeoJsonLayer(
+    id: string,
+    geojson: FeatureCollection,
+    options: LayerOptions = {}
+  ): Promise<void> {
+    await addGeoJsonLayer(this, id, geojson, options)
+  }
+
+  /** 增量更新 GeoJSON 图层：复用 dataSource，避免重建闪烁 */
+  async updateGeoJsonLayer(
+    id: string,
+    geojson: FeatureCollection,
+    options: LayerOptions = {}
+  ): Promise<void> {
+    await updateGeoJsonLayer(this, id, geojson, options)
+  }
+
+  /**
+   * 添加 GeoTIFF 栅格图层（3D 回退方案）：Cesium 影像不支持 GeoTIFF 解码，将 .tif 映射为
+   * 预生成 hillshade PNG（WGS84 经纬度坐标系，EPSG:4326）贴椭球面——山体明暗观感，无真 z 起伏（伪三维）。
+   * 与 2D 共用同一份 BusinessLayerManager 注册；2D↔3D 切换时由 App.vue 的 reapplyAll 重绘。
+   */
+  addGeoTIFFLayer(id: string, url: string, options: LayerOptions = {}): boolean {
+    return addGeoTIFFLayer(this, id, url, options)
+  }
+
+  /**
+   * 添加 3D Tiles 瓦片集图层（3D Only）：Cesium3DTileset 流式加载 tileset.json（3D Tiles 1.1 glTF
+   * 内容或 1.0 b3dm 均可），瓦片定位由 tileset 自带 transform 决定，与此处只传 URL。
+   * 异步：失败返回 false（不抛），由 adapter 兜底日志，避免中断 reapplyAll 整批重绘。
+   */
+  async add3DTilesLayer(id: string, url: string, options: Tiles3DOptions = {}): Promise<boolean> {
+    return add3DTilesLayer(this, id, url, options)
+  }
+
+  /**
+   * 添加单张影像覆盖图层（3D Only）：把离线提取的影像块按地理矩形铺到球面上。
+   * 与 addGeoTIFFLayer（hillshade 专用）的区别：矩形与图片都不做命名假设，参数全由调用方给。
+   */
+  addImageOverlayLayer(id: string, data: ImageOverlayData, options: LayerOptions = {}): boolean {
+    return addImageOverlayLayer(this, id, data, options)
+  }
+
+  _doSetVisibility(id: string, visible: boolean): void {
+    doSetVisibility(this, id, visible)
+  }
+
+  _doRemoveLayer(layer: { instance: unknown; visible: boolean; options?: LayerOptions }): void {
+    doRemoveLayer(this, layer)
+  }
+
+  _doFlyTo(target: FlyToTarget, options: FlyToOptions = {}): void {
+    const viewer = this.viewer
+    if (viewer && 'layerId' in target && target.layerId) {
+      const layer = this._layers.get(target.layerId)
+      if (layer && layer.instance) {
+        if (Array.isArray(layer.instance) && layer.instance.length > 0) {
+          void viewer.flyTo(layer.instance[0] as Entity)
+          return
+        } else if ((layer.instance as { entities?: unknown }).entities) {
+          void viewer.flyTo(layer.instance as EntityCollection)
+          return
+        }
+      }
+    }
+    const height = options?.height ?? 5000
+    // 防御性编程：优先使用 lng，兼容可能的 lon 字段
+    const lng =
+      (target as { lng?: number; lon?: number }).lng ?? (target as { lon?: number }).lon ?? 0
+    const lat = (target as { lat: number }).lat
+    const destination = Cartesian3.fromDegrees(lng, lat, height)
+    viewer?.camera.flyTo({
+      destination,
+      // Cesium duration 单位为秒：读 FlyToOptions.duration ?? 默认 1
+      duration: options.duration ?? 1,
+      orientation: {
+        heading: CesiumMath.toRadians(options.heading || 0),
+        // 默认俯视 -90°（与 OL 2D 平坦视图一致），避免引擎切换时 pickEllipsoid 因倾斜产生偏移
+        // 提为常量（刻意设计：引擎切换不传递倾斜状态，见 doSetCameraState 注释）
+        pitch: CesiumMath.toRadians(options.pitch ?? DEFAULT_CAMERA_PITCH_DEG),
+        roll: 0,
+      },
+    })
+  }
+
+  _getCameraState(): CameraState {
+    const camera = this.viewer?.camera
+    if (!camera) {
+      return { center: defaultCameraCenter() }
+    }
+    const posCartographic = camera.positionCartographic
+    // 弧度坐标未就绪（极早期帧）防御：与 getViewportBBox 的判空口径一致（审查 L-6）
+    if (!posCartographic) {
+      return { center: defaultCameraCenter() }
+    }
+
+    // 导出 pitch（恢复时用）
+    const pitchDeg = CesiumMath.toDegrees(camera.pitch)
+
+    // 优先取屏幕中心射线落点 pickEllipsoid（用户实际注视点，受 tilt 影响），失败回退相机正下方 positionCartographic
+    const screenCenter = new Cartesian2(
+      (this.viewer?.container.clientWidth ?? 0) / 2,
+      (this.viewer?.container.clientHeight ?? 0) / 2
+    )
+    const cartesian = camera.pickEllipsoid(screenCenter)
+    let center: { lng: number; lat: number }
+    if (cartesian) {
+      const cartographic = Cartographic.fromCartesian(cartesian)
+      center = {
+        lng: CesiumMath.toDegrees(cartographic.longitude),
+        lat: CesiumMath.toDegrees(cartographic.latitude),
+      }
+    } else {
+      center = {
+        lng: CesiumMath.toDegrees(posCartographic.longitude),
+        lat: CesiumMath.toDegrees(posCartographic.latitude),
+      }
+    }
+
+    const state: CameraState = {
+      center,
+      height: posCartographic.height,
+      pitch: pitchDeg,
+    }
+
+    logger.debug('[CesiumRenderer._getCameraState] 导出状态:', {
+      center: state.center,
+      height: state.height,
+      heightKm: ((state.height ?? 0) / 1000).toFixed(2) + 'km',
+      pitch: pitchDeg.toFixed(2) + '°',
+      usingPick: cartesian !== null,
+    })
+
+    return state
+  }
+
+  _setCameraState(state: CameraState): void {
+    logger.debug('[CesiumRenderer._setCameraState] 导入原始状态:', state)
+
+    // 计算高度：优先使用 height，其次从 OL 的 zoom 转换
+    let height = state.height
+    if (height == null && state.zoom != null) {
+      height = zoomToHeight(state.zoom)
+    }
+    if (height == null) {
+      height = MAP_CONFIG.CAMERA.center.height
+    }
+    // 高度钳制 [200m, 2000km]：200m 避免贴地；上限对齐 VIEW_LEVELS.REGION 的 1600km（约 0.25 地球半径，视角安全）
+    height = Math.max(200, Math.min(height, 2000000))
+
+    // pitch 强制 -90° 俯视，不与 OL 之间传递倾斜状态（OL 无 pitch 概念）
+    const pitch = -90
+
+    logger.debug('[CesiumRenderer._setCameraState] 最终设置:', {
+      center: state.center,
+      height,
+      heightKm: (height / 1000).toFixed(2) + 'km',
+      pitch: pitch + '°',
+    })
+
+    const destination = Cartesian3.fromDegrees(state.center.lng, state.center.lat, height)
+
+    // 从默认远视角飞向北部湾目标，3s 足够完成跨半球飞行又不显拖沓
+    this.viewer?.camera.flyTo({
+      destination,
+      duration: 3.0,
+      orientation: {
+        heading: 0,
+        pitch: CesiumMath.toRadians(pitch),
+        roll: 0,
+      },
+    })
+  }
+
+  setBaseLayer(type: 'image' | 'vector'): void {
+    this.baseLayers.image.forEach((l) => {
+      if (l) {
+        ;(l as { show: boolean }).show = type === 'image'
+      }
+    })
+    this.baseLayers.vector.forEach((l) => {
+      if (l) {
+        ;(l as { show: boolean }).show = type === 'vector'
+      }
+    })
+    this.viewer?.scene.requestRender()
+  }
+
+  startBreathing(target: GeoPoint | GeoPoint[], color?: string): void {
+    this.stopBreathing()
+    // 单点定位（小区/受影响设施）不传色，取缺省主色
+    this.startBreathingEntities(this._breathing, target, color, false)
+  }
+
+  stopBreathing(): void {
+    this.disposeBreathingEntities(this._breathing)
+    this._breathing.animId = null
+    this._breathing.entities = []
+    this._breathing.frame = null
+  }
+
+  /**
+   * 设施 POI 专属呼吸（第二层筛选主角）：旧版缩放式动效——pixelSize 10±5 脉动 + 透明度随动，视觉显眼。
+   * 点可携带 per-point color（多类型混合呼吸各按类型色），缺省用统一 color 参数
+   */
+  startFacilityBreathing(target: Array<GeoPoint & { color?: string }>, color?: string): void {
+    this.stopFacilityBreathing()
+    this.startBreathingEntities(this._facilityBreathing, target, color, true)
+  }
+
+  stopFacilityBreathing(): void {
+    this.disposeBreathingEntities(this._facilityBreathing)
+    this._facilityBreathing.animId = null
+    this._facilityBreathing.entities = []
+    this._facilityBreathing.frame = null
+  }
+
+  /**
+   * 两路呼吸的共同骨架：viewer 守卫 → 非有限坐标剔除 → 建点实体 → rAF 帧循环。
+   * 唯一差异是取色口径（`perPoint`）：假则整层共用一个 color 属性（与原 startBreathing 同一对象），
+   * 真则逐点各建一个回调属性（闭包各自基准色），两者共享同一 startTime 相位。
+   */
+  private startBreathingEntities(
+    channel: BreathingChannel,
+    target: Array<GeoPoint & { color?: string }> | (GeoPoint & { color?: string }),
+    color: string | undefined,
+    perPoint: boolean
+  ): void {
+    const viewer = this.viewer
+    if (!viewer) return
+    // 非有限坐标跳过（不落 (0,0) 哨兵——crs.ts 禁令）
+    const points = breathingPoints(target)
+    if (points.length === 0) return
+    const startTime = Date.now()
+    // 脉动参数取自 core/config/breathing（与 OL 侧同源；此前两个渲染器各逐行复制一份）
+    const pixelSizeProperty = new CallbackProperty(() => {
+      return breathingSize(elapsedSeconds(startTime))
+    }, false)
+    const pulseColor = (c: Color) =>
+      new CallbackProperty(() => {
+        return c.withAlpha(breathingAlpha(elapsedSeconds(startTime)))
+      }, false)
+    // 缺省 LAYER_DEFAULTS.color = '#409eff'；perPoint=false 时整层共用这一个属性
+    const sharedColorProperty = perPoint
+      ? null
+      : pulseColor(Color.fromCssColorString(color || LAYER_DEFAULTS.color))
+    channel.entities = points.map((p) =>
+      viewer.entities.add({
+        position: Cartesian3.fromDegrees(p.lng, p.lat),
+        point: {
+          pixelSize: pixelSizeProperty,
+          color:
+            sharedColorProperty ??
+            pulseColor(Color.fromCssColorString(p.color || color || LAYER_DEFAULTS.color)),
+          outlineColor: Color.WHITE,
+          outlineWidth: 2,
+        },
+      })
+    )
+    channel.frame = () => {
+      if (channel.entities.length > 0 && this.viewer) {
+        this.viewer.scene.requestRender()
+        channel.animId = requestAnimationFrame(channel.frame as FrameRequestCallback)
+      }
+    }
+    channel.animId = requestAnimationFrame(channel.frame as FrameRequestCallback)
+  }
+
+  /** 呼吸动画清理共用体：先撤帧（真值才 cancel）再摘 entity；三字段归零由调用方负责 */
+  private disposeBreathingEntities(channel: BreathingChannel): void {
+    if (channel.animId) cancelAnimationFrame(channel.animId)
+    const viewer = this.viewer
+    if (viewer && channel.entities.length > 0) {
+      channel.entities.forEach((e) => viewer.entities.remove(e as Entity))
+    }
+  }
+
+  // 水面方法委托至模块级函数（本文件下方）
+  addWaterSurface(
+    id: string,
+    coordinates: [number, number][],
+    height = 0,
+    options: WaterSurfaceOptions = {}
+  ): Promise<boolean> {
+    return addWaterSurface(this, id, coordinates, height, options)
+  }
+
+  updateWaterLevel(id: string, newHeight: number): boolean {
+    return updateWaterLevel(this, id, newHeight)
+  }
+
+  removeWaterSurface(id: string): boolean {
+    return removeWaterSurface(this, id)
+  }
+
+  removeAllWaterSurfaces(): boolean {
+    return removeAllWaterSurfaces(this)
+  }
+
+  setWaterSurfaceVisibility(id: string, visible: boolean): boolean {
+    return setWaterSurfaceVisibility(this, id, visible)
+  }
+
+  /**
+   * 覆写基类 hasLayer：水面存于 _waterSurfaces 而非 _layers，基类查不到会令 BLM（业务图层管理器）
+   * 误判图层缺失而走 remove+add 全量重建，增量水位更新（updateWaterLevel 先建后换）永远走不到。
+   */
+  hasLayer(id: string): boolean {
+    return super.hasLayer(id) || (this._waterSurfaces?.has(id) ?? false)
+  }
+
+  /** 覆写 isLayerVisible：水面可见性存于 _waterSurfaces（含 visible 字段），面板按钮据此读真实状态 */
+  isLayerVisible(id: string): boolean {
+    if (super.isLayerVisible(id)) return true
+    const ws = this._waterSurfaces?.get(id)
+    return ws ? ws.visible : false
+  }
+
+  /**
+   * 3D Tiles 接入（MapRenderer.add3DTiles 的 3D 实现）。
+   *
+   * **只走 Cesium 原生 API，不改动 viewer / scene 的任何既有配置**：
+   *   `Cesium3DTileset.fromUrl(url, { maximumScreenSpaceError })` → `scene.primitives.add(tileset)`
+   *
+   * options.nameFilter：只保留 `extras.name` 命中该子串的子树，其余节点用 Cesium 原生
+   * `tile.show = false` 隐藏（祖先只要有一个后代命中就保持可见）——用于「只看某一个枢纽」。
+   */
+  async add3DTiles(
+    id: string,
+    url: string,
+    options: { maximumScreenSpaceError?: number; nameFilter?: string } = {}
+  ): Promise<boolean> {
+    const ok = await add3DTilesLayer(this, id, url, {
+      maximumScreenSpaceError: options.maximumScreenSpaceError,
+    })
+    if (!ok) return false
+    if (options.nameFilter) {
+      const inst = this._layers.get(id)?.instance as Cesium3DTileset | undefined
+      type AnyTile = { extras?: { name?: string }; children?: AnyTile[]; show?: boolean }
+      const keep = options.nameFilter
+      const mark = (t: AnyTile): boolean => {
+        const self = String(t.extras?.name ?? '').includes(keep)
+        let child = false
+        for (const c of t.children ?? []) child = mark(c) || child
+        const hit = self || child
+        t.show = hit
+        return hit
+      }
+      if (inst?.root) mark(inst.root as unknown as AnyTile) // why: AnyTile 是渲染器内部最小结构，与 Cesium3DTile 结构兼容；exit: mark 参数改用 Cesium 类型后
+      this.viewer?.scene.requestRender()
+    }
+    return true
+  }
+
+  getType() {
+    // 返回 '3d'（与 MapType 一致；原因同 OLRenderer.getType）
+    return '3d'
+  }
+
+  getViewer() {
+    return this.viewer
+  }
+
+  updateSize() {
+    this.viewer?.resize()
+    this.viewer?.scene.requestRender()
+  }
+
+  /** 卸载但不销毁 Viewer 单例：仅从 DOM 移除，保留实例供下次复用 */
+  destroy() {
+    // 清理事件监听（相机监听 + 屏幕事件处理器）
+    destroyEvents(this)
+
+    // 清理水面图层 Map，防止内存泄漏
+    if (this._waterSurfaces) {
+      this.removeAllWaterSurfaces()
+      this._waterSurfaces = null
+    }
+
+    super.destroy()
+    this.stopBreathing()
+    this.stopFacilityBreathing()
+    // 清理相机防抖定时器，防止内存泄漏
+    if (this._cameraDebounceTimer) {
+      clearTimeout(this._cameraDebounceTimer)
+      this._cameraDebounceTimer = null
+    }
+    // 清除空闲销毁定时器（如果存在）
+    cesiumViewerManager._clearIdleDestroyTimer()
+    // 不销毁Viewer，只从DOM卸载
+    cesiumViewerManager.unmount()
+    this.viewer = null
+  }
+
+  /**
+   * 显式真正销毁 Viewer（供测试/工具调用）。生产路径无需调用：
+   * destroy() 内部已启动 30s 空闲销毁定时器（cesiumViewerManager.unmount），
+   * UnifiedMap 常驻 App 根组件、卸载仅发生于应用退出/HMR，届时兜底自动回收 WebGL。
+   */
+  destroyViewer() {
+    cesiumViewerManager.destroyViewer()
+    this.viewer = null
+  }
+}
+
+// ===== 事件：相机防抖 / 点击 / 指针移动（模块级函数，经 renderer 实例委托） =====
+/**
+ * 事件管理：click / pointer-move / camera-changed 的注册与清理。
+ * 处理器引用存于 renderer 实例（_screenSpaceEventHandler）；相机回调存 cameraPerf 的 WeakMap。
+ */
+
+/** Cartesian3 → [lng, lat]（角度制） */
+function cartesianToLonLatArray(cartesian: Cartesian3): [number, number] {
+  const cartographic = Cartographic.fromCartesian(cartesian)
+  return [CesiumMath.toDegrees(cartographic.longitude), CesiumMath.toDegrees(cartographic.latitude)]
+}
+
+/**
+ * 引擎存活守卫（1004-03）：viewer 为空或已销毁（30s 空闲销毁 / 引擎切换）一律返回 null。
+ * 原 43 处 `viewer!` 裸断言把「引擎已销毁」变成 TypeError（reading camera of null），
+ * 错误形态与真实原因无关，还会打断清理链；统一走本守卫 + 调用点降级（return / 跳过日志）。
+ */
+function aliveViewer(renderer: CesiumRenderer): Viewer | null {
+  const viewer = renderer.viewer
+  if (!viewer) return null
+  if (typeof viewer.isDestroyed === 'function' && viewer.isDestroyed() === true) return null
+  return viewer
+}
+
+/** 点击/移动监听：LEFT_CLICK 拾取要素 properties 并 emit click；MOUSE_MOVE 回传鼠标经纬度 */
+function setupClickHandler(renderer: CesiumRenderer): void {
+  // 闭包捕获局部引用：事件回调晚于卸载窗口触发，经共享 renderer 解构
+  // 裸 viewer 断言依赖 destroyEvents 时序；setup 期一次判空 + 局部捕获更稳（1004-03 复核）
+  const clickViewer = renderer.viewer
+  if (!clickViewer) return
+  renderer._screenSpaceEventHandler = clickViewer.screenSpaceEventHandler
+  const handler = renderer._screenSpaceEventHandler
+  if (!handler) return
+  // Cesium 拾取事件载荷：{ position: Cartesian2 }（LEFT_CLICK）/ { endPosition }（MOUSE_MOVE）
+  handler.setInputAction((click: { position: Cartesian2 }) => {
+    const pickedObject = clickViewer.scene.pick(click.position)
+    const cartesian = clickViewer.camera.pickEllipsoid(click.position)
+    const coordinate = cartesian ? cartesianToLonLatArray(cartesian) : null
+
+    if (pickedObject && pickedObject.id && pickedObject.id.properties) {
+      const properties = pickedObject.id.properties.getValue?.() || pickedObject.id.properties
+      const featureType = properties.featureType
+      if (featureType) {
+        renderer.emit('click', {
+          featureType,
+          data: properties,
+          coordinate,
+        })
+        return
+      }
+    }
+    renderer.emit('click', {
+      featureType: null,
+      data: null,
+      coordinate,
+    })
+  }, ScreenSpaceEventType.LEFT_CLICK)
+
+  // pointer-move 事件（对应 MapRendererEventMap 声明）
+  handler.setInputAction((movement: { endPosition: Cartesian2 }) => {
+    const cartesian = clickViewer.camera.pickEllipsoid(
+      movement.endPosition,
+      clickViewer.scene.globe.ellipsoid
+    )
+    if (cartesian) {
+      const carto = Cartographic.fromCartesian(cartesian)
+      renderer.emit('pointer-move', {
+        lng: CesiumMath.toDegrees(carto.longitude),
+        lat: CesiumMath.toDegrees(carto.latitude),
+      })
+    }
+  }, ScreenSpaceEventType.MOUSE_MOVE)
+}
+
+/** 移除相机变化监听与屏幕事件处理器（LEFT_CLICK/MOUSE_MOVE），供 destroy 调用 */
+function destroyEvents(renderer: CesiumRenderer): void {
+  // 移除相机监听（changed 防抖 + z038② 交互期降载；具名回调存 cameraPerf 的 WeakMap）
+  unbindPerf(renderer)
+
+  // 清理屏幕事件处理器，防止内存泄漏
+  if (renderer._screenSpaceEventHandler) {
+    renderer._screenSpaceEventHandler.removeInputAction(ScreenSpaceEventType.LEFT_CLICK)
+    renderer._screenSpaceEventHandler.removeInputAction(ScreenSpaceEventType.MOUSE_MOVE)
+    renderer._screenSpaceEventHandler = null
+  }
+
+  // 移除底图 errorEvent 监听（5.2-1）：provider 挂单例 Viewer 常驻，不摘除则闭包
+  // 永久持有已销毁的 renderer 实例（handler 捕获 this）。与注册顺序无关，注销即断开引用。
+  if (renderer._imageryErrorProviders.length > 0 && renderer._imageryErrorHandler) {
+    for (const provider of renderer._imageryErrorProviders) {
+      provider?.errorEvent?.removeEventListener(renderer._imageryErrorHandler)
+    }
+    renderer._imageryErrorProviders = []
+  }
+  renderer._imageryErrorHandler = null
+
+  // 移除地形 provider.errorEvent 监听：同底图监听，handler 捕获 renderer 实例，不摘除则常驻
+  // 单例 Viewer 的 terrainProvider 会永久持有已销毁 renderer（5.2-1 同类泄漏）
+  if (renderer._terrainProvider && renderer._terrainErrorHandler) {
+    renderer._terrainProvider.errorEvent.removeEventListener(renderer._terrainErrorHandler)
+  }
+  renderer._terrainErrorHandler = null
+
+  // 移除 WebGL 上下文丢失监听（2026-09-11 补）：与 camera.changed 同一重灾区——
+  // Viewer 是**单例复用**（cesiumViewerManager），而 scene.canvas 在单例生命周期内不变，
+  // 因此每次 renderer destroy 后重新 mount 都会再次 addEventListener 到同一个 canvas 上。
+  // 此前该监听是匿名箭头函数、无引用可摘，累加后表现为「一次上下文丢失弹 N 次 toast」，
+  // 且闭包永久持有已销毁 renderer（正是本文件 5.2-1 反复强调的泄漏模式）。
+  cesiumViewerManager.unregisterWebglContextLostHandler()
+
+  // 移除渲染循环错误监听：scene.renderError 事件对象同样随单例 Viewer
+  // 常驻不变——匿名监听重挂即累加，具名成对摘除（与上方 webglcontextlost 同款修法）。
+  cesiumViewerManager.unregisterRenderErrorHandler()
+}
+
+// ===== 图层：点/多边形/GeoJSON/GeoTIFF 注册与移除 =====
+/**
+ * 图层管理：entity / dataSource / imageryLayer 的添加、移除与可见性切换。
+ * 状态存于 renderer._layers；视口裁剪、异步竞态等跨模块依赖经 renderer 实例委托。
+ */
+
+/** 添加点图层：Entity 数超阈值时启用视口裁剪，仅渲染视口内要素 */
+export function addPointLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  features: PointFeature[],
+  options: LayerOptions = {}
+): void {
+  // 幂等：先清除同 id 旧图层，防止 Entity 累积 + 相机监听器泄漏
+  const existing = renderer._layers.get(id)
+  if (existing) renderer._doRemoveLayer(existing)
+
+  // 1004-03：viewer 已销毁/空 ⇒ 无法建 Entity，跳过（BLM 重试链兜底）
+  const viewer = aliveViewer(renderer)
+  if (!viewer) {
+    logger.warn(`[CesiumRenderer] addPointLayer ${id} 跳过：viewer 已销毁`)
+    return
+  }
+
+  // 视口裁剪本身无条件生效（下方 _getViewportBBox + _isInViewport 过滤）；
+  // DEV 仅控制诊断日志输出（2026-08-11 澄清：非功能门控）
+  const totalEntities = viewer.entities.values.length + features.length
+  if (totalEntities > 1000 && import.meta.env.DEV) {
+    logger.debug(`[CesiumRenderer] Entity数量(${totalEntities})超过1000，启动视口裁剪`)
+  }
+
+  // 视口裁剪：仅添加当前视口内的点
+  const bbox = renderer._getViewportBBox()
+
+  const entities: Entity[] = []
+  features.forEach((item: PointFeature, index: number) => {
+    // 坐标归一化走 normalizePoint（含 longitude 别名）；缺失坐标跳过该要素（不落 (0,0) 哨兵）
+    const point = normalizePoint(item)
+    if (!point) return
+    const { lng, lat } = point
+    if (bbox && !renderer._isInViewport(lng, lat, bbox)) return
+    const entity = createCesiumPointEntity(renderer, id, item, index, options)
+    if (entity) entities.push(entity)
+  })
+
+  if (entities.length === 0 && import.meta.env.DEV) {
+    logger.debug(`[CesiumRenderer] 图层 ${id} 视口内无可见要素（总 ${features.length} 个）`)
+  }
+
+  renderer.registerLayer(id, entities, options, {
+    // 保存原始 features 供视口变化时增量更新
+    allFeatures: features,
+    // 空间索引（W4-17）：相机移动增量更新时按视口 bbox 查询候选，替代全量遍历 O(N)
+    _spatialIndex: buildPointSpatialIndex(features),
+  })
+  // 触发渲染
+  viewer.scene.requestRender()
+
+  // 注册相机变化监听，视口变化时增量更新
+  renderer._setupViewportListener(id)
+}
+
+/** 为点要素构建经纬度 rbush 索引（缺失坐标跳过）；供视口裁剪候选查询复用 */
+function buildPointSpatialIndex(features: PointFeature[]) {
+  const index = createSpatialIndex<{ item: PointFeature; index: number }>()
+  const items: IndexedItem<{ item: PointFeature; index: number }>[] = []
+  features.forEach((item, index) => {
+    const point = normalizePoint(item)
+    if (!point) return
+    items.push({
+      minX: point.lng,
+      minY: point.lat,
+      maxX: point.lng,
+      maxY: point.lat,
+      data: { item, index },
+    })
+  })
+  index.load(items)
+  return index
+}
+
+/** 构建 Cesium 点 Entity（含 label/properties），点图层与视口裁剪复用（构建逻辑单一来源） */
+function createCesiumPointEntity(
+  renderer: CesiumRenderer,
+  id: string,
+  item: PointFeature,
+  index: number,
+  options: LayerOptions
+): Entity | null {
+  // 坐标归一化走 normalizePoint（含 longitude 别名）；缺失坐标返回 null 由调用方跳过
+  const point = normalizePoint(item)
+  if (!point) return null
+  const { lng, lat } = point
+  // per-point opacity（PointFeature.opacity，选址命中高亮/层层筛选）：缺省 1，夹取到 [0,1]
+  const alpha = typeof item.opacity === 'number' ? Math.min(Math.max(item.opacity, 0), 1) : 1
+  // per-point color（PointFeature.color，附近设施合并图层 6 色异色）：缺省用图层色
+  const baseColor = Color.fromCssColorString(item.color || options.color || LAYER_DEFAULTS.color)
+  // alpha<1 即「未激活」语义——低透明 + 亮度拉低（色相不变，与 OL dimHex 同口径 0.7）；
+  // alpha=1 激活原色实体
+  const dimmedColor =
+    alpha < 1
+      ? new Color(baseColor.red * 0.7, baseColor.green * 0.7, baseColor.blue * 0.7, alpha)
+      : baseColor
+  const viewer = aliveViewer(renderer)
+  if (!viewer) return null
+  return viewer.entities.add({
+    // id 追加 index：同名要素 id 会碰撞，重复 id 会覆盖旧实体 → 要素丢失 + 视口裁剪增删错乱
+    id: `${id}-${item.id || item.name || 'p'}-${index}`,
+    position: Cartesian3.fromDegrees(lng, lat),
+    point: {
+      pixelSize: options.size || 12,
+      color: dimmedColor,
+      outlineColor: Color.WHITE,
+      outlineWidth: 2,
+      // CLAMP_TO_GROUND 贴地形：真地形就绪后点应落实际地表（椭球绝对高在北部湾 geoid 分离 -30~-70m 处会错位）
+      heightReference: HeightReference.CLAMP_TO_GROUND,
+    },
+    label: options.labelField
+      ? {
+          text: String(item[options.labelField as keyof PointFeature]),
+          font: '12px sans-serif',
+          // 标注色收口 LAYER_DEFAULTS（原 BLACK/WHITE 硬编码；白底自包含，双主题可读）
+          fillColor: Color.fromCssColorString(LAYER_DEFAULTS.text),
+          showBackground: true,
+          backgroundColor: Color.fromCssColorString(LAYER_DEFAULTS.labelBackground),
+          verticalOrigin: 1,
+          pixelOffset: new Cartesian2(0, 15),
+        }
+      : undefined,
+    properties: { ...item, featureType: options.featureType || 'point' },
+  })
+}
+
+/** 添加多边形图层（Polygon / MultiPolygon） */
+export function addPolygonLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  features: PolygonFeature[],
+  options: LayerOptions = {}
+): void {
+  // 幂等：先清除同 id 旧图层，防止 Entity 累积
+  const existing = renderer._layers.get(id)
+  if (existing) renderer._doRemoveLayer(existing)
+
+  // 1004-03：viewer 已销毁/空 ⇒ 跳过（原先裸断言在销毁竞态下 TypeError）
+  const viewer = aliveViewer(renderer)
+  if (!viewer) {
+    logger.warn(`[CesiumRenderer] addPolygonLayer ${id} 跳过：viewer 已销毁`)
+    return
+  }
+
+  const entities: Entity[] = []
+
+  features.forEach((item: PolygonFeature) => {
+    const coordinates = item.coordinates || item.geometry?.coordinates
+    if (!coordinates) return
+
+    if (!Array.isArray(coordinates) || coordinates.length === 0) return
+
+    const geometryType = item.geometry?.type
+    const createPolygon = (polyCoords: unknown) => {
+      try {
+        if (!Array.isArray(polyCoords) || !Array.isArray(polyCoords[0])) return
+        const outerRing = polyCoords[0].map(([lng, lat]: [number, number]) =>
+          Cartesian3.fromDegrees(lng, lat)
+        )
+        const holes = polyCoords.slice(1).map((holeCoords: [number, number][]) => {
+          const holePoints = holeCoords.map(([lng, lat]) => Cartesian3.fromDegrees(lng, lat))
+          return new PolygonHierarchy(holePoints)
+        })
+        const entity = viewer.entities.add({
+          polygon: {
+            hierarchy: new PolygonHierarchy(outerRing, holes),
+            material: Color.fromCssColorString(options.fillColor || LAYER_DEFAULTS.fill),
+            outline: true,
+            outlineColor: Color.fromCssColorString(options.strokeColor || LAYER_DEFAULTS.stroke),
+            outlineWidth: options.strokeWidth || 2,
+            // 贴地形渲染：多边形沿真实地形起伏裁剪（淹没区不被山体盖住/悬空），替代椭球绝对高
+            heightReference: HeightReference.CLAMP_TO_GROUND,
+            classificationType: ClassificationType.TERRAIN,
+          },
+          properties: { ...item, featureType: options.featureType || 'polygon' },
+        })
+        entities.push(entity)
+      } catch (e) {
+        logger.warn('创建多边形实体失败:', e)
+      }
+    }
+    if (geometryType === 'MultiPolygon') {
+      coordinates.forEach((polyCoords: unknown) => createPolygon(polyCoords))
+    } else {
+      const coords = geometryType === 'Polygon' ? coordinates : coordinates[0]
+      createPolygon(coords)
+    }
+  })
+  renderer.registerLayer(id, entities, options, {
+    interactionHeavy: isHeavyPolygons(features), // z038②：相机移动期隐藏重图层
+  })
+  viewer.scene.requestRender()
+}
+
+/** 呼吸通道状态：默认呼吸（小区/定位）与设施 POI 呼吸各一条，同屏互不顶掉 */
+interface BreathingChannel {
+  entities: unknown[]
+  animId: number | null
+  frame: unknown | null
+}
+
+/**
+ * Cesium Entity 运行期最小形态（样式应用仅用这些成员，替代裸 any；
+ * Cesium 运行期对象 polygon/position 属性赋值类型过严（Property/PropertyBag），保持鸭子访问但收窄到最小面）
+ */
+interface CesiumEntityLike {
+  properties?: Record<string, unknown>
+  polygon?: {
+    heightReference?: unknown
+    classificationType?: unknown
+    material?: unknown
+    outline?: unknown
+    outlineColor?: unknown
+    outlineWidth?: unknown
+  }
+  position?: unknown
+  billboard?: unknown
+  point?: unknown
+  polyline?: {
+    material?: unknown
+    width?: unknown
+    clampToGround?: unknown
+  }
+}
+
+/** GeoJSON dataSource 样式应用（贴地形 polygon / point / polyline 样式），add/update 共用单一来源 */
+function applyGeoJsonDataSourceStyle(dataSource: GeoJsonDataSource, options: LayerOptions): void {
+  dataSource.entities.values.forEach((entity) => {
+    const e = entity as unknown as CesiumEntityLike // why: Entity 与内部 CesiumEntityLike 的 PropertyBag 结构不重叠；exit: 改用 Cesium PropertyBag 类型后
+    // properties 可能为 undefined（无属性的 GeoJSON 要素），判空避免崩溃
+    if (!e.properties) e.properties = {}
+    e.properties.featureType = options.featureType || 'geojson'
+    if (e.polygon) {
+      // 贴地形渲染：替代固定椭球绝对高（真地形就绪后，北部湾 geoid 分离 -30~-70m 会造成垂直错位）
+      e.polygon.heightReference = HeightReference.CLAMP_TO_GROUND
+      e.polygon.classificationType = ClassificationType.TERRAIN
+      e.polygon.material = Color.fromCssColorString(options.fillColor || LAYER_DEFAULTS.fill)
+      e.polygon.outline = true
+      e.polygon.outlineColor = Color.fromCssColorString(
+        options.strokeColor || LAYER_DEFAULTS.stroke
+      )
+      e.polygon.outlineWidth = options.strokeWidth || 2
+    } else if (e.position) {
+      // 点要素用 PointGraphics 替代默认图钉，支持 markerColor/markerSize
+      const markerColor = Color.fromCssColorString(options.markerColor || LAYER_DEFAULTS.marker)
+      e.billboard = undefined
+      e.point = new PointGraphics({
+        pixelSize: options.markerSize || 10,
+        color: markerColor,
+        outlineColor: Color.WHITE,
+        outlineWidth: 2,
+        // GeoJSON 点要素同样贴地形（同 createCesiumPointEntity）
+        heightReference: HeightReference.CLAMP_TO_GROUND,
+      })
+    } else if (e.polyline) {
+      // 线要素（路径线等 LineString）：此前无分支 → 保持 GeoJsonDataSource 的 Cesium 默认样式
+      // ——默认线色是**黄色**、且**不贴地形**。2026-09-13 航线分析实测（北海→钦州 111.5km）：
+      // 3D 真地形下画在椭球 0 高度的线被山体整段埋住，只剩海岸低处碎片露出，视觉呈锯齿断线。
+      // 与 polygon/point 的贴地形口径对齐：颜色走图层 strokeColor、宽度走 strokeWidth、贴地渲染。
+      e.polyline.material = Color.fromCssColorString(options.strokeColor || LAYER_DEFAULTS.stroke)
+      e.polyline.width = options.strokeWidth || 2
+      e.polyline.clampToGround = true
+    }
+  })
+}
+
+/** 异步加载 GeoJSON 图层（Symbol token 竞态保护：await 后校验仍为最新请求） */
+export async function addGeoJsonLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  geojson: FeatureCollection,
+  options: LayerOptions = {}
+): Promise<void> {
+  // 幂等：先清除同 id 旧图层，防止 dataSource 累积
+  const existing = renderer._layers.get(id)
+  if (existing) renderer._doRemoveLayer(existing)
+
+  // 异步竞态保护：token 标记当前请求，await 后检查是否仍为最新
+  renderer._geoJsonTokens = renderer._geoJsonTokens || new Map()
+  const token = Symbol(id)
+  renderer._geoJsonTokens.set(id, token)
+
+  try {
+    // 防御：viewer 可能已被 30s 空闲销毁（渲染器对象存活但 viewer 已失效），提前检出走 onError
+    // 让 BLM 感知重试；isDestroyed 须严格 === true（mock 的 chainable 函数返回 truthy 会误判）
+    const viewer = aliveViewer(renderer)
+    if (!viewer) {
+      renderer._geoJsonTokens.delete(id)
+      options.onError?.('Viewer 已销毁，图层创建失败')
+      return
+    }
+
+    const dataSource = await GeoJsonDataSource.load(geojson)
+
+    // await 后检查：若有更新的同 id 请求，丢弃本次结果
+    if (isStaleToken(renderer._geoJsonTokens, id, token)) return
+    // await 期间 viewer 可能已销毁；1004-03 起统一走 aliveViewer
+    const viewerAfterLoad = aliveViewer(renderer)
+    if (!viewerAfterLoad) return
+
+    logger.debug(`[CesiumRenderer] GeoJSON ${id} entities:`, dataSource.entities.values.length)
+    applyGeoJsonDataSourceStyle(dataSource, options)
+    // 显式 void：add 返回 Promise 仅用于悬挂标记，此处生命周期由下方 token 复检兜底
+    void viewerAfterLoad.dataSources.add(dataSource)
+
+    // 再次检查 token，防止 await 期间被新请求覆盖
+    if (isStaleToken(renderer._geoJsonTokens, id, token)) {
+      viewerAfterLoad.dataSources.remove(dataSource, true)
+      return
+    }
+
+    renderer.registerLayer(id, dataSource, options, {
+      interactionHeavy: isHeavyGeoJson(geojson), // z038②：相机移动期隐藏重图层
+    })
+    viewerAfterLoad.scene.requestRender()
+    // 成功路径清理 token，避免 Map 跨 id 累积增长
+    renderer._geoJsonTokens.delete(id)
+  } catch (error: unknown) {
+    // 陈旧请求（已被更新的同 id 请求覆盖）失败不触发 onError，避免误报
+    if (isStaleToken(renderer._geoJsonTokens, id, token)) return
+    renderer._geoJsonTokens.delete(id)
+    logger.error(`GeoJSON图层 ${id} 加载失败`, error)
+    options.onError?.('GeoJSON数据加载失败')
+  }
+}
+
+/**
+ * 增量更新 GeoJSON 图层：复用已有 dataSource 调 load 替换数据，
+ * 避免 remove+add 全量重建的闪烁与 dataSource 对象销毁开销；异步竞态沿用 token 保护。
+ */
+export async function updateGeoJsonLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  geojson: FeatureCollection,
+  options: LayerOptions = {}
+): Promise<void> {
+  const entry = renderer._layers.get(id)
+  if (!entry) return
+  // instance 为 unknown：先提取并窄化（typeof 守卫，防 null/非 dataSource）
+  const dataSource = entry.instance as GeoJsonDataSource | undefined
+  if (!dataSource || typeof dataSource.load !== 'function') {
+    // 无实例/非 dataSource（异常态）：回退重建
+    await addGeoJsonLayer(renderer, id, geojson, options)
+    return
+  }
+
+  // 与 add 同款 token 竞态保护
+  renderer._geoJsonTokens = renderer._geoJsonTokens || new Map()
+  const token = Symbol(id)
+  renderer._geoJsonTokens.set(id, token)
+
+  try {
+    // dataSource 已在上方窄化（typeof load === 'function'）
+    // 样式选项先更新（load 重建 entities 后样式需重放）
+    entry.options = { ...entry.options, ...options }
+    await dataSource.load(geojson)
+
+    if (isStaleToken(renderer._geoJsonTokens, id, token)) return
+    // await 后 viewer 可能已销毁；1004-03 起统一走 aliveViewer
+    const viewer = aliveViewer(renderer)
+    if (!viewer) return
+    applyGeoJsonDataSourceStyle(dataSource, entry.options)
+    entry.interactionHeavy = isHeavyGeoJson(geojson) // z038②：数据换 ⇒ 顶点规模重算
+    renderer._applyPendingVisibility(id)
+    viewer.scene.requestRender()
+    renderer._geoJsonTokens.delete(id)
+  } catch (error: unknown) {
+    if (isStaleToken(renderer._geoJsonTokens, id, token)) return
+    renderer._geoJsonTokens.delete(id)
+    logger.error(`GeoJSON图层 ${id} 增量更新失败`, error)
+    options.onError?.('GeoJSON数据更新失败')
+  }
+}
+
+/**
+ * 添加 GeoTIFF 栅格图层（3D 回退方案）：Cesium 影像不支持 GeoTIFF 解码，将 .tif 映射为
+ * 预生成 hillshade PNG（EPSG:4326 地理坐标）贴椭球面——山体明暗观感，无真 z 起伏（伪三维）。
+ * 与 2D 共用同一份 BusinessLayerManager 注册；2D↔3D 切换时由 App.vue 的 reapplyAll 重绘。
+ */
+export function addGeoTIFFLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  url: string,
+  options: LayerOptions = {}
+): boolean {
+  // 入口日志：无论走哪个分支都打印，便于排查"图层没挂载"（调用了/跳过了/URL 是什么）
+  logger.debug(
+    `[CesiumRenderer] addGeoTIFFLayer 调用: id=${id} url=${url} terrainReady=${renderer._terrainProvider !== null}`
+  )
+
+  // 回退方案仅支持预生成的 hillshade 影像；其它 GeoTIFF 在 3D 下暂不支持。
+  // 静默 return false 曾让图层面板/BLM 无从感知图层未挂上（审查 L-8）：warn 留痕
+  if (!/hillshade/i.test(url)) {
+    logger.warn(`[CesiumRenderer] addGeoTIFFLayer 仅支持 hillshade 回退，跳过: ${url}`)
+    return false
+  }
+
+  // DEM（数字高程模型）是独立图层，显隐由图层面板控制；真地形（terrainProvider z 起伏）
+  // 是常驻基础能力，不与 DEM 图层开关耦合（曾据此跳过导致面板开关空转）
+  // 整体防御：渲染失败仅记录完整错误，不向调用方（reapplyAll）抛错，避免单图层问题中断整批引擎切换重绘
+  try {
+    // 幂等：先清除同 id 旧图层
+    const existing = renderer._layers.get(id)
+    if (existing) renderer._doRemoveLayer(existing)
+
+    // Cesium 影像不支持 GeoTIFF，映射为预生成的 PNG 影像（两者地理范围一致）
+    const pngUrl = url.replace(/\.tif$/i, '.png')
+
+    // hillshade PNG 为 EPSG:4326 地理坐标，须显式 GeographicTilingScheme（默认 WebMercator 3857
+    // 会把北部湾 21°N 的纬度投影到错误位置，3D 下贴图不可见）；新版还强制校验
+    // tileWidth/tileHeight（缺省抛 DeveloperError），须传 PNG 实际像素 4096×2819
+    // 结构化断言替代裸 as any（原整对象断言无注释、无退出计划）——
+    // 构造选项为 Cesium 运行期类型（WebMercatorTilingScheme 等联合），此处以构造参数类型为准
+    const provider = new SingleTileImageryProvider({
+      url: pngUrl,
+      rectangle: getHillshadeImageBBox(),
+      tilingScheme: new GeographicTilingScheme(),
+      tileWidth: 4096,
+      tileHeight: 2819,
+    } as unknown as ConstructorParameters<typeof SingleTileImageryProvider>[0]) // why: tilingScheme 属运行期选项，未进 Cesium d.ts；exit: 类型收录后直接传
+    // 补 PNG 加载失败监听（OL 侧 addGeoTIFFLayer 已有等价监听）：把静默无图变成可见 warn
+    // F-5：具名回调；provider 生命周期与图层绑定（hillshade 移除即销毁），无独立泄漏路径
+    if (provider.errorEvent) {
+      const hillshadeErrorHandler = (err: unknown) => {
+        logger.warn(`[CesiumRenderer] hillshade 影像加载失败: ${pngUrl}`, err)
+      }
+      provider.errorEvent.addEventListener(hillshadeErrorHandler)
+    }
+    // 1004-03：viewer 已销毁/空 ⇒ 不挂影像，返回 false（既有失败语义）
+    const viewer = aliveViewer(renderer)
+    if (!viewer) {
+      logger.warn(`[CesiumRenderer] addGeoTIFFLayer ${id} 跳过：viewer 已销毁`)
+      return false
+    }
+    const imageryLayer = viewer.imageryLayers.addImageryProvider(provider)
+    // hillshade 顶层叠加 + 默认 alpha 0.85：明暗清晰可辨（曾 0.45 太淡，用户视觉上看不到 DEM 图层；
+    // 天地图影像在下层透出轮廓，注记层最上显示地名）；真 3D 已由地形瓦片承接，此为降级兜底
+    imageryLayer.alpha = options.opacity ?? 0.85
+    // 图层实例统一登记进 _layers 注册表（移除/显隐均走该表，无需额外实例字段）
+    // 不得 lowerToBottom：hillshade 须在天地图之上（alpha 半透明叠加），沉底会被盖住致 DEM 图层不可见
+
+    renderer.registerLayer(id, imageryLayer, options)
+    viewer.scene.requestRender()
+    logger.debug(`[CesiumRenderer] addGeoTIFFLayer 已添加 hillshade 回退贴图: ${id} → ${pngUrl}`)
+    return true
+  } catch (error: unknown) {
+    // 完整错误信息（name/message）用于定位投影或 imageryLayers 层问题
+    logger.error(
+      `[CesiumRenderer] addGeoTIFFLayer 失败 ${id} → ${url}: ${(error as Error)?.name}: ${(error as Error)?.message}`,
+      error
+    )
+    return false
+  }
+}
+
+/**
+ * 添加 3D Tiles 瓦片集图层（3D Only）。
+ * 瓦片定位完全由 tileset.json 自带的 transform 决定（含 WGS84 锚定），此处只负责取回与挂载。
+ * 与其它图层一样登记进 renderer._layers，使显隐走通用 .show 路径；移除由 doRemoveLayer 的
+ * primitives 分支负责（Cesium3DTileset 存于 scene.primitives，不在 imageryLayers/dataSources）。
+ */
+export async function add3DTilesLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  url: string,
+  options: Tiles3DOptions = {}
+): Promise<boolean> {
+  logger.debug(`[CesiumRenderer] add3DTilesLayer 调用: id=${id} url=${url}`)
+  if (!renderer.viewer) {
+    logger.warn(`[CesiumRenderer] add3DTilesLayer 跳过（viewer 未就绪）: ${id} → ${url}`)
+    return false
+  }
+  try {
+    // 幂等：先移除同 id 旧瓦片集
+    if (renderer.hasLayer(id)) renderer.removeLayer(id)
+
+    const tileset = await Cesium3DTileset.fromUrl(url, {
+      maximumScreenSpaceError: options.maximumScreenSpaceError ?? 16,
+    })
+    // 瓦片内容加载失败 Cesium 默认静默（只表现为画面缺块），补 warn 留痕——
+    // tileset 路径写错是既有事故类型（URL 前缀双重拼接曾致线上 404）
+    const tileFailedHandler = (err: unknown) => {
+      const msg = (err as { message?: string })?.message ?? String(err)
+      logger.warn(`[CesiumRenderer] 3D Tiles 瓦片加载失败 ${id}: ${msg}`)
+    }
+    tileset.tileFailed.addEventListener(tileFailedHandler)
+
+    renderer.viewer.scene.primitives.add(tileset)
+    // 图层实例统一登记进 _layers 注册表（显隐/移除均走该表，无需额外实例字段）
+    renderer.registerLayer(id, tileset, options)
+    renderer.viewer.scene.requestRender()
+    // statistics（瓦片就绪/加载计数）Cesium 1.142 的 Cesium.d.ts 未导出（仅运行时存在），
+    // 结构化断言读取，仅用于日志、不参与逻辑
+    const tilesetStats = (tileset as unknown as { statistics?: { numberOfTilesTotal?: number } }) // why: Cesium3DTileset 无 statistics 字段；exit: 官方类型或模块扩充声明后删断言
+      .statistics
+    logger.debug(
+      `[CesiumRenderer] add3DTilesLayer 已添加瓦片集: ${id} → ${url}（瓦片总数 ${tilesetStats?.numberOfTilesTotal ?? '?'}）`
+    )
+    return true
+  } catch (error: unknown) {
+    logger.error(
+      `[CesiumRenderer] add3DTilesLayer 失败 ${id} → ${url}: ${(error as Error)?.name}: ${(error as Error)?.message}`,
+      error
+    )
+    return false
+  }
+}
+
+/**
+ * 添加单张影像覆盖图层（3D Only）：以 SingleTileImageryProvider 按地理矩形铺一张离线影像。
+ * 与 addGeoTIFFLayer 的差别：不做 hillshade 命名假设，矩形与像素尺寸全由调用方给。
+ * 登记进 _layers 后显隐/移除走通用路径（instance 是 ImageryLayer，doRemoveLayer 已支持）。
+ */
+export function addImageOverlayLayer(
+  renderer: CesiumRenderer,
+  id: string,
+  data: ImageOverlayData,
+  options: LayerOptions = {}
+): boolean {
+  logger.debug(
+    `[CesiumRenderer] addImageOverlayLayer 调用: id=${id} url=${data.url} bbox=${data.bbox?.join(',')}`
+  )
+  if (!renderer.viewer) {
+    logger.warn(`[CesiumRenderer] addImageOverlayLayer 跳过（viewer 未就绪）: ${id}`)
+    return false
+  }
+  try {
+    const existing = renderer._layers.get(id)
+    if (existing) renderer._doRemoveLayer(existing)
+
+    const [west, south, east, north] = data.bbox
+    // EPSG:4326 影像必须显式 GeographicTilingScheme（默认 WebMercator 会把中纬度矩形投歪）；
+    // tileWidth/tileHeight 为必填，缺省抛 DeveloperError —— 用图片真实像素尺寸
+    const provider = new SingleTileImageryProvider({
+      url: data.url,
+      rectangle: Rectangle.fromDegrees(west, south, east, north),
+      tilingScheme: new GeographicTilingScheme(),
+      tileWidth: data.size[0],
+      tileHeight: data.size[1],
+    } as unknown as ConstructorParameters<typeof SingleTileImageryProvider>[0]) // why: tilingScheme 属运行期选项，未进 Cesium d.ts；exit: 类型收录后直接传
+
+    const imageryLayer = renderer.viewer.imageryLayers.addImageryProvider(provider)
+    // 缺省不透明：该图层用于与 3D Tiles 模型对照核验，盖住在线底图才看得清
+    imageryLayer.alpha = options.opacity ?? 1
+
+    renderer.registerLayer(id, imageryLayer, options)
+    renderer.viewer.scene.requestRender()
+    logger.debug(`[CesiumRenderer] addImageOverlayLayer 已添加影像块: ${id} → ${data.url}`)
+    return true
+  } catch (error: unknown) {
+    logger.error(
+      `[CesiumRenderer] addImageOverlayLayer 失败 ${id} → ${data.url}: ${(error as Error)?.name}: ${(error as Error)?.message}`,
+      error
+    )
+    return false
+  }
+}
+
+function doSetVisibility(renderer: CesiumRenderer, id: string, visible: boolean): void {
+  const layer = renderer._layers.get(id)
+  const inst = layer?.instance
+  if (inst) {
+    if (Array.isArray(inst)) {
+      inst.forEach((entity: unknown) => {
+        if (entity && typeof entity === 'object') {
+          ;(entity as { show?: boolean }).show = visible
+        }
+      })
+    } else if (typeof inst === 'object') {
+      ;(inst as { show?: boolean }).show = visible
+    }
+    if (visible && layer?.allFeatures) updateCulledLayer(renderer, id)
+    // 1004-03：viewer 已销毁时显隐只改本账本，渲染请求跳过（不再 TypeError）
+    aliveViewer(renderer)?.scene.requestRender()
+  }
+}
+
+/** 移除图层实例：先摘除视口裁剪监听（点图层特有），再按类型移除并释放资源 */
+function doRemoveLayer(renderer: CesiumRenderer, layer: LayerState): void {
+  // 移除视口监听（视口裁剪点图层特有，其它图层为 undefined）；rAF 挂起也一并取消
+  // 1004-03：viewer 已销毁时引擎侧对象随 viewer 一起消亡，摘除无意义；
+  // 本账本清理（监听引用置空 / rAF 取消 / 容器遍历跳过）照做，避免闭包与句柄泄漏。
+  const viewer = aliveViewer(renderer)
+  if (layer.cameraListener) {
+    viewer?.camera.changed.removeEventListener(layer.cameraListener)
+    layer.cameraListener = null
+  }
+  if (layer._viewportRafId) {
+    cancelAnimationFrame(layer._viewportRafId)
+    layer._viewportRafId = null
+  }
+  if (layer.instance) {
+    if (Array.isArray(layer.instance)) {
+      layer.instance.forEach((entity: unknown) => {
+        if (entity && typeof entity === 'object') {
+          viewer?.entities.remove(entity as Entity)
+        }
+      })
+    } else if (viewer) {
+      // instance 为 unknown：按 Cesium 容器逐一尝试（imageryLayers / primitives / dataSources）
+      const inst = layer.instance as unknown as  // why: layer.instance 为 unknown；exit: 图层实例联合类型收口后改单断言
+        | ImageryLayer
+        | Cesium3DTileset
+        | DataSource
+        | undefined
+      if (inst && viewer.imageryLayers.contains(inst as ImageryLayer)) {
+        // 影像图层（如 hillshade 回退贴图），destroy=true 释放 GPU 纹理
+        viewer.imageryLayers.remove(inst as ImageryLayer, true)
+      } else if (inst && viewer.scene.primitives.contains(inst as Cesium3DTileset)) {
+        // 3D Tiles 瓦片集（Cesium3DTileset 存于 scene.primitives，不在上两个容器里）；
+        // PrimitiveCollection.remove 会调用其 destroy 释放几何缓冲与瓦片缓存
+        viewer.scene.primitives.remove(inst as Cesium3DTileset)
+      } else if (inst) {
+        // 第二参数 destroy=true 让 Cesium 在移除时销毁 dataSource，防止内存泄漏
+        viewer.dataSources.remove(inst as DataSource, true)
+      }
+    }
+    viewer?.scene.requestRender()
+  }
+}
+
+// ===== 视口裁剪：视口范围估算与点要素增量更新 =====
+/**
+ * 视口裁剪：估算视口经纬度范围、点要素裁剪、相机移动时增量更新。
+ * 状态存于图层条目的 allFeatures（原始全量要素）与 cameraListener（相机监听，rAF 防抖）。
+ */
+
+/** 视口经纬度范围 */
+interface ViewportBBox {
+  west: number
+  east: number
+  south: number
+  north: number
+}
+
+/**
+ * 计算相机视口经纬度范围。
+ * 注意：positionCartographic 的经纬度为弧度，须 toDegrees 后与要素经纬度比较。
+ * 优先 computeViewRectangle 取真实视口四角投影（倾斜视角下边缘要素不再被圆形估算误裁），
+ * 不可用时回退相机高度圆形估算；太高（>5000km）或无相机返回 null（不裁剪）。
+ */
+function getViewportBBox(renderer: CesiumRenderer): ViewportBBox | null {
+  // 1004-03：viewer 空/已销毁 ⇒ 不裁剪（与「太高不裁剪」同语义）
+  const viewer = aliveViewer(renderer)
+  if (!viewer) return null
+  const camera = viewer.camera
+  const scene = viewer.scene
+  const cartographic = camera.positionCartographic
+  if (!cartographic) return null
+  const height = cartographic.height
+  if (height > 5000000) return null // 太高不做裁剪
+
+  // 真实视口四角投影：倾斜视角下边缘要素不再被误裁
+  try {
+    const rect = camera.computeViewRectangle(scene?.globe.ellipsoid)
+    if (rect) {
+      return {
+        west: CesiumMath.toDegrees(rect.west),
+        east: CesiumMath.toDegrees(rect.east),
+        south: CesiumMath.toDegrees(rect.south),
+        north: CesiumMath.toDegrees(rect.north),
+      }
+    }
+  } catch {
+    // computeViewRectangle 在场景未渲染等场景可能抛错——回退下方估算
+  }
+
+  // 兜底：相机高度圆形估算（仅真实投影不可用时的近似）
+  const halfRange = Math.min((height / 111000) * 1.5, 10) // 上限 10 度
+  const centerLon = CesiumMath.toDegrees(cartographic.longitude)
+  const centerLat = CesiumMath.toDegrees(cartographic.latitude)
+  return {
+    west: centerLon - halfRange,
+    east: centerLon + halfRange,
+    south: centerLat - halfRange,
+    north: centerLat + halfRange,
+  }
+}
+
+/** 点是否在视口内（bbox 为 null 时不裁剪，返回 true） */
+function isInViewport(lng: number, lat: number, bbox: ViewportBBox | null): boolean {
+  if (!bbox) return true // 无视口信息时不裁剪
+  return lng >= bbox.west && lng <= bbox.east && lat >= bbox.south && lat <= bbox.north
+}
+
+/** 注册视口变化监听：相机移动时 requestAnimationFrame 防抖合并，增量更新裁剪图层 */
+function setupViewportListener(renderer: CesiumRenderer, id: string): void {
+  const layer = renderer._layers.get(id)
+  if (!layer || !layer.allFeatures) return
+
+  // 防抖：相机移动时频繁触发，用 requestAnimationFrame 合并；rafId 存图层条目，
+  // 图层移除时随 cameraListener 一并 cancel（闭包持有无法取消）
+  const updateHandler = () => {
+    if (layer._viewportRafId) cancelAnimationFrame(layer._viewportRafId)
+    layer._viewportRafId = requestAnimationFrame(() => {
+      updateCulledLayer(renderer, id)
+      layer._viewportRafId = null
+    })
+  }
+
+  // 1004-03：viewer 空/已销毁 ⇒ 不注册（注册即 TypeError）
+  const viewer = aliveViewer(renderer)
+  if (!viewer) return
+
+  // 移除旧监听（如果存在）
+  if (layer.cameraListener) {
+    viewer.camera.changed.removeEventListener(layer.cameraListener)
+  }
+
+  viewer.camera.changed.addEventListener(updateHandler)
+  layer.cameraListener = updateHandler
+}
+
+/** 增量更新裁剪图层：移除出视口的 Entity，添加新进入的（Entity ID 与 _createCesiumPointEntity 一致） */
+function updateCulledLayer(renderer: CesiumRenderer, id: string): void {
+  const layer = renderer._layers.get(id)
+  if (!layer || !layer.allFeatures || !layer.visible) return
+
+  const bbox = getViewportBBox(renderer)
+  if (!bbox) return
+  // 1004-03：viewer 空/已销毁 ⇒ 不增量更新（相机事件源已不存在）
+  const viewer = aliveViewer(renderer)
+  if (!viewer) return
+
+  // 候选集：优先 rbush 索引查询（W4-17，相机移动 O(logN)），无索引回退全量遍历
+  const spatialIndex = layer._spatialIndex as { query: (bbox: number[]) => unknown[] } | undefined
+  const candidates: Array<{ item: PointFeature; index: number }> = spatialIndex
+    ? (
+        spatialIndex.query([bbox.west, bbox.south, bbox.east, bbox.north]) as Array<
+          IndexedItem<{ item: PointFeature; index: number }>
+        >
+      ).map((it) => it.data)
+    : layer.allFeatures.map((item: PointFeature, index: number) => ({ item, index }))
+
+  // 计算应显示的要素 ID 集合（ID 与 _createCesiumPointEntity 保持一致：id-name-index）
+  const shouldShow = new Set<string>()
+  candidates.forEach(({ item, index }: { item: PointFeature; index: number }) => {
+    // 坐标归一化走 normalizePoint（含 longitude 别名）；缺失坐标跳过
+    const point = normalizePoint(item)
+    if (!point) return
+    const { lng, lat } = point
+    if (isInViewport(lng, lat, bbox)) {
+      shouldShow.add(`${id}-${item.id || item.name || 'p'}-${index}`)
+    }
+  })
+
+  // 移除不在视口内的 Entity（点图层 instance 为 Entity[]；非数组图层不进入本函数）
+  const entities = layer.instance as Entity[]
+  for (const entity of entities) {
+    if (!shouldShow.has(entity.id)) {
+      viewer.entities.remove(entity)
+    }
+  }
+
+  // 添加新进入视口的 Entity
+  const existingIds = new Set<string>(entities.map((e: Entity) => e.id))
+  candidates.forEach(({ item, index }: { item: PointFeature; index: number }) => {
+    const entityId = `${id}-${item.id || item.name || 'p'}-${index}`
+    if (shouldShow.has(entityId) && !existingIds.has(entityId)) {
+      const entity = renderer._createCesiumPointEntity(id, item, index, layer.options ?? {})
+      if (entity) entities.push(entity)
+    }
+  })
+
+  // 清理已移除的 Entity 引用（entities 为局部窄化数组，写回 instance）
+  layer.instance = entities.filter((e) => viewer.entities.contains(e))
+}
+
+// ===== 水面：Primitive 管理（水位更新=先建后换） =====
+/**
+ * 水面：Primitive API 管理（适合大规模几何体），状态存于 renderer._waterSurfaces。
+ * 水位更新走「先建后换」（updateWaterLevel）：asynchronous=false 同步构建新 Primitive
+ * 成功后再 remove 旧 + add 新 —— requestRenderMode 下同一 tick 不产生中间帧，无重建空窗；
+ * 构建失败旧 Primitive 原地保留（不闪、不消失）。
+ */
+
+/** 水面状态条目 */
+interface WaterSurfaceEntry {
+  primitive: Primitive
+  height: number
+  coordinates: [number, number][]
+  options: WaterSurfaceOptions
+  visible: boolean
+  /** z038②：交互期降载标记（顶点数达标；只切 primitive.show，不覆盖 visible 权威值） */
+  interactionHeavy?: boolean
+  /** 地形基准（每顶点地形高度，椭球高制）：海面抬升语义 = 基准 + 水位；无真地形时全 0 */
+  terrainBase: number[]
+}
+
+/**
+ * 采样坐标点的地形高度（椭球高制）作为水面基准。
+ * 真地形（海拔制）下椭球绝对高存在 geoid 分离（北部湾 -30~-70m），
+ * 水面直接按水位取椭球高会沉入地下不可见——必须采样地形后叠加水位。
+ * 无真地形（EllipsoidTerrainProvider）或采样失败时回退 0（旧行为）。
+ */
+async function sampleTerrainHeights(
+  renderer: CesiumRenderer,
+  coordinates: [number, number][]
+): Promise<number[]> {
+  try {
+    // 1004-03：统一走 aliveViewer（空/已销毁同判）；采样失败仍由下方 catch 兜底
+    const viewer = aliveViewer(renderer)
+    const terrainProvider = viewer?.terrainProvider as { availability?: unknown } | undefined
+    if (!terrainProvider || !terrainProvider.availability) {
+      return coordinates.map(() => 0)
+    }
+    const positions = coordinates.map(([lng, lat]) => Cartographic.fromDegrees(lng, lat))
+    const sampled = await sampleTerrain(
+      terrainProvider as unknown as Parameters<typeof sampleTerrain>[0], // why: 局部窄化类型与 TerrainProvider 不重叠；exit: 改用 viewer.terrainProvider 原类型后
+      10,
+      positions
+    )
+    return sampled.map((s) => s.height ?? 0)
+  } catch {
+    // 采样失败不阻断水面创建，回退椭球基准（与旧行为一致）
+    return coordinates.map(() => 0)
+  }
+}
+
+/** 构建水面 GeometryInstance（create 与 update 复用，避免重复代码） */
+function buildWaterInstance(
+  coordinates: [number, number][],
+  height: number,
+  options: WaterSurfaceOptions,
+  terrainBase: number[] = []
+): GeometryInstance {
+  const positions = coordinates.map((coord, i) =>
+    Cartesian3.fromDegrees(coord[0], coord[1], (terrainBase[i] ?? 0) + height)
+  )
+  const hierarchy = new PolygonHierarchy(positions)
+  const geometry = new PolygonGeometry({
+    polygonHierarchy: hierarchy,
+    vertexFormat: PerInstanceColorAppearance.VERTEX_FORMAT,
+  })
+
+  return new GeometryInstance({
+    geometry: geometry,
+    attributes: {
+      color: ColorGeometryInstanceAttribute.fromColor(
+        // 水面色复用 LAYER_DEFAULTS.color（#409eff），保留 0.5 透明度以维持水面半透明观感
+        Color.fromCssColorString((options.color as string) || LAYER_DEFAULTS.color).withAlpha(0.5)
+      ),
+    },
+    id: `water-${height}`,
+  })
+}
+
+/** 构建水面 Primitive（create/update 共用；asynchronous=false 同步构建，免加载竞态） */
+function buildWaterPrimitive(instance: GeometryInstance): Primitive {
+  return new Primitive({
+    geometryInstances: instance,
+    appearance: new PerInstanceColorAppearance({
+      translucent: true,
+      closed: false,
+    }),
+    asynchronous: false,
+  })
+}
+
+/** 添加水面 Primitive（先移除同 id 旧水面，幂等；真地形下采样基准叠加水位） */
+export async function addWaterSurface(
+  renderer: CesiumRenderer,
+  id: string,
+  coordinates: [number, number][],
+  height = 0,
+  options: WaterSurfaceOptions = {}
+): Promise<boolean> {
+  removeWaterSurface(renderer, id)
+  try {
+    const terrainBase = await sampleTerrainHeights(renderer, coordinates)
+    // await 期间 viewer 可能已销毁（审查 L-7 同模式）：1004-03 起统一走 aliveViewer，
+    // 判空让失败语义可读（入口已 removeWaterSurface，此处返回 false 即"未挂上"）
+    const viewer = aliveViewer(renderer)
+    if (!viewer) return false
+    const instance = buildWaterInstance(coordinates, height, options, terrainBase)
+
+    const primitive = buildWaterPrimitive(instance)
+
+    viewer.scene.primitives.add(primitive)
+
+    // 保存水面状态供后续更新使用
+    renderer._waterSurfaces = renderer._waterSurfaces || new Map()
+    renderer._waterSurfaces.set(id, {
+      primitive: primitive,
+      height: height,
+      coordinates: coordinates,
+      options: options,
+      visible: true,
+      terrainBase: terrainBase,
+      interactionHeavy: isHeavyVertexCount(coordinates.length), // z038②：多顶点贴地大面
+    })
+
+    viewer.scene.requestRender()
+    return true
+  } catch (e) {
+    // 坐标无效或几何体构建失败时不中断调用方
+    logger.warn(`[CesiumRenderer] 水面图层 ${id} 创建失败:`, e)
+
+    return false
+  }
+}
+
+/**
+ * 更新水位：以新高度同步重建水面 Primitive（remove+add）。
+ * @arch-note 曾实现「复用同一 Primitive 仅替换 geometryInstances」，对 Cesium 状态机
+ * 不成立：geometryInstances 仅在构建期（_state=READY）被读取，构建完成置 COMPLETE
+ * 后 update() 不再进入加载路径，运行时替换属性是纯 no-op——水面纹丝不动。
+ * requestRenderMode 下同一 tick 内 remove+add 不产生中间帧，无重建空窗；
+ * terrainBase 不随水位变化，从 entry 复用免去重采样。先建后换：构建失败时
+ * 旧 Primitive 原地保留（不闪、不消失）。
+ */
+export function updateWaterLevel(renderer: CesiumRenderer, id: string, newHeight: number): boolean {
+  const waterSurface: WaterSurfaceEntry | undefined = renderer._waterSurfaces?.get(id)
+  if (!waterSurface) {
+    logger.warn(`水面图层 ${id} 不存在，无法更新水位`)
+
+    return false
+  }
+
+  // 高度未变化 → 跳过（滑块拖动可能触发同值更新）
+  if (waterSurface.height === newHeight) return true
+
+  try {
+    const newInstance = buildWaterPrimitive(
+      buildWaterInstance(
+        waterSurface.coordinates,
+        newHeight,
+        waterSurface.options,
+        waterSurface.terrainBase
+      )
+    )
+    // 1004-03：viewer 已销毁 ⇒ 保持旧水位返回 false（与「构建失败」同语义）
+    const viewer = aliveViewer(renderer)
+    if (!viewer) return false
+    const scene = viewer.scene
+    scene.primitives.remove(waterSurface.primitive)
+    scene.primitives.add(newInstance)
+    waterSurface.primitive = newInstance
+    waterSurface.height = newHeight
+    scene.requestRender()
+    return true
+  } catch (e) {
+    // 构建失败保持旧水位（不闪、不崩），仅日志
+    logger.warn(`[CesiumRenderer] 水面 ${id} 水位更新失败（保持旧水位）:`, e)
+
+    return false
+  }
+}
+
+/** 移除水面 Primitive */
+export function removeWaterSurface(renderer: CesiumRenderer, id: string): boolean {
+  const waterSurface: WaterSurfaceEntry | undefined = renderer._waterSurfaces?.get(id)
+  if (waterSurface) {
+    // 1004-03：viewer 已销毁 ⇒ 引擎侧对象已不存在，只摘本账本
+    const viewer = aliveViewer(renderer)
+    viewer?.scene.primitives.remove(waterSurface.primitive)
+    // _waterSurfaces 只可能在 viewer 销毁路径置 null；此处 waterSurface 非空即 Map 存在
+    renderer._waterSurfaces!.delete(id)
+    viewer?.scene.requestRender()
+    return true
+  }
+  return false
+}
+
+/** 移除全部水面 */
+export function removeAllWaterSurfaces(renderer: CesiumRenderer): boolean {
+  if (renderer._waterSurfaces) {
+    renderer._waterSurfaces.forEach((_: WaterSurfaceEntry, id: string) =>
+      removeWaterSurface(renderer, id)
+    )
+    return true
+  }
+  return false
+}
+
+/** 设置水面可见性 */
+export function setWaterSurfaceVisibility(
+  renderer: CesiumRenderer,
+  id: string,
+  visible: boolean
+): boolean {
+  const waterSurface: WaterSurfaceEntry | undefined = renderer._waterSurfaces?.get(id)
+  if (waterSurface) {
+    waterSurface.visible = visible
+    waterSurface.primitive.show = visible
+    // 1004-03：viewer 已销毁时只改本账本，渲染请求跳过
+    aliveViewer(renderer)?.scene.requestRender()
+    return true
+  }
+  return false
+}

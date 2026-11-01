@@ -1,0 +1,332 @@
+const fs = require('node:fs')
+const path = require('node:path')
+
+/**
+ * z187：后端 feature 间深引用规则域。
+ *
+ * 规则集合**由 `backend/src/modules` 实际目录派生**（每域一条 `nest-cross-feature-<域>`），
+ * 不手写域名清单——新增域未建规则会被 `tools/v3-guard/cruise-coverage.mjs` 判红。
+ *
+ * 表达力边界：dependency-cruiser 的 path 规则无法表达「to 的域 ≠ from 的域」，也无法在
+ * 同一条规则里表达「仅这一对 (源文件, 目标文件) 放行」。故：
+ *   ① 每域一条规则：from 整域 → 其它域的 modules 内文件（同域、`*.module.ts` 装配除外）；
+ *   ② 显式豁免按**源文件**分组，另生成 `nest-cross-feature-scoped-<域>-<n>`：
+ *      from 收敛到该源文件，to 只放行登记的目标——避免「整域放行某个源文件」的横切漏洞；
+ *   ③ 豁免条目由 `tools/v3-guard/nest-cross-feature-exemptions.json` 单源登记（含理由），
+ *      cruise-coverage 校验「被豁免的 import 仍存在」，删掉 import 后条目转红（防过期豁免）。
+ */
+const BACKEND_MODULES = 'backend/src/modules'
+const NEST_EXEMPTIONS = require('./tools/v3-guard/nest-cross-feature-exemptions.json')
+const NEST_MODULE_ASSEMBLY = '^backend/src/modules/[^/]+/[^/]+\\.module\\.ts$'
+
+function listBackendFeatures() {
+  return fs
+    .readdirSync(path.join(__dirname, BACKEND_MODULES), { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name !== '__tests__')
+    .map((e) => e.name)
+    .sort()
+}
+
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/** 从豁免源路径取 feature 名；取不到返回 ''（由 cruise-coverage 判为非法条目） */
+function featureOf(file) {
+  const m = /^backend\/src\/modules\/([^/]+)\//.exec(file || '')
+  return m ? m[1] : ''
+}
+
+const nestCrossFeatureRules = (() => {
+  const rules = []
+  for (const feature of listBackendFeatures()) {
+    const own = NEST_EXEMPTIONS.filter((e) => featureOf(e.from) === feature)
+    const groups = new Map()
+    for (const e of own) {
+      if (!groups.has(e.from)) groups.set(e.from, [])
+      groups.get(e.from).push(e)
+    }
+    const exemptSources = [...groups.keys()]
+    rules.push({
+      name: `nest-cross-feature-${feature}`,
+      comment:
+        `${feature} 域不得深引其它 feature（Nest 模块装配 \`*.module.ts\` 除外）。` +
+        `豁免 ${exemptSources.length} 个源文件，见 nest-cross-feature-scoped-${feature}-*。` +
+        '规则集合由 backend/src/modules 目录派生（z187）。',
+      severity: 'error',
+      from: {
+        path: `^${escapeRe(`${BACKEND_MODULES}/${feature}/`)}`,
+        ...(exemptSources.length ? { pathNot: exemptSources.map((f) => `^${escapeRe(f)}$`) } : {}),
+      },
+      to: {
+        path: `^${BACKEND_MODULES}/`,
+        pathNot: [`^${escapeRe(`${BACKEND_MODULES}/${feature}/`)}`, NEST_MODULE_ASSEMBLY],
+      },
+    })
+
+    let n = 0
+    for (const [fromFile, entries] of groups) {
+      n += 1
+      rules.push({
+        name: `nest-cross-feature-scoped-${feature}-${n}`,
+        comment:
+          `显式豁免（${entries.map((e) => e.id).join('、')}）：` +
+          `${entries.map((e) => e.reason).join(' ')}` +
+          ` 放行目标：${entries.map((e) => e.to).join('、')}。` +
+          '删除对应 import 后本条目须一并删除，cruise-coverage 会判「豁免过期」。',
+        severity: 'error',
+        from: { path: `^${escapeRe(fromFile)}$` },
+        to: {
+          path: `^${BACKEND_MODULES}/`,
+          pathNot: [
+            `^${escapeRe(`${BACKEND_MODULES}/${feature}/`)}`,
+            NEST_MODULE_ASSEMBLY,
+            ...entries.map((e) => `^${escapeRe(e.to)}$`),
+          ],
+        },
+      })
+    }
+  }
+  return rules
+})()
+
+/** @type {import('dependency-cruiser').IConfiguration} */
+module.exports = {
+  forbidden: [
+    {
+      name: 'core-imports-business',
+      comment: 'core 层不应依赖业务层',
+      severity: 'error',
+      from: { path: '^frontend/src/core/' },
+      to: { path: '^frontend/src/(business|views)/' },
+    },
+    {
+      name: 'services-imports-business',
+      comment: 'services 层不应依赖业务层',
+      severity: 'error',
+      from: { path: '^frontend/src/services/' },
+      to: { path: '^frontend/src/(business|views)/' },
+    },
+    // 业务模块互不依赖：每模块一条全称规则（from 本模块 → to 任何其它业务目录）。
+    // 04-E2：禁止"逐个枚举模块名"表达全称约束——覆盖面由 cruise-coverage 守卫断言
+    // （规则模块集合 == business/ 实际目录集合，新增目录未建规则即红，z055）。
+    // 2026-09-22 重构：原 3 条两两互引规则只覆盖 flood/site/forecast，
+    // route-analysis 自落地起无守护（z051/z053 在册）；且枚举式 to 每加模块要改 N 处。
+    {
+      name: 'business-cross-import-flood-analysis',
+      comment:
+        'flood-analysis 不应依赖其他业务模块（经 manifest 注册；2026-08-10 P1-2：warn→error）',
+      severity: 'error',
+      from: { path: '^frontend/src/business/flood-analysis/' },
+      to: {
+        path: '^frontend/src/business/',
+        pathNot: '^frontend/src/business/flood-analysis/',
+      },
+    },
+    {
+      name: 'business-cross-import-diversion',
+      comment: 'diversion 不应依赖其他业务模块（经 manifest 注册；04-E2 规则集合==目录集合）',
+      severity: 'error',
+      from: { path: '^frontend/src/business/diversion/' },
+      to: {
+        path: '^frontend/src/business/',
+        pathNot: '^frontend/src/business/diversion/',
+      },
+    },
+    {
+      name: 'business-cross-import-site-suitability',
+      comment:
+        'site-suitability 不应依赖其他业务模块（经 manifest 注册；04-E2 规则集合==目录集合）',
+      severity: 'error',
+      from: { path: '^frontend/src/business/site-suitability/' },
+      to: {
+        path: '^frontend/src/business/',
+        pathNot: '^frontend/src/business/site-suitability/',
+      },
+    },
+    {
+      name: 'business-cross-import-forecast',
+      comment: 'forecast 不应依赖其他业务模块（z055 补双向；2026-08-10 P1-2：warn→error）',
+      severity: 'error',
+      from: { path: '^frontend/src/business/forecast/' },
+      to: {
+        path: '^frontend/src/business/',
+        pathNot: '^frontend/src/business/forecast/',
+      },
+    },
+    {
+      name: 'business-cross-import-route-analysis',
+      comment:
+        'route-analysis 不应依赖其他业务模块（2026-09-22 补：该模块落地起无互引守护，z051/z053）',
+      severity: 'error',
+      from: { path: '^frontend/src/business/route-analysis/' },
+      to: {
+        path: '^frontend/src/business/',
+        pathNot: '^frontend/src/business/route-analysis/',
+      },
+    },
+    {
+      name: 'renderers-cross-reference',
+      comment:
+        '渲染器间不应互相引用（OLRenderer 与 CesiumRenderer 各自独立；CesiumRenderer 内部 helper 不算互引）',
+      severity: 'error',
+      from: { path: 'frontend/src/core/map/renderers/', pathNot: 'index\\.(js|ts)' },
+      to: {
+        path: 'frontend/src/core/map/renderers/',
+        pathNot: '(MapRenderer|index\\.(js|ts))',
+      },
+    },
+    {
+      name: 'stores-imports-business',
+      comment: 'store 不应导入业务模块',
+      severity: 'error',
+      from: { path: '^frontend/src/stores/' },
+      to: { path: '^frontend/src/(business|views)/' },
+    },
+    {
+      name: 'shared-imports-business',
+      comment: 'shared 层是通用基础设施，不应反向依赖业务层',
+      severity: 'error',
+      from: { path: '^frontend/src/shared/' },
+      to: { path: '^frontend/src/(business|views)/' },
+    },
+    {
+      name: 'shared-not-import-core',
+      comment: 'shared 层不应依赖 core 层（z054：8 处违规）',
+      severity: 'error',
+      from: { path: '^frontend/src/shared/' },
+      to: { path: '^frontend/src/core/' },
+    },
+    {
+      name: 'shared-not-import-stores',
+      comment: 'shared 层不应依赖 stores 层（z053：useAuth 重置 5 store）',
+      severity: 'error',
+      from: { path: '^frontend/src/shared/' },
+      to: { path: '^frontend/src/stores/' },
+    },
+    {
+      name: 'visualization-should-not-import-business',
+      comment: '可视化层是通用资产，不应反向依赖具体业务',
+      severity: 'error',
+      from: { path: '^frontend/src/visualization/' },
+      to: { path: '^frontend/src/business/' },
+    },
+    {
+      name: 'types-not-import-shared',
+      comment:
+        '分层契约（架构审查收口）：types/ 为纯类型层,禁止 import shared 运行时工具——' +
+        '曾发生 types/crs.ts 引 logger 的反向依赖（normalizePoint 等已移 shared/utils/crs）。',
+      severity: 'error',
+      from: { path: '^frontend/src/types/' },
+      to: { path: '^frontend/src/shared/' },
+    },
+    {
+      name: 'types-not-import-backend-runtime',
+      comment:
+        'types/ 是 L0 纯类型层，只允许 type-only 引后端（值/谓词经 shared/task 转出）。' +
+        '此前 types/task.ts 直接 re-export 后端常量与谓词，使 L0 层对后端实现产生静态依赖，' +
+        '`import type` 不再能安全剥离（审查专项6 R02）。' +
+        '判据依赖 tsPreCompilationDeps + dependencyTypes 的 type-only 标记：' +
+        '`import type` / `export type` 放行，值导入与值 re-export 即红。',
+      severity: 'error',
+      from: { path: '^frontend/src/types/' },
+      to: { path: '^backend/', dependencyTypesNot: ['type-only'] },
+    },
+    {
+      name: 'services-not-import-core',
+      comment:
+        '分层契约：services 禁止 import core。唯一例外为叶子配置 core/config/map' +
+        '（mapDataService 深路径引用,走 @/core 会形成 core↔services 循环,详见该文件注释）。',
+      severity: 'error',
+      from: { path: '^frontend/src/services/' },
+      to: { path: '^frontend/src/core/', pathNot: '^frontend/src/core/config/map' },
+    },
+    {
+      name: 'core-not-import-services',
+      comment:
+        '分层契约：core 禁止 import services（W61，2026-10-20 补——此前该方向零规则，' +
+        '反向边只有 usePortLayer.ts 一处却无约束）。唯一豁免为 core/map/composables/usePortLayer.ts' +
+        '（港口图层取数经 mapDataService；业务归属是否移出 core 另裁，本条先让这一面受约束）。',
+      severity: 'error',
+      from: {
+        path: '^frontend/src/core/',
+        // 正则里 `\.` 转义点号会被 no-useless-escape 记 error（正则里的点号本就匹配字面点，
+        // 此处不需要转义；同文件 :81/:84 的 `index\\.(js|ts)` 转义成立是因为点紧邻量词）。
+        // 改成 `.ts$` 语义不变。
+        pathNot: '^frontend/src/core/map/composables/usePortLayer.ts$',
+      },
+      to: { path: '^frontend/src/services/' },
+    },
+    {
+      name: 'business-root-not-deep-import-modules',
+      comment:
+        '分层契约：business 根层文件不得直接引用某个业务模块的内部实现，只能走模块入口（index.ts）。' +
+        'W62：五条 business-cross-import-* 的 from.path 只匹配 ^frontend/src/business/<模块>/ 子目录，' +
+        '根层（index.ts / manifest.ts / preload.ts）不受任何一条约束——实测在根层深路径引用模块内部，' +
+        'cruise 一条规则都不咬。' +
+        '注意：不能把这五条的 from.path 改成整层，tools/v3-guard/cruise-coverage.mjs 的 parseRuleModules ' +
+        '强制「规则名后缀 == from 路径里的模块目录名」，改整层会直接抛错。',
+      severity: 'error',
+      from: { path: '^frontend/src/business/[^/]+\\.ts$' },
+      to: {
+        path: '^frontend/src/business/[^/]+/',
+        pathNot: '^frontend/src/business/[^/]+/index\\.ts$',
+      },
+    },
+    {
+      name: 'no-circular',
+      severity: 'error',
+      comment: '禁止循环依赖（z055 升级 error）',
+      from: {},
+      to: { circular: true },
+    },
+    // ===== 后端模块分层契约（Nest 形态：modules/<域>/{controllers,services,repositories}）=====
+    // 层间单向约束：controller 只向下委托 service，service 不得反向依赖 controller，
+    // repositories 是数据访问叶子层。
+    {
+      name: 'nest-controllers-not-import-repositories',
+      comment: 'controller 经 service 委托业务，不得越层直接 import repositories',
+      severity: 'error',
+      from: { path: '^backend/src/modules/[^/]+/controllers/' },
+      to: { path: '^backend/src/modules/[^/]+/repositories/' },
+    },
+    {
+      name: 'nest-services-not-import-controllers',
+      comment: 'services 不得反向依赖 controllers（上层只向下委托）',
+      severity: 'error',
+      from: { path: '^backend/src/modules/[^/]+/services/' },
+      to: { path: '^backend/src/modules/[^/]+/controllers/' },
+    },
+    {
+      name: 'nest-repositories-not-import-upper-layers',
+      comment: 'repositories 是数据访问叶子层，不得 import controllers/services',
+      severity: 'error',
+      from: { path: '^backend/src/modules/[^/]+/repositories/' },
+      to: { path: '^backend/src/modules/[^/]+/(controllers|services)/' },
+    },
+    // DB 访问收口：pg 仅允许 repository 层与 infra/db（连接池 provider）import，
+    // 其余层禁止直接依赖 pg，防止裸 SQL 散落到 service/controller。
+    {
+      name: 'nest-db-access-only-in-repository',
+      severity: 'error',
+      from: { path: '^backend/src/', pathNot: '(repositories/|infra/db/)' },
+      to: { path: 'node_modules/pg' },
+    },
+    // ===== 后端 feature 间边界（z187）=====
+    // 每条 `nest-cross-feature-<域>` / `nest-cross-feature-scoped-<域>-<n>` 由上方代码派生，
+    // 域名不在此手写；规则集合 == backend/src/modules 目录集合由 cruise-coverage 对账。
+    ...nestCrossFeatureRules,
+  ],
+  options: {
+    doNotFollow: 'node_modules',
+    // 解析 @/ 别名（vite alias 定义在 frontend/tsconfig.app.json 的 paths），否则规则匹配不到
+    tsConfig: { fileName: 'tsconfig.cruise.json' },
+    tsPreCompilationDeps: true,
+    // ⚠️ node_modules 不得进 exclude.path（z055）：exclude 会把命中模块整体移出结果，
+    // nest-db-access-only-in-repository 的 to 正是 node_modules/pg ⇒ 该规则恒不报告
+    // （19 条里唯一不能红的一条）。doNotFollow 已保证不爬进 node_modules，
+    // 移除 exclude 后它们仅作为依赖边终点出现在图里（+17 个叶子模块），规则恢复可红。
+    exclude: {
+      path: '(__tests__|dist|\\.test\\.)',
+    },
+    includeOnly: '^(frontend/src|backend)',
+  },
+}

@@ -1,0 +1,315 @@
+/**
+ * MapRenderer 抽象接口：OL（2D）/Cesium（3D）双引擎的共同契约，
+ * 业务层只面向此接口操作地图，实现 2D/3D 无感切换；引擎切换用 exportState/importState 传递视角。
+ * 单引擎专有能力收敛为可选能力接口（Water3DCapability/GeoTIFFCapability/HeatmapCapability），
+ * 调用方先做能力检查再调用；呼吸动画为双引擎公共能力。
+ */
+
+import type { FeatureCollection } from 'geojson'
+
+import type { GeoPoint } from '@/types/business/base'
+
+// ===== 基础坐标类型 =====
+
+/** 点要素（渲染器 addPointLayer 入参） */
+export interface PointFeature {
+  /** 常规输入：lng/lat；GeoJSON Feature 形状（热力图）走 geometry.coordinates */
+  lng?: number
+  lat?: number
+  name?: string
+  /** per-point 透明度 0-1（缺省 1）：选址「层层筛选」命中高亮——命中设施 1、未命中 0.5 */
+  opacity?: number
+  /** per-point 颜色（缺省用 options.color）：附近设施合并图层 6 类设施同层异色 */
+  color?: string
+  /** 兼容 GeoJSON Feature 形状；可选——空 geometry 时渲染器跳过该要素（不落 (0,0) 哨兵，a059） */
+  geometry?: { type?: string; coordinates?: [number, number] }
+  properties?: Record<string, unknown>
+  /** 开放扩展：业务层可附加任意属性（渲染器经 options.labelField 等按需读取） */
+  [key: string]: unknown
+}
+
+/** 多边形要素（渲染器 addPolygonLayer 入参） */
+export interface PolygonFeature {
+  coordinates?: [number, number][]
+  properties?: Record<string, unknown>
+  /** 兼容 GeoJSON 风格输入（渲染器按 geometry.type 分派 Polygon/MultiPolygon） */
+  geometry?: { type: string; coordinates: unknown }
+  /** 业务要素类型标识（渲染器透传到 feature 属性） */
+  featureType?: string
+  [key: string]: unknown
+}
+
+// ===== FlyTo 目标 =====
+
+export type FlyToTarget = GeoPoint | [number, number] | { layerId: string }
+
+export interface FlyToOptions {
+  duration?: number // 毫秒（2D）/ 秒（3D，内部转换）
+  zoom?: number
+  height?: number
+  // Cesium 相机朝向（3D 专用；OL 忽略）
+  heading?: number
+  pitch?: number
+  roll?: number
+}
+
+// ===== 图层选项 =====
+
+export interface LayerOptions {
+  // 注：显隐**不在**本接口。图层的 visible 由 `LayerDescriptor.visible`（register/applyOrUpdate
+  // 的入参）承载，渲染器经 registry 状态读写（`MapRenderer.setVisibility` / `isVisible`）。
+  // 曾有一个同名的 `visible?: boolean` 留在这里：全仓 0 处赋值、0 处读取，
+  // 直到 2026-10-19 立「可选字段零生产者」守卫才被扫出来（W67 / PB-1）。
+  zIndex?: number
+  markerColor?: string
+  markerSize?: number
+  // GeoJSON 多边形样式
+  strokeColor?: string
+  strokeWidth?: number
+  fillColor?: string
+  // 点图层样式
+  size?: number
+  color?: string
+  labelField?: string
+  // 业务要素类型标识（如 'port' / 'boundary'）
+  featureType?: string
+  // 栅格图层透明度（GeoTIFF hillshade 等，0-1）
+  opacity?: number
+  // GeoJSON 图层 per-feature 样式回调（OL 渲染器消费）
+  style?: unknown
+  // GeoJSON 图层加载失败回调（Cesium 渲染器消费）
+  onError?: (err: unknown) => void
+  // ── 热力图选项（2D Only）──
+  /** 热力图色带（CSS 颜色字符串数组，从低到高） */
+  gradient?: string[]
+  /** 权重字段名（feature 属性中作为权重的 key，如 'value'） */
+  weightField?: string
+  /** 热力点半径（像素） */
+  radius?: number
+  /** 热力模糊半径（像素） */
+  blur?: number
+}
+
+/**
+ * 底图注册表形状（影像/矢量两槽，考古 K1-4：原 CesiumRenderer 三处内联字面收口）。
+ * 槽内元素类型暂为 unknown[]（Cesium ImageryLayer 的收敛留待接线时定），
+ * 收口目的是让三处消费点共享同一具名形状，改槽结构只改这里。
+ */
+export interface BaseLayerPair {
+  image: unknown[]
+  vector: unknown[]
+}
+
+/** 水面选项（3D Only） */
+export interface WaterSurfaceOptions {
+  color?: string
+  opacity?: number
+}
+
+/**
+ * 水面效果能力接口（3D Only）：3D 专有方法收敛为独立能力接口，仅 CesiumRenderer 实现，
+ * 调用方先做能力检查，不支持的渲染器跳过并 warn。呼吸动画为双引擎公共能力，留在主接口。
+ */
+export interface Water3DCapability {
+  addWaterSurface(
+    id: string,
+    coordinates: [number, number][],
+    height: number,
+    options?: WaterSurfaceOptions
+  ): Promise<boolean>
+  updateWaterLevel(id: string, newHeight: number): boolean
+  removeWaterSurface(id: string): boolean
+  removeAllWaterSurfaces(): boolean
+  setWaterSurfaceVisibility(id: string, visible: boolean): boolean
+}
+
+// ===== 渲染器可选能力接口 =====
+// 单引擎专有方法收敛为能力接口（避免基类为 2D 背负 3D 契约），调用方经类型守卫检查后调用；
+// 守卫函数位于 core/map/layerAdapters.ts（types 层不引 core，避免循环依赖）
+
+/** GeoTIFF 栅格图层能力（2D COG / 3D hillshade 影像——双引擎各自实现） */
+export interface GeoTIFFCapability {
+  addGeoTIFFLayer(id: string, url: string, options?: LayerOptions): boolean
+}
+
+/**
+ * 3D Tiles 能力（3D Only——Cesium 以 Cesium3DTileset 流式加载 glTF/b3dm 瓦片集；OL 无 3D Tiles 概念）。
+ * 异步：fromUrl 需先取回 tileset.json 再建瓦片树；失败返回 false 而不抛出（与 addGeoTIFFLayer 一致，
+ * 避免单图层问题中断 App.vue reapplyAll 的整批引擎切换重绘）。
+ */
+/** 3D Tiles 图层选项：通用图层选项 + 瓦片集专属参数 */
+export type Tiles3DOptions = LayerOptions & {
+  /** 瓦片集最大屏误差（像素）：越小越清晰、加载越多；缺省交给 Cesium 默认 16 */
+  maximumScreenSpaceError?: number
+}
+
+export interface Tiles3DCapability {
+  add3DTilesLayer(id: string, url: string, options?: Tiles3DOptions): Promise<boolean>
+}
+
+/**
+ * 单张影像覆盖图层数据载荷（3D Only，imageOverlay adapter 入参）。
+ * 用于把「离线提取的影像块」按地理矩形铺到球面上（区别于在线底图瓦片服务）——
+ * 例如从天地图拼接出的枢纽施工影像，与 3D Tiles 模型同源同坐标系，便于对齐核验。
+ * 放在本文件而非 `types/core/layerManager.ts`：它是 `ImageOverlayCapability` 的入参契约，
+ * 属渲染器契约面；BLM 元数据单向依赖渲染器类型，反向 import 会在 L0 成环。
+ */
+export interface ImageOverlayData {
+  /** 图片地址（同源路径，如 /static/pinglu/imagery/madao.jpg） */
+  url: string
+  /** 地理范围 [west, south, east, north]（度，EPSG:4326） */
+  bbox: [number, number, number, number]
+  /** 图片像素尺寸 [width, height]（SingleTileImageryProvider 构造必填，缺省会抛 DeveloperError） */
+  size: [number, number]
+}
+
+/**
+ * 单张影像覆盖能力（3D Only——Cesium 用 SingleTileImageryProvider 按地理矩形铺一张图）。
+ * 与 geotiff（hillshade 回退）的区别：本能力接受任意矩形 + 任意图，对文件名不做假设；
+ * 用于把离线提取的影像块（与 3D Tiles 同源同坐标系）按 bbox 铺回球面，便于对齐核验。
+ */
+export interface ImageOverlayCapability {
+  addImageOverlayLayer(id: string, data: ImageOverlayData, options?: LayerOptions): boolean
+}
+
+/** 热力图能力（2D Only——OL 专属，Cesium 无对应实现） */
+export interface HeatmapCapability {
+  addHeatmapLayer(id: string, features: PointFeature[], options?: LayerOptions): boolean
+  updateHeatmapLayer(id: string, features: PointFeature[], options?: LayerOptions): boolean
+}
+
+/**
+ * 真地形开关能力（3D Only——Cesium 在 CesiumTerrainProvider（CTB z 起伏）与
+ * EllipsoidTerrainProvider（平坦椭球）之间切换 terrainProvider）。
+ *
+ * 2026-09-28 重新作为**能力接口**对外暴露：真地形由「挂载即开的基础能力」改为
+ * 图层面板里的可选图层（layerType 'terrain'，默认关）。原因是用户实测真地形与
+ * 3D Tiles 同时开启时模型落位错乱（锚点高程基准差），二者不能共存，故默认看模型
+ * 时保持平面，要看真地形再手动开关。
+ *
+ * 与 2026-09-21 移除时的区别：那时移除是为了切断 geotiff 显隐对真地形的误联动；
+ * 本次恢复是把它做成**独立的图层开关**，不再由任何贴图图层的显隐间接控制。
+ */
+export interface TerrainToggleCapability {
+  setTerrainEnabled(_enabled: boolean): void
+}
+
+// ===== 状态持久化 =====
+
+/** Camera 状态（用于 2D/3D 切换） */
+export interface CameraState {
+  center: GeoPoint
+  zoom?: number
+  height?: number
+  heading?: number
+  pitch?: number
+  roll?: number
+}
+
+/** 渲染器导出状态（图层 ID → { visible }，特殊键 `_camera` 存切换用视角） */
+export interface RendererState {
+  [layerId: string]: { visible: boolean } | CameraState
+}
+
+// ===== 事件 =====
+
+export interface MapRendererEventMap {
+  /** 点击事件：命中要素的类型/属性/坐标，未命中为 null */
+  click: {
+    featureType: string | null
+    data: Record<string, unknown> | null
+    coordinate: [number, number] | null
+  }
+  /** 悬停事件（要素气泡驱动，2D）：命中 POI 的类型/属性/锚点坐标，移出/未命中/拖拽中为 null */
+  hover: {
+    featureType: string | null
+    data: Record<string, unknown> | null
+    coordinate: [number, number] | null
+  }
+  'pointer-move': { lng: number; lat: number }
+  'camera-changed': CameraState
+}
+
+// ===== 主接口 =====
+
+export interface MapRenderer {
+  /** 销毁地图，释放资源 */
+  destroy(): void
+
+  /** 添加点图层 */
+  addPointLayer(_id: string, _features: PointFeature[], _options?: LayerOptions): void
+
+  /** 添加多边形图层 */
+  addPolygonLayer(_id: string, _features: PolygonFeature[], _options?: LayerOptions): void
+
+  /** 添加 GeoJSON 图层 */
+  addGeoJsonLayer(_id: string, _geojson: FeatureCollection, _options?: LayerOptions): void
+
+  /**
+   * 添加 3D Tiles 瓦片集（2D 引擎无对应概念 ⇒ 基类静默 no-op 并返回 false）。
+   *
+   * 定位完全由 tileset.json 自带的 `root.transform` 决定，调用方只传 URL；
+   * `nameFilter` 只保留 `extras.name` 命中该子串的子树（用于「只看某一个枢纽」）。
+   *
+   * 与 `MapRenderer` 类（renderers/MapRenderer.ts）的签名逐字对应：本接口是
+   * `mapStore.currentRenderer` 的静态类型，缺这一条会让业务页的
+   * `renderer.add3DTiles(...)` 在类型面不成立——**实现类有、契约接口没有**是契约单向，
+   * 修的是 09-27 加该方法时漏改的类型面。
+   */
+  add3DTiles(
+    _id: string,
+    _url: string,
+    _options?: { maximumScreenSpaceError?: number; nameFilter?: string }
+  ): Promise<boolean>
+
+  // addGeoTIFFLayer/addHeatmapLayer 等单引擎专有方法已收敛为上方能力接口，经类型守卫后调用
+
+  /** 设置图层显隐 */
+  setVisibility(_id: string, _visible: boolean): void
+
+  /** 切换底图（image 影像 / vector 矢量）——双引擎公共能力 */
+  setBaseLayer(_type: 'image' | 'vector'): void
+
+  /** 移除图层 */
+  removeLayer(_id: string): void
+
+  /** 检查图层是否已存在（公开方法，替代直读 _layers 私有 Map） */
+  hasLayer(_id: string): boolean
+
+  /** 飞往目标位置 */
+  flyTo(_target: FlyToTarget, _options?: FlyToOptions): void
+
+  /** 导出当前状态（引擎切换用） */
+  exportState(): RendererState
+
+  /** 导入状态 */
+  importState(_state: RendererState): void
+
+  /** 呼吸灯效果（双引擎公共能力：OL 矢量动画圈 / Cesium 实体动画）；
+   *  支持单点/多点（设施 POI 图层按类型唤醒）；颜色缺省为默认蓝（定位小区等单点场景） */
+  startBreathing?(_target: GeoPoint | GeoPoint[], _color?: string): void
+  stopBreathing?(): void
+
+  // ── 要素气泡（2D Overlay 能力，仅 OLRenderer 实现；调用方经可选链调用）──
+  /** 挂载气泡宿主元素（Vue 渲染树提供，Overlay 用它做锚点定位；幂等） */
+  attachBubbleElement?(_element: HTMLElement): void
+  /** 设置气泡锚点（WGS84 经纬度）：随地图移动自动跟随；null 隐藏 */
+  setBubbleAnchor?(_coordinate: [number, number] | null): void
+
+  /** 事件监听 */
+  on<K extends keyof MapRendererEventMap>(
+    _event: K,
+    _handler: (event: CustomEvent<MapRendererEventMap[K]>) => void
+  ): void
+  on(_event: string, _handler: EventListenerOrEventListenerObject): void
+  off<K extends keyof MapRendererEventMap>(
+    _event: K,
+    _handler: (event: CustomEvent<MapRendererEventMap[K]>) => void
+  ): void
+  off(_event: string, _handler: EventListenerOrEventListenerObject): void
+  emit<K extends keyof MapRendererEventMap>(_event: K, _data: MapRendererEventMap[K]): void
+  emit(_event: string, _data: unknown): void
+
+  /** 获取渲染器类型标识 */
+  getType(): string
+}

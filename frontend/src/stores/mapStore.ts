@@ -1,0 +1,210 @@
+import { defineStore } from 'pinia'
+import type { Ref, ShallowRef } from 'vue'
+import { ref, shallowRef, computed } from 'vue'
+
+import { BASE_LAYER_KEYS, LAYER_KEYS, logger } from '@/shared'
+import { readStoredJSON, writeStoredJSON } from '@/shared/utils/safeStorage'
+import type { EngineName, LayerEntry, LayerType, MapType } from '@/types'
+import type { MapRenderer } from '@/types'
+import { DEFAULT_ENGINES, ENGINE_NAMES } from '@/types'
+import { STORAGE_KEYS } from '@/shared/constants'
+
+/** localStorage 键：底图 */
+const BASE_LAYER_STORAGE_KEY = STORAGE_KEYS.baseLayer
+
+function readStoredBaseLayer(): string | null {
+  if (typeof window === 'undefined') return null
+  const key = readStoredJSON<string>(BASE_LAYER_STORAGE_KEY)
+  // 白名单校验：底图 key 集合演进后，旧 localStorage 值可能指向已不存在的底图，
+  // 直接透传会导致初始底图静默降级且面板无高亮（P1-8）
+  return key && BASE_LAYER_KEYS.includes(key) ? key : null
+}
+
+function writeStoredBaseLayer(key: string | null): void {
+  if (typeof window === 'undefined') return
+  writeStoredJSON(BASE_LAYER_STORAGE_KEY, key)
+}
+
+export const useMapStore = defineStore('map', () => {
+  // 地图状态不持久化（无读取方的死状态已删）；跨页恢复由各业务 store 的内存快照负责
+  const mapType: Ref<MapType> = ref('2d')
+  // shallowRef（浅响应式）：条目变更由各 action 重建数组触发，避免深度代理 50 个图层对象
+  const layerCatalog: ShallowRef<LayerEntry[]> = shallowRef([])
+
+  /** 不可变更新条目（配合 shallowRef 浅响应式）：命中项替换，其余保持原引用 */
+  function patchEntries(
+    match: (e: LayerEntry) => boolean,
+    patch: (e: LayerEntry) => LayerEntry
+  ): void {
+    layerCatalog.value = layerCatalog.value.map((e) => (match(e) ? patch(e) : e))
+  }
+  const baseLayerKey: Ref<string | null> = ref(readStoredBaseLayer())
+
+  /** 当前渲染器引用（由UnifiedMap设置，供业务组件访问） */
+  const currentRenderer: ShallowRef<MapRenderer | null> = shallowRef(null)
+
+  // 由 UnifiedMap 在渲染器初始化/切换时调用
+  function setCurrentRenderer(renderer: MapRenderer | null): void {
+    currentRenderer.value = renderer
+  }
+
+  /**
+   * 当前渲染器对应的引擎名（未就绪为 null）。
+   * 单一来源：面板判断"图层是否适用当前引擎"、BLM.reapplyAll 的引擎过滤都读它——
+   * 原先 '2d'/'3d' → EngineName 的映射散在 reapplyAll 与各处判定里。
+   */
+  const currentEngineName = computed<EngineName | null>(() => {
+    const rt = currentRenderer.value?.getType?.()
+    return rt === '2d' ? ENGINE_NAMES.OPENLAYERS : rt === '3d' ? ENGINE_NAMES.CESIUM : null
+  })
+
+  // 地图类型仅内存态（无读取方的持久化已移除），刷新回退默认 '2d'
+  function setMapType(type: MapType): void {
+    mapType.value = type
+  }
+
+  /**
+   * 目录条目按键查找（唯一入口）：各 action 与图层面板共用同一谓词。
+   * 手抄 find/findIndex 的谓词一旦漂移（如漏 : LayerEntry 标注或改比较方向），
+   * 会出现「注册判存在」与「删除定位」两套口径，条目被静默重复注册或删错下标。
+   */
+  function findLayerEntry(key: string): LayerEntry | undefined {
+    return layerCatalog.value.find((e: LayerEntry) => e.key === key)
+  }
+
+  /** 目录条目按键定位（同上，用于按下标删除/更新） */
+  function findLayerEntryIndex(key: string): number {
+    return layerCatalog.value.findIndex((e: LayerEntry) => e.key === key)
+  }
+
+  /** 注册底图条目（幂等——UnifiedMap 每次引擎切换都会调用，已存在则跳过） */
+  function registerBaseLayer(key: string, label: string): void {
+    const existing = findLayerEntry(key)
+    if (existing) return
+    const isFirstBase = layerCatalog.value.every((e: LayerEntry) => e.category !== 'base')
+    // 可见性以持久化的底图 key 为准，未设置时默认第一张可见
+    const storedKey = baseLayerKey.value
+    const visible = storedKey ? key === storedKey : isFirstBase
+    layerCatalog.value = [...layerCatalog.value, { key, label, visible, category: 'base' }]
+  }
+
+  /** 注册业务图层：仅存元数据（key/label/layerType/visible/category），不存回调、不触发显隐——渲染由 LayerControlPanel 读条目驱动 */
+  function registerBusinessLayer(
+    key: string,
+    label: string,
+    layerType: LayerType,
+    visible: boolean = true,
+    engines: EngineName[] = DEFAULT_ENGINES,
+    listed: boolean = true,
+    locked: boolean = false
+  ): void {
+    const existing = findLayerEntry(key)
+    if (existing) {
+      // 已存在则更新可见性与类型（不可变更新，配合 shallowRef 浅响应式）
+      patchEntries(
+        (e) => e.key === key,
+        (e) => ({ ...e, visible, layerType, engines, listed, locked })
+      )
+      return
+    }
+    const newEntry: LayerEntry = {
+      key,
+      label,
+      layerType,
+      visible,
+      engines,
+      category: 'business',
+      listed,
+      locked,
+    }
+    layerCatalog.value = [...layerCatalog.value, newEntry]
+  }
+
+  /** 切换底图（互斥）：key 持久化到 localStorage，catalog base 条目 visible 同步镜像，供控制面板调用 */
+  let lastBaseRenderer: MapRenderer | null = null // 底图指令最近应用到的渲染器实例（引擎切换后需重放）
+  function setBaseLayer(key: string): void {
+    const entry = findLayerEntry(key)
+    if (!entry || entry.category !== 'base') return
+
+    // 通知当前渲染器切换底图引擎（OL/Cesium 渲染器均实现 setBaseLayer）
+    const renderer = currentRenderer.value as
+      | (MapRenderer & { setBaseLayer?: (type: string) => void })
+      | null
+
+    // no-op 仅限「同 key 且已应用到当前渲染器实例」——引擎切换后渲染器是新实例，
+    // 即使 key 未变也必须重放，否则新引擎保持默认底图而权威键不变（面板与屏幕脱节）
+    if (baseLayerKey.value === key && entry.visible && renderer === lastBaseRenderer) return
+
+    // base 条目互斥可见（不可变更新，配合 shallowRef 浅响应式）
+    patchEntries(
+      (e) => e.category === 'base',
+      (e) => ({ ...e, visible: e.key === key })
+    )
+
+    baseLayerKey.value = key
+    writeStoredBaseLayer(key)
+
+    // 渲染器未就绪（null）：状态已更新、不记 lastBaseRenderer——渲染器就绪后 setupLayers 重放权威键
+    if (!renderer) return
+    lastBaseRenderer = renderer
+
+    renderer.setBaseLayer?.(key === LAYER_KEYS.baseImage ? 'image' : 'vector')
+  }
+
+  function removeLayer(key: string): void {
+    const idx = findLayerEntryIndex(key)
+    if (idx < 0) return
+    // 仅删条目：显隐由 BusinessLayerManager.setVisible 驱动（不可变更新，配合 shallowRef）
+    layerCatalog.value = layerCatalog.value.filter((_, i) => i !== idx)
+  }
+
+  function clearLayerCatalog(): void {
+    layerCatalog.value = []
+  }
+
+  /** 设置图层可见性：必须经 action 走不可变更新，Pinia 状态库才能正确追踪（绕过 action 直接改条目会丢响应式与 DevTools 记录） */
+  function setLayerVisible(key: string, visible: boolean): void {
+    const idx = findLayerEntryIndex(key)
+    if (idx < 0) {
+      logger.debug(`setLayerVisible: 未找到key为“${key}”的图层`)
+      return
+    }
+    patchEntries(
+      (e) => e.key === key,
+      (e) => ({ ...e, visible })
+    )
+  }
+
+  /**
+   * 统一重置地图业务交互状态（登出/业务切换时调用）：
+   * 清业务图层条目；保留底图条目（避免控制面板底图区空白）、
+   * mapType/baseLayerKey（用户偏好）与 currentRenderer（渲染器生命周期由 UnifiedMap 持有，登出时组件未卸载）
+   */
+  function resetMapState(): void {
+    layerCatalog.value = layerCatalog.value.filter((e: LayerEntry) => e.category !== 'business')
+    // lastBaseRenderer 一并失效：登出/业务切换后同 key 切底图不得被 no-op 短路，
+    // 须对当前渲染器重放（setBaseLayer 幂等），避免渲染器重建后底图静默不跟随
+    lastBaseRenderer = null
+  }
+
+  return {
+    mapType,
+    layerCatalog,
+    baseLayerKey,
+    currentRenderer,
+    // 当前引擎名（面板三态判定与 BLM 引擎过滤共用）
+    currentEngineName,
+    setCurrentRenderer,
+    setMapType,
+    // 目录条目按键查找/定位（面板等消费方走同一入口，勿再手抄 find 谓词）
+    findLayerEntry,
+    findLayerEntryIndex,
+    registerBaseLayer,
+    registerBusinessLayer,
+    setBaseLayer,
+    removeLayer,
+    clearLayerCatalog,
+    setLayerVisible,
+    resetMapState,
+  }
+})

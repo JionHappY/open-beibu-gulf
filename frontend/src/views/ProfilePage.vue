@@ -1,0 +1,155 @@
+<script setup lang="ts">
+/**
+ * ProfilePage - 个人中心（用户工作台）
+ * 继承 AppLayout 布局基座：左侧吞吐量图表（自 AppLayout 下沉），
+ * 右侧单个 4×8 Panel 放置登录/用户信息/收藏夹（UserInfoCard、PlansPanel 为独立子组件）。
+ */
+import { onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+import { useOverviewCharts } from '@/business'
+import { AppLayout, GCSPanel } from '@/core'
+import { useAuth, useGCS } from '@/shared'
+
+import PlansPanel from './components/PlansPanel.vue'
+import UserInfoCard from './components/UserInfoCard.vue'
+import LoginPanel from './LoginPanel.vue'
+import { LazyBarChart, LazyLineChart } from './lazyCharts'
+
+const LineChart = LazyLineChart
+const BarChart = LazyBarChart
+
+const { user, logout } = useAuth()
+const { cellCss, css } = useGCS()
+const { chartData, barData, loadOverviewCharts, cancelOverviewCharts } = useOverviewCharts()
+
+// 与首页共用 useOverviewCharts（图表数据统一来源，无本页假数据）
+onMounted(loadOverviewCharts)
+onUnmounted(cancelOverviewCharts)
+
+// 登录成功后按 redirect 参数返回原页面——
+// handleAuthError 把被 401 打断的路径带回这里，登录后还原现场继续操作。
+// immediate 必需：已登录用户（localStorage 临时态/后端不可达分支）挂载时 user 已非空，
+// 无 immediate 则 watch 永不触发、redirect 成死链（审查 M-2 残留）
+const route = useRoute()
+const router = useRouter()
+watch(
+  user,
+  (u) => {
+    if (!u) return
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+    // 仅允许站内路径跳转（防 open redirect）：必须以 / 开头且非协议相对 //host，
+    // 完整 URL（http(s):/data: 等）与外部域名一律落回默认首页
+    if (!redirect || !redirect.startsWith('/') || redirect.startsWith('//')) return
+    void router.replace(redirect)
+  },
+  { immediate: true }
+)
+
+/** 退出登录：复用 useAuth.logout（清 HttpOnly Cookie + localStorage + 业务 store） */
+async function handleLogout() {
+  await logout()
+}
+
+// 退出按钮尺寸（Cell 单位，样式自 UserInfoCard 下沉）
+// 🔴 必须是 computed（cellCss 返回 computed）：`v-bind()` 只跟踪响应式依赖，写成普通字符串
+// 会在首次求值时把 cellPixel 读死 ⇒ 窗口缩放后按钮尺寸**不跟随**。
+const logoutWidthCss = cellCss(3.8)
+const logoutHeightCss = cellCss(0.8)
+const logoutFontCss = cellCss(0.175)
+// 内边距 0.1 Cell（与 GCS 面板边缘规格一致）：复用 useGCS 既有的 cell8px，不再手算系数
+const logoutPaddingCss = css.cell8px
+</script>
+
+<template>
+  <div class="profile-page">
+    <AppLayout>
+      <!-- 左侧：吞吐量图表（自 AppLayout 下沉） -->
+      <template #left>
+        <GCSPanel :w="4" :h="4" anchor="top-left" :offset-x="0" :offset-y="1.25">
+          <LineChart title="港口吞吐量趋势" :x-data="chartData.labels" :series="chartData.series" />
+        </GCSPanel>
+        <GCSPanel :w="4" :h="4" anchor="top-left" :offset-x="0" :offset-y="5.5">
+          <BarChart title="港口吞吐量对比" :x-data="barData.labels" :series="barData.series" />
+        </GCSPanel>
+      </template>
+
+      <!-- 右侧：单个 4×8 Panel -->
+      <template #right>
+        <GCSPanel :w="4" :h="8" anchor="top-right" :offset-x="0" :offset-y="1.25">
+          <div class="profile-content">
+            <!-- 未登录显示登录面板，已登录显示个人中心 -->
+            <LoginPanel v-if="!user" class="profile-login" />
+
+            <!-- 已登录：用户信息 + 收藏 + 底部独立退出按钮 -->
+            <div v-else class="profile-logged-in">
+              <UserInfoCard />
+              <PlansPanel />
+              <div class="profile-logout-bar">
+                <button class="profile-logout-btn" @click="handleLogout">退出登录</button>
+              </div>
+            </div>
+          </div>
+        </GCSPanel>
+      </template>
+    </AppLayout>
+  </div>
+</template>
+
+<style scoped>
+.profile-page {
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.profile-content {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+/* 未登录：登录面板占满整个 Panel */
+.profile-login {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* 已登录：内部三段式（顶部头像+用户名 / 中段收藏 / 底部退出） */
+.profile-logged-in {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 底部退出登录：独立下沉到最底部（内边距 0.1 Cell 与 GCS 规格一致） */
+.profile-logout-bar {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  padding: v-bind(logoutPaddingCss);
+}
+
+.profile-logout-btn {
+  width: v-bind(logoutWidthCss);
+  height: v-bind(logoutHeightCss);
+  border: 1px solid var(--GCS-color-error);
+  border-radius: var(--GCS-radius-md);
+  background: var(--GCS-bg-panel);
+  color: var(--GCS-color-error);
+  font-size: v-bind(logoutFontCss);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color var(--GCS-duration-base) ease,
+    color var(--GCS-duration-base) ease;
+}
+
+.profile-logout-btn:hover {
+  background: var(--GCS-color-error);
+  color: var(--GCS-text-inverse);
+}
+</style>

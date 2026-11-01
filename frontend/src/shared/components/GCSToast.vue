@@ -1,0 +1,154 @@
+<script setup lang="ts">
+/**
+ * GCSToast — 全局轻提示（GCS 标准，编程式）：固定胶囊语义色提示，自动消失。
+ * App.vue 挂载一次，全局经 showToast() 触发（gcsFeedback 单例），替代 Element Plus ElMessage。
+ * 规格：固定 3×0.5 cell 胶囊（形状不随文案变化）——语义点与文案成组整体居中、
+ * 强制单行；超长动态文案（如「已收藏：<长名>」）尾部省略，不换行不溢出。
+ */
+import { computed, onBeforeUnmount, watch } from 'vue'
+
+import { useGCS } from '../layout/useGCS'
+import { gcsToastState } from '../utils/gcsFeedback'
+
+const { cell } = useGCS()
+
+// 胶囊高度（0.5 cell）；宽度固定 3 cell，由 CSS 控制
+const toastHeightCss = computed(() => cell(1, 0.5).height)
+
+const TOAST_DURATION_MS = 3000
+const timers = new Map<number, ReturnType<typeof setTimeout>>()
+
+// 触发信号用 id 序列而非 items.length：队列满时 pop+unshift 长度不变，watch length 不触发，新 toast 会永远无定时器
+watch(
+  () => gcsToastState.items.map((t) => t.id).join(','),
+  () => {
+    // 清理已被移除（pop 挤掉/已消失）toast 的残留定时器
+    for (const id of timers.keys()) {
+      if (!gcsToastState.items.some((t) => t.id === id)) {
+        const timer = timers.get(id)
+        if (timer) clearTimeout(timer)
+        timers.delete(id)
+      }
+    }
+    // 为尚无定时器的新 toast 启动 3s 计时
+    for (const item of gcsToastState.items) {
+      if (timers.has(item.id)) continue
+      timers.set(
+        item.id,
+        setTimeout(() => {
+          const idx = gcsToastState.items.findIndex((t) => t.id === item.id)
+          if (idx !== -1) gcsToastState.items.splice(idx, 1)
+          timers.delete(item.id)
+        }, TOAST_DURATION_MS)
+      )
+    }
+  },
+  { immediate: true }
+)
+
+onBeforeUnmount(() => {
+  for (const timer of timers.values()) clearTimeout(timer)
+  timers.clear()
+})
+</script>
+
+<template>
+  <div class="GCS-toast-container">
+    <TransitionGroup name="GCS-toast">
+      <div
+        v-for="item in gcsToastState.items"
+        :key="item.id"
+        class="GCS-toast"
+        :class="`GCS-toast--${item.type}`"
+        :style="{ height: toastHeightCss }"
+      >
+        <span class="GCS-toast-dot" />
+        <span class="GCS-toast-message">{{ item.message }}</span>
+      </div>
+    </TransitionGroup>
+  </div>
+</template>
+
+<style scoped>
+.GCS-toast-container {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--GCS-z-message);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+
+  /* 不裁切（裁切会水平切断 toast）；队列上限由 gcsFeedback.showToast 控制（最多 4 条） */
+}
+
+.GCS-toast {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+
+  /* 固定胶囊：恒 3×0.5 cell，形状不随文案长短变化（高度由内联 style 给） */
+  width: calc(var(--GCS-cell, 80px) * 3);
+  background: var(--GCS-bg-panel-translucent);
+  border-radius: calc(var(--GCS-cell, 80px) * 0.15);
+  box-shadow: var(--GCS-shadow-md);
+  font-size: calc(var(--GCS-cell, 80px) * 0.16);
+  color: var(--GCS-text-primary);
+  padding: 0 16px;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+
+/* 语义点与文案成组整体居中（点在流内，间隔由容器 gap 控制） */
+.GCS-toast-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--GCS-radius-round);
+  flex-shrink: 0;
+}
+
+.GCS-toast--success .GCS-toast-dot {
+  background: var(--GCS-color-success);
+}
+
+.GCS-toast--warning .GCS-toast-dot {
+  background: var(--GCS-color-warning);
+}
+
+.GCS-toast--error .GCS-toast-dot {
+  background: var(--GCS-color-error);
+}
+
+.GCS-toast-message {
+  line-height: 1.4;
+
+  /* 强制单行：触顶 max-width 时尾部省略，不换行、不撑破胶囊 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* 进出场动画（新 toast 从顶部进入占一号位，老 toast 顺移下移用 move 过渡） */
+.GCS-toast-enter-active,
+.GCS-toast-leave-active {
+  transition:
+    opacity var(--GCS-duration-base) ease,
+    transform var(--GCS-duration-base) ease;
+}
+
+.GCS-toast-enter-from,
+.GCS-toast-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+/* TransitionGroup 位置变化（老 toast 被挤到下一位）——平滑下移 */
+.GCS-toast-move {
+  transition: transform var(--GCS-duration-base) ease;
+}
+</style>

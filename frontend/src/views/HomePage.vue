@@ -1,0 +1,54 @@
+<script setup lang="ts">
+/**
+ * HomePage - 首页
+ * 承载 AppLayout 布局基座：左侧图表面板经 #left slot（Vue 插槽）注入；
+ * 港口吞吐量图表下沉到本页（业务数据由业务页持有）。
+ */
+
+import { onMounted, onUnmounted } from 'vue'
+
+// 6-01：经 business 桶入口取数（不再深路径穿透 composables）
+import { useOverviewCharts } from '@/business'
+import { AppLayout, GCSPanel } from '@/core'
+import { usePanelPlacements } from '@/shared'
+
+import { HOME_PANELS } from './panels'
+import { LazyBarChart, LazyLineChart } from './lazyCharts'
+
+const LineChart = LazyLineChart
+const BarChart = LazyBarChart
+
+const { chartData, barData, loadOverviewCharts, cancelOverviewCharts } = useOverviewCharts()
+
+/** 两面板位置由 panels.ts 派生（cell 档随全局；模板不写 offset 字面量） */
+const placements = usePanelPlacements(HOME_PANELS)
+
+onMounted(loadOverviewCharts)
+onUnmounted(cancelOverviewCharts)
+</script>
+
+<template>
+  <div class="home-page">
+    <AppLayout>
+      <template #left>
+        <!-- 左上：折线图 4×4 -->
+        <GCSPanel v-bind="placements.trend">
+          <LineChart title="港口吞吐量趋势" :x-data="chartData.labels" :series="chartData.series" />
+        </GCSPanel>
+        <!-- 左下：柱状图 4×4 -->
+        <GCSPanel v-bind="placements.compare">
+          <BarChart title="港口吞吐量对比" :x-data="barData.labels" :series="barData.series" />
+        </GCSPanel>
+      </template>
+    </AppLayout>
+    <!-- 港口信息浮层（PortInfoPanel）已移除：点击/悬浮港口改由地图内气泡（MapFeatureBubble）呈现 -->
+  </div>
+</template>
+
+<style scoped>
+.home-page {
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+</style>

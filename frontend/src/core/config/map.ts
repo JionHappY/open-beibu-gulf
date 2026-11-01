@@ -1,0 +1,146 @@
+// 天地图 KEY 仅从环境变量读取，缺失时显式报错
+import { logger } from '@/shared'
+
+const TIANDITU_KEY: string = import.meta.env.VITE_TIANDITU_KEY
+if (!TIANDITU_KEY) {
+  logger.error('[map/config] 缺少 VITE_TIANDITU_KEY 环境变量，天地图底图将无法加载')
+}
+
+/** 天地图底图图层配置 */
+interface MapBaseLayerConfig {
+  name: string
+  layers: string[]
+}
+
+/** 天地图底图集合 */
+interface MapBaseLayersConfig {
+  image: MapBaseLayerConfig
+  vector: MapBaseLayerConfig
+}
+
+/** 数据文件路径配置 */
+interface MapDataPaths {
+  ports: string
+  boundary: string
+}
+
+/** 相机中心点（含高度） */
+interface MapCameraCenter {
+  lng: number
+  lat: number
+  height: number
+}
+
+/** 相机初始参数 */
+interface MapCameraConfig {
+  center: MapCameraCenter
+  heading: number
+  pitch: number
+  roll: number
+}
+
+/** 视图层级配置（区域 / 城市 / 区级） */
+interface MapViewLevel {
+  center: { lng: number; lat: number }
+  height: number
+  zoom: number
+  label: string
+}
+
+/** 城市 flyTo 坐标（北部湾三港，按钮定位用，收归地图配置单一权威源） */
+interface CityFlyToTarget {
+  lng: number
+  lat: number
+  height: number
+  zoom: number
+}
+
+/** 视图层级集合 */
+interface MapViewLevels {
+  REGION: MapViewLevel
+}
+
+/** 地图全局配置 */
+interface MapConfig {
+  TIANDITU_KEY: string
+  BASE_LAYERS: MapBaseLayersConfig
+  TIANDITU_URL: string
+  DATA_PATHS: MapDataPaths
+  CAMERA: MapCameraConfig
+  VIEW_LEVELS: MapViewLevels
+  CITY_CENTERS: Record<string, CityFlyToTarget>
+}
+
+export const MAP_CONFIG: MapConfig = {
+  TIANDITU_KEY,
+  BASE_LAYERS: {
+    image: {
+      name: '影像底图',
+      layers: ['img_w', 'cia_w'],
+    },
+    vector: {
+      name: '矢量底图',
+      layers: ['vec_w', 'cva_w'],
+    },
+  },
+  TIANDITU_URL: 'https://t0.tianditu.gov.cn/DataServer?T={layerCode}&x={x}&y={y}&l={z}&tk={key}',
+  DATA_PATHS: {
+    // 港口为静态参考数据（与 boundary 同类，2026-08-29 自后端回迁前端——纯透传端点无后端价值）
+    // 数据路径统一收口于此叶子配置——services 深路径引用（mapDataService），
+    // 走 @/core 入口会形成 core↔services 循环依赖（no-circular），故保留在此并声明为唯一收口点
+    ports: '/data/ports.json',
+    boundary: '/data/route-analysis/boundary.geojson',
+  },
+  CAMERA: {
+    center: { lng: 108.5752963, lat: 21.760409, height: 10000 },
+    heading: 0,
+    pitch: -60,
+    roll: 0,
+  },
+  VIEW_LEVELS: {
+    REGION: {
+      center: { lng: 108.5752963, lat: 21.760409 },
+      height: 1600000,
+      zoom: 9,
+      label: '北部湾区域',
+    },
+  },
+  // 与 VIEW_LEVELS 语义不同：前者是三港按钮定位，后者是相机层级档位，勿合并
+  CITY_CENTERS: {
+    钦州: { lng: 108.590379, lat: 21.726917, height: 100000, zoom: 11 },
+    防城港: { lng: 108.340973, lat: 21.617689, height: 100000, zoom: 11 },
+    北海: { lng: 109.130658, lat: 21.418792, height: 100000, zoom: 11 },
+  },
+}
+
+/**
+ * 配置相机中心的二维快照（考古 K1-2：两渲染器 3 处同构收口）。
+ * 刻意只取 lng/lat 不含 height——CAMERA.center.height 走 zoom 换算通道
+ * （heightToZoom），不随水平中心进 CameraState。
+ */
+export function defaultCameraCenter(): { lng: number; lat: number } {
+  return { lng: MAP_CONFIG.CAMERA.center.lng, lat: MAP_CONFIG.CAMERA.center.lat }
+}
+
+export function buildTiandituUrl(layerCode: string): string {
+  return MAP_CONFIG.TIANDITU_URL.replace('{layerCode}', layerCode).replace(
+    '{key}',
+    MAP_CONFIG.TIANDITU_KEY
+  )
+}
+
+/**
+ * 相机 zoom ↔ height 互逆转换（经验公式 height = 300000000 / 2^zoom，
+ * 历史三档校准：zoom 9/12/14 ≈ 586km/73km/18km）
+ */
+
+/** zoom → height（OL → Cesium） */
+export function zoomToHeight(zoom: number): number {
+  return 300000000 / Math.pow(2, zoom)
+}
+
+/** height → zoom（Cesium → OL） */
+export function heightToZoom(height: number): number {
+  const safeHeight = Math.max(200, height)
+  return Math.log2(300000000 / safeHeight)
+}

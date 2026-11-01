@@ -1,0 +1,272 @@
+/**
+ * 回归测试：图表 props 更新必须反映到 getOption 输出
+ * 策略：mock useECharts，捕获 useChartBase 传入的 getOption，
+ * 验证其在 props 变化前后返回不同的（新的）数据。
+ * 这样测试聚焦"快照 bug"本身，不依赖 jsdom 中 echarts 的真实渲染。
+ */
+import { mount } from '@vue/test-utils'
+import { describe, expect, it, vi } from 'vitest'
+
+/**
+ * 图表 option 结构化类型：useECharts 的 getOption 返回 Record<string, unknown>，
+ * 但测试需访问具体属性（xAxis/series/title 等），故定义此接口供测试断言使用。
+ * 仅声明测试实际访问的字段，保持与 ECharts option 结构一致。
+ */
+interface ChartOptionLike {
+  backgroundColor: string
+  grid: { top: number; right: number; bottom: number; left: number }
+  title: {
+    text: string
+    left: string
+    textStyle: { color: string; fontSize: number; fontWeight: number }
+  }
+  tooltip: {
+    trigger: string
+    confine?: boolean
+    valueFormatter?: (v: number) => string
+  }
+  legend: { bottom: number }
+  xAxis: { data: unknown[]; type: string }
+  yAxis: { type: string; name?: string }
+  series: Array<{ data: unknown[]; type: string; smooth?: boolean; name?: string }>
+}
+
+interface Captured {
+  getOption: (() => ChartOptionLike) | null
+  updateChartCalls: number
+}
+
+// vi.hoisted 保证变量在 vi.mock 工厂提升后可用
+const { captured } = vi.hoisted<{ captured: Captured }>(() => ({
+  captured: { getOption: null, updateChartCalls: 0 },
+}))
+
+vi.mock('@/visualization/composables/useECharts', () => ({
+  useECharts: (opts: { getOption: () => Record<string, unknown> }) => {
+    // useChartBase 传入的 getOption 实际返回 ChartOptionLike 结构，
+    // 此处断言为具体类型以便测试通过 captured.getOption() 访问属性
+    captured.getOption = opts.getOption as unknown as () => ChartOptionLike
+    return {
+      chartRef: { value: null },
+      updateChart: () => {
+        captured.updateChartCalls++
+      },
+      getInstance: () => null,
+    }
+  },
+}))
+
+import BarChart from '../../BarChart.vue'
+import LineChart from '../../LineChart.vue'
+
+describe('P0-01 回归：useChartBase 不得返回过期快照', () => {
+  it('LineChart：xData/series 更新后 getOption 返回新数据', async () => {
+    const wrapper = mount(LineChart, {
+      props: {
+        title: '趋势',
+        xData: ['2024'],
+        series: [{ name: '钦州港', data: [100] }],
+      },
+    })
+
+    const before = captured.getOption!()
+    expect(before.xAxis.data).toEqual(['2024'])
+    expect(before.series[0].data).toEqual([100])
+
+    await wrapper.setProps({
+      xData: ['2024', '2025'],
+      series: [{ name: '钦州港', data: [100, 230] }],
+    })
+
+    const after = captured.getOption!()
+    expect(after.xAxis.data).toEqual(['2024', '2025'])
+    expect(after.series[0].data).toEqual([100, 230])
+
+    wrapper.unmount()
+  })
+
+  it('BarChart：title 更新后 getOption 返回新标题', async () => {
+    const wrapper = mount(BarChart, {
+      props: { title: '旧标题', xData: ['A'], series: [{ name: 's', data: [1] }] },
+    })
+    expect(captured.getOption!().title.text).toBe('旧标题')
+
+    await wrapper.setProps({ title: '新标题' })
+    expect(captured.getOption!().title.text).toBe('新标题')
+
+    wrapper.unmount()
+  })
+
+  it('LineChart：yUnit 声明为 prop 并进 yAxis.name（F4 红样：修前未声明 ⇒ undefined）', () => {
+    const wrapper = mount(LineChart, {
+      props: {
+        title: '预测趋势',
+        xData: ['2024'],
+        series: [{ name: '钦州港', data: [100] }],
+        yUnit: '万吨',
+      },
+    })
+    expect(captured.getOption!().yAxis.name).toBe('万吨')
+    wrapper.unmount()
+  })
+
+  it('结构不变量：option 的静态结构与修复前保持一致', () => {
+    mount(LineChart, {
+      props: { title: 'T', xData: ['x'], series: [{ name: 'n', data: [1] }] },
+    })
+    const option = captured.getOption!()
+
+    // 以下键值与修复前逐字节一致（防止修复时手滑改结构）
+    expect(option.backgroundColor).toBe('transparent')
+    expect(option.grid).toEqual({ top: 40, right: 16, bottom: 40, left: 40 })
+    expect(option.title.left).toBe('center')
+    expect(option.title.textStyle).toEqual({ color: '#303133', fontSize: 16, fontWeight: 600 })
+    // confine 是 2026-10-02 的修复（4×4 面板内 tooltip 被 overflow:hidden 裁掉）：
+    // 该断言同时钉住"不得退回未约束形态"
+    expect(option.tooltip.trigger).toBe('axis')
+    expect(option.tooltip.confine).toBe(true)
+    // 数值显示收敛（用户 2026-10-02）：2 位小数 + 去尾零；极小量不抹零
+    const fmt = option.tooltip.valueFormatter!
+    expect(fmt(837.5550000000001)).toBe('837.56')
+    expect(fmt(514)).toBe('514')
+    expect(fmt(0)).toBe('0')
+    expect(fmt(5.872405896832376e-7)).toBe('5.872405896832376e-7')
+    expect(option.legend.bottom).toBe(0)
+    expect(option.xAxis.type).toBe('category')
+    expect(option.yAxis.type).toBe('value')
+    expect(option.series[0].type).toBe('line')
+    // LineChart 的 seriesConfig 透传检查
+    expect(option.series[0].smooth).toBe(true)
+  })
+
+  it('空 props 防御：缺省 xData/series 不报错', () => {
+    mount(LineChart, { props: { title: 'T', xData: [], series: [] } })
+    const option = captured.getOption!()
+    expect(option.xAxis.data).toEqual([])
+    expect(option.series).toEqual([])
+  })
+
+  it('缺省 props：两组件不得有演示数据默认值（F6 红样：修前 LineChart 3 系列 / BarChart 2 系列）', () => {
+    mount(LineChart, { props: {} })
+    expect(captured.getOption!().series).toEqual([])
+    expect(captured.getOption!().xAxis.data).toEqual([])
+    mount(BarChart, { props: {} })
+    expect(captured.getOption!().series).toEqual([])
+    expect(captured.getOption!().xAxis.data).toEqual([])
+  })
+})
+
+describe('轴样式单源化回归（2026-10-23 压缩 buildOption）', () => {
+  type Axis = {
+    type: string
+    name?: string
+    position?: string
+    splitLine?: { show?: boolean; lineStyle?: { color?: string } }
+    axisLabel?: { color?: string; fontSize?: number; interval?: number; rotate?: number }
+    nameTextStyle?: { fontSize?: number; color?: string }
+  }
+  const axesOf = (option: ChartOptionLike) => option.yAxis as unknown as Axis | Axis[]
+
+  it('单轴无单位：不写 name，且保留分割线颜色', () => {
+    mount(LineChart, { props: { title: 'T', xData: ['x'], series: [{ name: 'n', data: [1] }] } })
+    const axis = axesOf(captured.getOption!()) as Axis
+    expect(Array.isArray(axis)).toBe(false)
+    expect(axis.name).toBeUndefined()
+    expect(axis.splitLine?.lineStyle?.color).toBeTypeOf('string')
+    expect(axis.axisLabel).toMatchObject({ fontSize: 10 })
+  })
+
+  it('双轴：左轴分割线在、右轴 position=right 且关闭分割线，单位各挂各轴', () => {
+    mount(BarChart, {
+      props: {
+        title: 'T',
+        xData: ['x'],
+        series: [{ name: 'n', data: [1], yAxisIndex: 1 }],
+        yUnit: '万吨',
+        yUnitRight: 'TEU',
+      },
+    })
+    const axes = axesOf(captured.getOption!()) as Axis[]
+    expect(axes).toHaveLength(2)
+    expect(axes[0]).toMatchObject({ type: 'value', name: '万吨' })
+    expect(axes[0].splitLine?.lineStyle?.color).toBeTypeOf('string')
+    expect(axes[1]).toMatchObject({
+      type: 'value',
+      name: 'TEU',
+      position: 'right',
+      splitLine: { show: false },
+    })
+    // 两轴标签样式来自同一工厂：颜色/字号必须逐字相等
+    expect(axes[0].axisLabel).toEqual(axes[1].axisLabel)
+  })
+
+  it('密集刻度：>24 点才加 interval/rotate，24 点整不加', () => {
+    const many = Array.from({ length: 25 }, (_, i) => String(i))
+    const m1 = mount(LineChart, { props: { xData: many, series: [{ name: 'n', data: [1] }] } })
+    const xAxisOf = () => (captured.getOption!() as unknown as { xAxis: Axis }).xAxis
+    expect(xAxisOf().axisLabel).toMatchObject({ interval: 2, rotate: 30 })
+    m1.unmount()
+
+    const exact = many.slice(0, 24)
+    mount(LineChart, { props: { xData: exact, series: [{ name: 'n', data: [1] }] } })
+    const label = xAxisOf().axisLabel!
+    expect(label.interval).toBeUndefined()
+    expect(label.rotate).toBeUndefined()
+  })
+
+  it('图例与轴标签共用同一样式源', () => {
+    mount(LineChart, { props: { xData: ['x'], series: [{ name: 'n', data: [1] }] } })
+    const option = captured.getOption!()
+    const label = (axesOf(option) as Axis).axisLabel!
+    expect(option.legend).toMatchObject({ bottom: 0 })
+    expect((option as unknown as { legend: { textStyle: unknown } }).legend.textStyle).toEqual(
+      label
+    )
+  })
+})
+
+describe('U2：空态判定随 useChartBase 一并返回（两图不再各抄一份）', () => {
+  it('🔴 @guard-red-sample 无数据系列时两图都渲染空态浮层，有数据即撤（摘下沉判定即红）', async () => {
+    // 治的失效：判定原先在 LineChart / BarChart 各手抄一份，改一边漏一边 ⇒
+    // 一图空态常驻（有数据也盖着"暂无数据"），另一图永远不显示空态。
+    const line = mount(LineChart, { props: { series: [] } })
+    expect(line.find('.line-chart-empty').exists()).toBe(true)
+    await line.setProps({ series: [{ name: '钦州港', data: [1, 2] }] })
+    expect(line.find('.line-chart-empty').exists()).toBe(false)
+    line.unmount()
+
+    const bar = mount(BarChart, { props: { series: [] } })
+    expect(bar.find('.bar-chart-empty').exists()).toBe(true)
+    await bar.setProps({ series: [{ name: '钦州港', data: [1, 2] }] })
+    expect(bar.find('.bar-chart-empty').exists()).toBe(false)
+    bar.unmount()
+  })
+
+  it('判定口径：系列空数组 / 系列内 data 全空算无数据，任一系列有数据即有数据', () => {
+    const cases: Array<[Array<{ name: string; data: Array<number | null> }>, boolean]> = [
+      [[], false],
+      [[{ name: 'a', data: [] }], false],
+      [
+        [
+          { name: 'a', data: [] },
+          { name: 'b', data: [] },
+        ],
+        false,
+      ],
+      [[{ name: 'a', data: [0] }], true],
+      [[{ name: 'a', data: [null] }], true],
+      [
+        [
+          { name: 'a', data: [] },
+          { name: 'b', data: [null, 1] },
+        ],
+        true,
+      ],
+    ]
+    for (const [series, expected] of cases) {
+      const wrapper = mount(LineChart, { props: { series } })
+      expect(wrapper.find('.line-chart-empty').exists(), JSON.stringify(series)).toBe(!expected)
+      wrapper.unmount()
+    }
+  })
+})

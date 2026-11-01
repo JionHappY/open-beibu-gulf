@@ -1,0 +1,62 @@
+/**
+ * useSliderFocus - 滑块专注模式（安卓控制中心风格）
+ * 多面板同时显示时拖动滑块会被其他面板干扰视觉：按下进入专注模式，
+ * 其余面板透明、只保留滑块所在面板，松手恢复（底部 nav 不受影响）。
+ * 模块级单例：AppLayout 监听 active 切换 class，滑块组件调用 begin/end。
+ */
+import { onScopeDispose, type Ref, ref } from 'vue'
+
+import { layoutTierFor } from '@/shared'
+
+/** 专注模式是否激活 */
+const active = ref(false)
+/** 当前滑块所在面板元素（closest('.GCS-panel')） */
+const activePanel = ref<HTMLElement | null>(null)
+
+/** 返回契约（显式化，防重构时签名静默漂移） */
+interface UseSliderFocusReturn {
+  active: Ref<boolean>
+  activePanel: Ref<HTMLElement | null>
+  beginSliderFocus: (el: HTMLElement | null) => void
+  /** 三页滑块统一入口：事件目标是原生 range 才进入专注模式（卡片文字/标签按下不触发） */
+  beginSliderFocusOnRange: (e: PointerEvent) => void
+  endSliderFocus: () => void
+}
+
+export function useSliderFocus(): UseSliderFocusReturn {
+  /**
+   * 滑块按下：记录所在面板并进入专注模式。
+   * 桌面档位（≥960px，3 面板宽）无遮挡，不生效。
+   * 在 document 上注册 pointerup/pointercancel 兜底：组件事件可能因卸载或内部
+   * 吞掉而丢失，否则专注模式会卡死（所有面板透明）。
+   */
+  function beginSliderFocus(el: HTMLElement | null): void {
+    if (typeof window !== 'undefined' && layoutTierFor(window.innerWidth) === 'desktop') return
+    document.removeEventListener('pointerup', endSliderFocus)
+    document.removeEventListener('pointercancel', endSliderFocus)
+    activePanel.value = el?.closest('.GCS-panel') ?? null
+    active.value = true
+    document.addEventListener('pointerup', endSliderFocus)
+    document.addEventListener('pointercancel', endSliderFocus)
+  }
+  /**
+   * 三页滑块的统一按下守卫（浸没/预测/选址同构 27tok 曾散三份，dup 棘轮咬住后收此）：
+   * SliderSelectCard 的根还含 label/状态文案，直接挂根会让点卡片文字也触发专注，
+   * 故按 target 是否为原生 range 过滤。
+   */
+  function beginSliderFocusOnRange(e: PointerEvent): void {
+    const target = e.target as HTMLElement | null
+    if (target?.matches?.('input[type="range"]')) beginSliderFocus(target)
+  }
+  /** 滑块松手/取消：退出专注模式（幂等） */
+  function endSliderFocus(): void {
+    document.removeEventListener('pointerup', endSliderFocus)
+    document.removeEventListener('pointercancel', endSliderFocus)
+    active.value = false
+    activePanel.value = null
+  }
+  // 作用域卸载兜底——调用方组件卸载时 document 监听随 endSliderFocus 解绑，
+  // 防止监听残留（专注模式卡死）
+  onScopeDispose(endSliderFocus)
+  return { active, activePanel, beginSliderFocus, beginSliderFocusOnRange, endSliderFocus }
+}

@@ -1,0 +1,114 @@
+import { Controller, Get, Param, Query } from '@nestjs/common'
+import { ApiTags } from '@nestjs/swagger'
+import { SkipThrottle } from '@nestjs/throttler'
+
+import { parseConfidence } from '../../../common/constants/forecast.constants'
+import { SKIP_AUTH_NAMED_THROTTLERS } from '../../../common/constants/throttling.constants'
+import { DtoPipe } from '../../../common/pipes/dto.pipe'
+import { ForecastMapQuery, ForecastTimeseriesQuery } from '../dto/forecast.dto'
+import {
+  type ForecastIndexResponse,
+  type ForecastIndicatorResponse,
+  type ForecastMapResponse,
+  ForecastService,
+  type ForecastTimeSeriesResponse,
+} from '../services/forecast.service'
+import { parseScenarioId } from '../services/scenario.service'
+
+@Controller('forecast')
+/**
+ * 限流：命名桶（login/register，各 50/15min）对本域是**误伤** —— 时间轴播放一轮约 400 请求，
+ * 50 的配额两下见底。故与本仓其它业务域同口径：**只豁免命名桶、保留 global 桶**。
+ *
+ * global 是 1000/15min ⇒ 约 **2.5 轮播放**触顶，届时前端按既有 429 静默降级处理
+ * （见 `useForecastLayer` 的播放分支注释）。这个边界是刻意留的：本域是**公开端点**，
+ * 全豁免等于零防护，而限额又必须容得下正常交互。
+ *
+ * 原为裸 `@SkipThrottle()`（= 三桶全豁免）——那与 csp-report/health 的"有意全豁免"不同：
+ * 那两个是被浏览器/探针高频调用的接收端，本域是用户可主动连点的计算端点。
+ */
+@SkipThrottle(SKIP_AUTH_NAMED_THROTTLERS)
+@ApiTags('forecast')
+export class ForecastController {
+  constructor(private readonly forecastService: ForecastService) {}
+
+  // / 与 /overview 同义：前端实际调 /overview 获取指标索引
+  @Get()
+  overviewRoot(): Promise<ForecastIndexResponse> {
+    return this.forecastService.readIndex()
+  }
+
+  @Get('overview')
+  overview(): Promise<ForecastIndexResponse> {
+    return this.forecastService.readIndex()
+  }
+
+  @Get('map')
+  getMap(
+    @Query(new DtoPipe(ForecastMapQuery.parse)) query: ForecastMapQuery
+  ): Promise<ForecastMapResponse> {
+    return this.forecastService.getMapData(
+      query.indicator,
+      query.time,
+      parseConfidence(query.confidence),
+      parseScenarioId(query.scenario)
+    )
+  }
+
+  @Get('timeseries')
+  getTimeseries(
+    @Query(new DtoPipe(ForecastTimeseriesQuery.parse)) query: ForecastTimeseriesQuery
+  ): Promise<ForecastTimeSeriesResponse> {
+    return this.forecastService.getTimeSeriesData(
+      query.indicator,
+      query.portId,
+      query.start,
+      query.end,
+      query.granularity,
+      parseConfidence(query.confidence),
+      parseScenarioId(query.scenario)
+    )
+  }
+
+  @Get('indicator/:type')
+  getIndicator(
+    @Param('type') type: string,
+    @Query('time') time?: string,
+    @Query('portId') portId?: string,
+    @Query('confidence') confidence?: string,
+    @Query('scenario') scenario?: string
+  ): Promise<ForecastIndicatorResponse> {
+    return this.forecastService.getIndicatorData(
+      type,
+      time,
+      portId,
+      parseConfidence(confidence),
+      parseScenarioId(scenario)
+    )
+  }
+
+  // 孤儿路由（前端零消费）保留作兼容端点；须置于显式路由之后，避免吞掉具体路径。
+  //
+  // 失效条件（D11 补）：本路由的存续前提与 nginx.conf 的 `/api` 兼容 location 同族——
+  // 都是"面向历史构建产物 / 外部调用方"的兼容面。故：
+  //   ① 若 D1 选案 a（双前缀收口单前缀）⇒ 该前提被判定不成立，本路由应同批删除；
+  //   ② 若 D1 选案 b（保留兼容面）⇒ 保留，但删除判据须可观测：生产访问日志中
+  //      `GET /forecast/:portId` 连续 30 天零命中，即可删。
+  // 未给此判据前不得以"没人用"为理由删除——"没人用"与"无人观测到"不是同一件事。
+  @Get(':portId')
+  getPortForecast(
+    @Param('portId') portId: string,
+    @Query('indicator') indicator?: string,
+    @Query('start') start?: string,
+    @Query('end') end?: string,
+    @Query('scenario') scenario?: string
+  ) {
+    return this.forecastService.getPortData(
+      portId,
+      indicator,
+      start,
+      end,
+      parseScenarioId(scenario)
+    )
+  }
+}

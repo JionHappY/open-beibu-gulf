@@ -1,0 +1,299 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.DS_Store
+dist
+dist*/
+**/dist*/
+dist-baseline
+dist-baseline*
+dist-ssr
+dist-verify*
+dist_new
+dist_tmp
+dist-tmp
+dist_verify_run1
+dist_verify
+# 通用构建产物变体（如 frontend/dist-audit-20260829）
+dist-*/
+dist_*/
+**/dist-*/
+**/dist_*/
+temp_cruise*.json
+coverage
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.trae/
+_traetmp/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+*.tsbuildinfo
+
+.eslintcache
+
+# Cypress
+/cypress/videos/
+/cypress/screenshots/
+
+# Vitest
+__screenshots__/
+
+# Vite
+*.timestamp-*-*.mjs
+# 运行时用户库与计划库（含敏感数据，不提交）
+backend/data/users.json
+backend/data/plans.json
+.env
+.env.production
+.env.local
+
+# WorkBuddy
+.workbuddy/
+
+# Reasonix 本地工具状态
+.reasonix/
+
+# 本地开发工具与残渣（不提交到远程）
+# 816-专项5主10：.husky/ 入版本库（官方推荐，fresh clone 保留本地门禁）；仅 .husky/_/husky.sh 由 prepare 重建
+.gdal_work/
+
+# 审查/调试临时文件残渣（.tmp-p1.txt/.tmp-p2.txt 已删除，同类禁止入根）
+.tmp-*
+
+# ── 本机专属区：不入库内容的唯一落点（详见 .local/README.md）──
+# agent 文档 → .local/agent-docs/；临时文件 → .local/tmp/；待删暂存 → .local/trash/
+# 根目录再出现临时文件由 tools/v3-guard/tmp-hygiene.mjs 断言失败
+.local/
+
+# Tokens and secrets
+*.token
+*token*.txt
+test_token*
+
+# TLS 证书（私钥敏感，不提交）
+certs/
+
+# DEM 预处理流水线中间产物（保留本地，不提交；可由 tools/dem-pipeline/*.ps1 重新生成）
+# 拼接中间产物
+backend/data/flood/dem/*.vrt
+backend/data/flood/dem/_inputs.txt
+# SAGA grid 中间产物（.sgrd/.sdat/.mgrd/.prj 及辅助文件）
+backend/data/flood/dem/*.sgrd
+backend/data/flood/dem/*.sdat
+backend/data/flood/dem/*.sdat.aux.xml
+backend/data/flood/dem/*.mgrd
+backend/data/flood/dem/dem_mosaic.prj
+backend/data/flood/dem/filled_utm48n.prj
+# DEM 栅格产物（大文件 46~308MB，可由 tools/dem-pipeline 重新生成，不提交）
+backend/data/flood/dem/*.tif
+backend/static/dem/*.tif
+
+# Python flood-service（代码入 git；仅排除 venv/缓存）
+backend/flood-service/.venv/
+__pycache__/
+*.pyc
+# 816-专项6 29：pytest 缓存目录（根目录与 flood-service 各一处）
+.pytest_cache/
+
+# 816-专项6 23：类型契约生成产物（types:gen 脚本产物，不提交源码区）
+frontend/src/types/generated/
+
+# 本地审查/审计文档（不入库，仅本机留存）——根锚定：勿再误伤 docs/根基文档/审查体系专项/
+/审查体系专项/
+深度代码审计-2026-08-02/
+代码审计/
+项目代码深度审查指标体系.md
+
+# 🔴 2026-09-19 修正：原为 tools/poi/.amap_key（只覆盖一个目录），
+# 而实际读取点在 tools/gis-import/fetch-port-poi.mjs —— 忽略规则与真实落点不匹配。
+# 改为通配覆盖 tools 下任意层级。
+tools/**/.amap_key
+# 🔴 文档口径（用户 2026-10-03 明确）：**文档默认不入库**，只在本机使用——
+# 不是"忘了放行"，而是既定政策。需要跨克隆/对外可见的才逐份 `!` 放行（下同）。
+# 整树仍不入库；v4 两档例外（2026-10-17 用户裁决 N7：v4 在飞、被 §三 称为唯一权威源，
+# 却在版本控制外 ⇒ 逐份放行，见下方 `!docs/v4-*`）。
+# 问题台账/审计/复盘文档（学习意义大于项目发展意义，不公开；根基文档除外）
+docs/*
+!docs/根基文档/
+# 信息源三层体系（2026-10-05 重建）：宪法/契约逐份放行入库，日志默认不入库（逐份放行）。
+# 目录先放行、内容默认忽略、再逐份白名单——与下方「开工前必读」同款政策。
+!docs/宪法/
+docs/宪法/*
+!docs/宪法/C1-项目宪法.md
+!docs/宪法/C2-质量不变量与根因守则.md
+!docs/宪法/C3-信息源宪法.md
+!docs/契约/
+docs/契约/*
+!docs/契约/K1-技术规则集.md
+!docs/契约/K2-架构与流程契约.md
+!docs/契约/K3-接口与数据契约.md
+!docs/契约/K4-开发与门禁契约.md
+!docs/文档地图.md
+# v4 活线两档（2026-10-17 用户裁决 N7）：v4 迭代在飞、两份互为「唯一设计文档 / 唯一状态档」，
+# 不在版本控制内等于对新克隆不存在（AGENTS §一-4）⇒ 逐份放行。
+!docs/v4-总纲设计-2026-09-18.md
+!docs/v4-施工手册.md
+# 日志层（2026-10-05 Batch D）：默认不入库；下列为已入库、需对新克隆可见的记录件。
+!docs/日志/
+docs/日志/*
+!docs/日志/状态/
+docs/日志/状态/*
+!docs/日志/状态/接力状态.md
+# 接手状态档（2026-10-28 用户工单 W3）：状态正本，不在版本控制内等于对新克隆不存在。
+!docs/日志/状态/STATE.md
+# 接力状态历史正文分片（同笔零改写搬入；归档件必须对新克隆可见，否则"逐字节等价"无法复算）。
+!docs/日志/状态/archive/
+!docs/日志/状态/archive/*
+!docs/日志/状态/外部依赖登记.md
+# 必要性审判总账（2026-10-19 · goal-efae0e79 DoD ⑥）：跨窗/跨克隆可见的处置账，
+# 与接力状态/外部依赖登记同性质 ⇒ 放行入库。
+!docs/日志/状态/必要性审判总账.md
+!docs/日志/状态/数据链排障入口.md
+# 换窗交接正本（2026-10-12 用户裁决 A）：跨窗/跨机器可见件，与接力状态同性质 ⇒ 放行入库。
+!docs/日志/状态/接力文档-*.md
+!docs/日志/快照/
+docs/日志/快照/*
+!docs/日志/快照/代码知识库.md
+!docs/日志/快照/项目收敛路线图.md
+!docs/日志/快照/平陆运河3DTiles-README-2026-09-27.md
+!docs/日志/快照/平陆运河枢纽重烘需求-2026-09-26.md
+!docs/日志/快照/论文主线-开工对照与工单-2026-09-26.md
+!docs/日志/快照/预测分析-样本参数与提准方案-2026-10-04.md
+!docs/日志/快照/预测分析-运河情景定稿-2026-10-05.md
+!docs/日志/快照/高程与水深基准统一说明-2026-10-04.md
+!docs/日志/快照/工作红线来历-源自旧03-2026-10-05.md
+!docs/日志/快照/文档体系AB对照实验-2026-10-05.md
+!docs/日志/快照/收口报告-1005批-2026-10-06.md
+!docs/日志/决策/
+docs/日志/决策/*
+!docs/日志/决策/2026-10-05-历史ADR-源自旧03.md
+!docs/日志/决策/2026-10-05-三目标阶段裁定与协议补丁.md
+!docs/日志/决策/2026-10-05-台账36条分流复算与裁定单.md
+!docs/日志/退役/
+docs/日志/退役/*
+!docs/日志/退役/README.md
+# 退役件逐份放行（2026-10-18 · N8：04 为首件）
+!docs/日志/退役/04-防复发清单.md
+# 归档区（2026-10-02 文档整合）：一次性留痕/复盘/旧施工手册/问题副本，一律不进活文档面。
+# 归档区默认不入库（与 docs/* 同政策）；下列放行项＝整合时已在库、需对新克隆可见的件。
+!docs/archive/
+docs/archive/*
+!docs/archive/v3-施工手册.md
+!docs/archive/v3-发展路径-2026-08-14.md
+!docs/archive/老选址隔离与移除工单-2026-09-30.md
+!docs/archive/部署历程记录-2026-08-09.md
+!docs/archive/故障复盘-生产3D真地形无起伏-2026-08-10.md
+!docs/archive/环境故障排查全记录-2026-09-05.md
+!docs/archive/回滚演练记录-2026-08-12.md
+!docs/archive/Git仓库事故复盘-2026-08-02.md
+!docs/archive/v3全量体检-2026-09-05.md
+!docs/archive/项目水平评价与简历工程-2026-09-05.md
+!docs/archive/交接文档-2026-09-05.md
+!docs/archive/交接文档-2026-10-01.md
+!docs/archive/接力文档-2026-10-02.md
+# 挂起守卫归档（2026-10-06：三条单发迁移期守卫停用，复活条件见该档 README）
+!docs/archive/guards-hung-20261006/
+!docs/archive/guards-hung-20261006/**
+# docs/图片/ 已于 2026-10-02 移出仓库 → 桌面《_北部湾项目\04-项目文档\架构图.svg》
+docs/v3-施工日志/
+# 审查/修复报告（2026-09-12 裁决入库，已登记文档地图；docs/* 默认忽略，逐份放行）
+!docs/CI-CD与单测审查报告.md
+!docs/修复任务清单-下一轮.md
+# 开工前必读：只放行活文档（API 契约）；滚动状态档已 2026-10-05 移入 docs/日志/状态/（接力文档改名接力状态）
+!docs/开工前必读/
+docs/开工前必读/*
+!docs/开工前必读/API契约文档.md
+# 论文主线/预测提准/重烘需求/高程基准四档已 2026-10-05 零改写移入 docs/日志/快照/（逐份放行见上方日志层）
+# 陆地 DEM 换源需求书（2026-09-27：EGM96 基准/精度分级/GLO-30 红线，已登记文档地图；逐份放行）
+!docs/陆海DEM高程数据需求-2026-09-27.md
+!docs/近岸测深数据需求-2026-10-04.md
+# 钦州港容量评估开工档（2026-09-27：公开口径全部标注待校准，已登记文档地图；逐份放行）
+!docs/钦州港基础设施容量评估-2026-09-27.md
+# 老选址隔离与移除工单 → 2026-10-02 归档至 docs/archive/（已闭，见该档 §二）
+
+# v3 ����������ʱĿ¼���� OSM Ӳ��������������棩
+
+# �ߵ� key(����ʵ��Կ,��ֹ���)
+
+# Agent 开发辅助脚本：一次性工具不再散落 tools/，统一落 .local/tmp/（见 .local/README.md）
+
+# POI 抓取缓存（fetch-amap-poi-city.py 的中间产物，可再生；抓取进行中会持续增长，勿误提交）
+tools/.poi_cache/
+
+# 待删暂存区已迁入 .local/trash/（见 .local/README.md）
+algorithm-service.log*
+
+# 地形瓦片：DEM 派生缓存（tools/dem-pipeline/07 一键重切），不入库（云端冷备=v3-migration@92aa9475）
+backend/static/terrain/
+
+# 3D Tiles 运行时资产（外部交付「传输包-20260928」提取，2026-09-28）。
+# 不入库理由：qinzhou-port 单包 144 MB / 96 瓦片，且以 GLB 二进制为主，
+# Git 无法审阅其内容差异——入库后任何一次"替换瓦片"都无法判断是修复还是回归。
+# 与 backend/static/pinglu/tiles/（7.6 MB，可入库）的区别只在体积量级。
+# 复现与来源见 backend/static/qinzhou-port/README.md、backend/static/bim-hub/README.md。
+backend/static/qinzhou-port/
+backend/static/bim-hub/
+# tiles-v2 同量级（44 MB）且同性质，一并排除
+backend/static/pinglu/tiles-v2/
+
+# 本机备份目录（整树备份产物，500M+，绝不入库）
+.backups/
+# ZCode 会话运行时产物（计划文件等，agent 生成非项目源码）
+.zcode/
+# 本地测评专用 vite 配置（文件头自述"非提交资产，测完可删"：本地前端 + 线上 API 复测用）
+frontend/vite.local-online.config.js
+# 性能测评报告产物（2026-09-10 会话生成、本地报告：保留生成时样式，不随库维护；2026-09-12 决策入库 gitignore）
+性能测评-20260910/
+
+# CodeBuddy 会话运行时产物(同 .zcode,agent 生成非项目源码)
+.codebuddy/
+
+# 本机临时工作目录（tmp-pinglu/ 平陆运河建模中间件、tmp-resume/ 简历产物等）：
+# 会话产物、可再生，不入库（同 .local/ 定位）
+# ⚠️ 2026-09-17：上方「v3 临时目录（含 OSM 硬编码 key）」注释存在**编码损坏且忽略规则缺失**，
+#    导致 tmp-pinglu/ 长期未被忽略——其内含 OSM 拉取失败的 406 错误页（伪装成 .json），
+#    既干扰 format:check，也带来「脚本内硬编码 key 被误提交」的风险。
+tmp-*/
+
+# 平陆运河 3D Tiles 产物（2026-09-16 会话产出 141 MB / 465 文件）：
+# 已移出工作区 → 桌面/项目文档归档/07-平陆运河3DTiles/（含 viewer.html 与离线 Cesium）
+# 此处忽略：避免重新生成时再度污染 git status
+pinglu-canal-3dtiles/
+
+# git 事故现场存档（2026-09-18 对象库被清空，原 .git 改名保留备查）：
+# 内含 index / packed-refs / .idx 等证据文件，不参与版本管理，
+# 否则会污染 git status 与 pre-push 的 format:check（扫未跟踪文件）
+.git-BROKEN-*/
+
+# 预测域复算产物（L6）：报告与指纹由 `node tools/forecast/run-all.mjs` 生成，逐次可再生
+# （报告含生成时间戳 ⇒ 入库只会带来噪音），故不入库
+tools/forecast/out/
+
+# 城区五桥（tools/3dtiles-build/build-bridges.mjs 生成，本机可复现）
+backend/static/bridges-city/
+
+# 3D Tiles 资产改造任务表（2026-10-03 批，可勾选执行记录 + Web 端实测）
+!docs/3dtiles-改造任务表.md
+
+# 会话运行时产物：ZCode 忽略文件（同上方 .zcode/）+ agent 工作目录（非项目源码，不入库）
+.zcodeignore
+untitled-project/
+
+# dsh 会话运行时产物：ops 写盘锁与运行目录（非项目源码，出现在源码树里会污染全仓 walker）
+.dsh-ops/
+.dsh-ops-update-*.lock

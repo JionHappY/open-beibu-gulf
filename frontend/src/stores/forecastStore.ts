@@ -1,0 +1,230 @@
+import { defineStore } from 'pinia'
+import type { Ref, ShallowRef } from 'vue'
+import { reactive, ref, shallowRef } from 'vue'
+
+// 分层铁律：stores 不得引用 business——初始化所需共享常量一律从 shared 取
+import { BoundedMap, DEFAULT_CONFIDENCE } from '@/shared'
+import type { ConfidenceThresholds } from '@/types'
+import type { ForecastDataSource } from '@/types/schemas'
+
+import { createPersistedState } from './factories'
+import { createTransactionId } from './factories'
+
+/**
+ * 预测分析跨页面状态快照（「跳转个人中心登录 → 返回原路由」链路：saveState → consumeState）。
+ * Map 以 [key, value] 数组序列化（Map 不可直接入快照，且组件本地请求缓存卸载时会清空）；
+ * isPlaying 不保存——播放是临时交互态，由组件内 interval 驱动，重挂载无法恢复。
+ */
+export interface ForecastSavedState {
+  currentTime: string
+  timeGranularity: string
+  playSpeed: number
+  activeIndicator: string
+  canalScenario: string
+  confidenceThresholds: ConfidenceThresholds
+  activeForecastLayer: string | null
+  /** 页面本地请求缓存（恢复后图表零请求重建） */
+  requestCache: Array<[string, unknown]>
+}
+
+export const useForecastStore = defineStore('forecast', () => {
+  const currentTime: Ref<string> = ref('2026-06')
+
+  // timeRange 死状态已删除（currentTime 与 timeRange.current 双持「当前时间」，
+  // 全仓业务 0 消费；start/end 由 BASE_YEAR/END_YEAR 派生）
+
+  const timeGranularity: Ref<string> = ref('month')
+  const isPlaying: Ref<boolean> = ref(false)
+  const playSpeed: Ref<number> = ref(500)
+  const activeIndicator: Ref<string> = ref('cargo')
+  // 运河情景（F4）：默认基线；仅 cargo 指标消费（切走 cargo 时由页面 watch 复位基线）
+  const canalScenario: Ref<string> = ref('baseline')
+
+  const confidenceThresholds: Ref<ConfidenceThresholds> = ref({
+    cargo: DEFAULT_CONFIDENCE,
+    container: DEFAULT_CONFIDENCE,
+    activity: DEFAULT_CONFIDENCE,
+  })
+
+  const activeForecastLayer: Ref<string | null> = ref(null)
+  // F-7：原 dataCache/currentData 无业务写路径（死状态，currentData 恒 null），已移除；
+  // 数据缓存职责由 requestCache（LRU 上限 50）承担
+
+  /** requestCache 大小上限（BoundedMap 构造参数） */
+  const MAX_REQUEST_CACHE_ENTRIES = 50
+
+  // 页面请求缓存（跨页面快照序列化；Map 不可直接入快照，saveState 时转数组）。
+  // 原为 ForecastPage 页面级 Map，C4 收口后迁入 store 统一管理（含快照恢复）；
+  // 上限淘汰由 BoundedMap 按插入序处理（原手写 size 检查已收敛）
+  const requestCache: ShallowRef<Map<string, unknown>> = shallowRef(
+    new BoundedMap<string, unknown>(MAX_REQUEST_CACHE_ENTRIES)
+  )
+
+  /** 请求事务状态迁入 store（消除请求 composable 的模块级可变状态）；AbortController 不可序列化、不响应式，仍由请求实例持有并透传 signal */
+  const { activeTransactionId, bumpTransactionId } = createTransactionId()
+  const isRequesting: Ref<boolean> = ref(false)
+
+  // ── v4-S3 图表数据槽：请求归属上移面板后，请求 composable 的结果写这里，
+  // 页面模板只绑定 store（页面管"画出来"）。不入快照——恢复链路由 renderer watch
+  // 重新加载（requestCache 命中即零请求重建），快照只存源数据不存派生视图。
+  const chart = reactive({
+    lineXData: [] as string[],
+    lineSeries: [] as Array<{ name: string; data: number[] }>,
+    /** 折线图 y 轴单位（接口 unit 透传；F4 前被适配器丢弃，图无单位标注） */
+    lineUnit: '',
+    /**
+     * 折线图数据来源（P1-1 降级可观测，接口 metadata.dataSource 透传）：
+     * 'engine-fallback' 时页面显示降级角标；null = 模型路径/未标记（旧响应）。
+     */
+    lineDataSource: null as ForecastDataSource | null,
+    lineViewportXMin: '2023-01',
+    lineViewportXMax: '2029-12',
+    barXData: [] as string[],
+    barSeries: [] as Array<{
+      name: string
+      data: Array<number | null>
+      yAxisIndex?: number
+    }>,
+    /** 柱状图左右轴单位（接口 unit 透传；双轴各自标注，单位不再拼进系列名） */
+    barUnit: '',
+    barUnitRight: '',
+    /** 柱状图数据来源（P1-1）：两指标任一降级即为 'engine-fallback'；null = 未标记 */
+    barDataSource: null as ForecastDataSource | null,
+  })
+
+  /** 请求进行态写入口（isRequesting 不再被 composable 直改） */
+  function setIsRequesting(v: boolean): void {
+    isRequesting.value = v
+  }
+
+  function setCurrentTime(time: string): void {
+    currentTime.value = time
+  }
+
+  function setTimeGranularity(granularity: string): void {
+    timeGranularity.value = granularity
+  }
+
+  function setActiveIndicator(indicator: string): void {
+    activeIndicator.value = indicator
+  }
+
+  function setCanalScenario(scenario: string): void {
+    canalScenario.value = scenario
+  }
+
+  function setConfidenceThreshold(indicator: string, value: number): void {
+    confidenceThresholds.value[indicator] = value
+  }
+
+  function setIsPlaying(playing: boolean): void {
+    isPlaying.value = playing
+  }
+
+  /** 请求缓存写入（上限淘汰由 BoundedMap 处理；页面/composable 统一入口，替代页面级 Map） */
+  function setRequestCache(key: string, value: unknown): void {
+    requestCache.value.set(key, value)
+  }
+
+  /** 快照恢复（跨页面登录返回）：一次性批量写回（禁止调用方逐字段直改 state） */
+  function restoreState(saved: ForecastSavedState): void {
+    currentTime.value = saved.currentTime
+    timeGranularity.value = saved.timeGranularity
+    playSpeed.value = saved.playSpeed
+    activeIndicator.value = saved.activeIndicator
+    // 旧快照无 canalScenario 字段，兜底基线
+    canalScenario.value = saved.canalScenario ?? 'baseline'
+    confidenceThresholds.value = { ...saved.confidenceThresholds }
+    activeForecastLayer.value = saved.activeForecastLayer
+    // shallowRef 需重赋值引用才触发响应式
+    requestCache.value = new BoundedMap<string, unknown>(MAX_REQUEST_CACHE_ENTRIES)
+    // 快照条目不在上限之内（最多 50 条），按插入序批量写入
+    for (const [key, value] of saved.requestCache) {
+      requestCache.value.set(key, value)
+    }
+  }
+
+  /** 事务状态重置（配合请求取消与组件卸载使用；reset() 也调用） */
+  function resetTransactionState(): void {
+    activeTransactionId.value = 0
+    isRequesting.value = false
+  }
+
+  function reset(): void {
+    currentTime.value = '2026-06'
+    timeGranularity.value = 'month'
+    isPlaying.value = false
+    playSpeed.value = 500
+    activeIndicator.value = 'cargo'
+    canalScenario.value = 'baseline'
+    confidenceThresholds.value = {
+      cargo: DEFAULT_CONFIDENCE,
+      container: DEFAULT_CONFIDENCE,
+      activity: DEFAULT_CONFIDENCE,
+    }
+    activeForecastLayer.value = null
+    requestCache.value = new BoundedMap<string, unknown>(MAX_REQUEST_CACHE_ENTRIES)
+    chart.lineXData = []
+    chart.lineSeries = []
+    chart.lineUnit = ''
+    chart.lineDataSource = null
+    chart.lineViewportXMin = '2023-01'
+    chart.lineViewportXMax = '2029-12'
+    chart.barXData = []
+    chart.barSeries = []
+    chart.barUnit = ''
+    chart.barUnitRight = ''
+    chart.barDataSource = null
+    resetTransactionState()
+  }
+
+  // ─── 跨页面持久化（与选址/洪涝同模式） ────────────────────
+  // reset() 不清快照，保证「保存 → 卸载重置 → 返回恢复」链路成立
+  const persisted = createPersistedState<ForecastSavedState>()
+
+  /** 保存当前状态到快照（跳转登录时由页面 onBeforeRouteLeave 调用） */
+  function saveState(payload: ForecastSavedState): void {
+    persisted.saveState(payload)
+  }
+
+  /** 消费已保存的状态（一次性，返回后快照清空） */
+  function consumeState(): ForecastSavedState | null {
+    return persisted.consumeState()
+  }
+
+  /** 显式清空快照（登出时调用——reset() 刻意不清快照，登出必须清，见 App.vue resetStores） */
+  function clearState(): void {
+    persisted.clearPersistedState()
+  }
+
+  return {
+    currentTime,
+    timeGranularity,
+    isPlaying,
+    playSpeed,
+    activeIndicator,
+    canalScenario,
+    confidenceThresholds,
+    activeForecastLayer,
+    requestCache,
+    chart,
+    activeTransactionId,
+    isRequesting,
+    bumpTransactionId,
+    setIsRequesting,
+    setCurrentTime,
+    setTimeGranularity,
+    setActiveIndicator,
+    setCanalScenario,
+    setConfidenceThreshold,
+    setIsPlaying,
+    setRequestCache,
+    restoreState,
+    resetTransactionState,
+    reset,
+    // 跨页面持久化
+    saveState,
+    consumeState,
+    clearState,
+  }
+})

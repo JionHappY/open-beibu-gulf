@@ -1,0 +1,59 @@
+/**
+ * 后端端点单一事实源：业务层/适配层严禁裸 URL 字面量，一律引用本表。
+ * 前缀由 `useApiRequest` 统一拼接为单前缀 `NEST_API_BASE`（默认 `/nest-api`），已无逐功能域分支。
+ * 原 flood.online/impact 的 FastAPI（flood-service）全路径已随 algorithm-service 退役删除。
+ * 端点演进（新增/改名）只改此处，避免散落调用点漏改。
+ */
+export const ENDPOINTS = {
+  siteSuitability: {
+    map: '/site-suitability/map',
+    // 默认值单源（权重定稿+阈值+缺省；store.loadDefaults 唯一消费方）
+    defaults: '/site-suitability/defaults',
+  },
+  diversion: {
+    breakdown: '/diversion/breakdown',
+    canalLine: '/diversion/canal-line',
+  },
+  auth: {
+    me: '/auth/me',
+    login: '/auth/login',
+    register: '/auth/register',
+    logout: '/auth/logout',
+  },
+  favorites: {
+    root: '/favorites',
+    item: (itemType: string, itemId: string) => `/favorites/${itemType}/${itemId}`,
+  },
+  plans: {
+    root: '/plans',
+    byId: (id: string) => `/plans/${id}`,
+  },
+  forecast: {
+    overview: '/forecast/overview',
+    timeseries: '/forecast/timeseries',
+    map: '/forecast/map',
+    indicator: (indicator: string) => `/forecast/indicator/${indicator}`,
+  },
+  flood: {
+    // 2026-09-10（阶段 4）：online/impact 两条 FastAPI 全路径已随 algorithm-service
+    // 退役删除——淹没档位走 /flood/flood-areas（PostGIS 251 档），影响评估走
+    // /flood/analysis/disaster（点面判定在 PostGIS）
+    waterArea: '/flood/water-area',
+    floodAreas: '/flood/flood-areas',
+    statistics: '/flood/flood-statistics',
+    terrainProfiles: '/flood/terrain-profiles',
+    disaster: '/flood/analysis/disaster',
+  },
+  // route 域（2026-09-10 起 Nest + pgRouting；原 /flood-online 代理通道已随退役删除）
+  route: {
+    // 名称关键词搜索（航线分析选点）：2026-09-30 自旧版选址域迁入本域
+    // （多源点集合并口径不变，limit 1..200）
+    pois: '/route/pois',
+  },
+  // task 域（v4 系统 B）：提交/查询/取消三端点。2026-10-06 Swagger 契约核对抓到
+  // useTaskApi 曾在此表外裸写 '/task' 字面量（端点第二源）⇒ 收口回本表。
+  task: {
+    root: '/task',
+    byId: (id: string) => `/task/${encodeURIComponent(id)}`,
+  },
+} as const

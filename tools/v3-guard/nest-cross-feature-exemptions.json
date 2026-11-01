@@ -1,0 +1,50 @@
+[
+  {
+    "id": "auth-guard-cross-cutting",
+    "reason": "认证守卫是横切件（JWT 校验 + 属主注入），favorites/plans 的 controller 必须消费同一实现；下沉 backend/src/common 属结构调整（AGENTS §四-10 类取舍），本批按裁定保留原位并登记豁免。",
+    "from": "backend/src/modules/favorites/controllers/favorites.controller.ts",
+    "to": "backend/src/modules/auth/guards/auth.guard.ts"
+  },
+  {
+    "id": "auth-guard-cross-cutting",
+    "reason": "认证守卫是横切件（JWT 校验 + 属主注入），favorites/plans 的 controller 必须消费同一实现；下沉 backend/src/common 属结构调整（AGENTS §四-10 类取舍），本批按裁定保留原位并登记豁免。",
+    "from": "backend/src/modules/plans/controllers/plans.controller.ts",
+    "to": "backend/src/modules/auth/guards/auth.guard.ts"
+  },
+  {
+    "id": "task-orchestrator-delegation",
+    "reason": "task 域是编排层（见 backend/src/modules/task/types/task.ts 头注）：真实计算一律委托给各业务域，本文件是唯一委托点；收口到 module exports 属结构调整，本批按裁定登记豁免。",
+    "from": "backend/src/modules/task/services/task-handlers.ts",
+    "to": "backend/src/modules/flood/services/flood.service.ts"
+  },
+  {
+    "id": "task-orchestrator-delegation",
+    "reason": "task 域是编排层（见 backend/src/modules/task/types/task.ts 头注）：真实计算一律委托给各业务域，本文件是唯一委托点；收口到 module exports 属结构调整，本批按裁定登记豁免。",
+    "from": "backend/src/modules/task/services/task-handlers.ts",
+    "to": "backend/src/modules/route/services/route.service.ts"
+  },
+  {
+    "id": "task-orchestrator-delegation",
+    "reason": "task 域是编排层（见 backend/src/modules/task/types/task.ts 头注）：真实计算一律委托给各业务域，本文件是唯一委托点；收口到 module exports 属结构调整，本批按裁定登记豁免。",
+    "from": "backend/src/modules/task/services/task-handlers.ts",
+    "to": "backend/src/modules/route/utils/route-params.ts"
+  },
+  {
+    "id": "task-orchestrator-delegation",
+    "reason": "task 域是编排层（见 backend/src/modules/task/types/task.ts 头注）：真实计算一律委托给各业务域，本文件是唯一委托点；收口到 module exports 属结构调整，本批按裁定登记豁免。",
+    "from": "backend/src/modules/task/services/task-handlers.ts",
+    "to": "backend/src/modules/site-suitability/dto/site-suitability.dto.ts"
+  },
+  {
+    "id": "task-orchestrator-delegation",
+    "reason": "task 域是编排层（见 backend/src/modules/task/types/task.ts 头注）：真实计算一律委托给各业务域，本文件是唯一委托点；收口到 module exports 属结构调整，本批按裁定登记豁免。",
+    "from": "backend/src/modules/task/services/task-handlers.ts",
+    "to": "backend/src/modules/site-suitability/services/site-suitability.service.ts"
+  },
+  {
+    "id": "diversion-forecast-scenario-constants",
+    "reason": "分流模型的运河分流量与 forecast 情景常量同源（diversion.module.ts 注释自陈），拆成两份会在参数调整时静默漂移；常量下沉 common 属结构调整，本批登记豁免。",
+    "from": "backend/src/modules/diversion/services/diversion.service.ts",
+    "to": "backend/src/modules/forecast/constants/scenario.constants.ts"
+  }
+]

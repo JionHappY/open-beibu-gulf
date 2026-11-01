@@ -1,0 +1,96 @@
+/**
+ * forecastAdapter — 预测数据适配器：统一 Nest 后端 /forecast/*（全局前缀由 NEST_API_BASE 单前缀拼接）的
+ * 请求与 zod 校验，隔离业务层与 HTTP 细节；返回业务形状，图表直接消费、零原始字段透传。
+ */
+import { ENDPOINTS, scenarioParam, useApiRequest } from '@/shared'
+import type {
+  ForecastDataSource,
+  ForecastIndicatorIndexParsed,
+  IndicatorComparisonResponseParsed,
+  TimeSeriesResponseParsed,
+} from '@/types/schemas'
+import {
+  forecastIndicatorIndexSchema,
+  indicatorComparisonResponseSchema,
+  timeSeriesResponseSchema,
+} from '@/types/schemas'
+
+const { apiRequest } = useApiRequest()
+
+interface ForecastTimeSeriesParams {
+  indicator: string
+  granularity: string
+  confidence: number
+  /** 运河情景（仅 cargo 有意义；缺省不传参，后端默认 baseline） */
+  scenario?: string
+}
+
+/** unit 随 series 一并带出（F4：图表 y 轴单位曾在此被丢弃，混图无单位标注） */
+type ForecastTimeSeriesResult = Pick<TimeSeriesResponseParsed, 'series' | 'unit'> & {
+  /** P1-1 降级标记：'engine-fallback' 时页面须显示角标；旧响应缺省 undefined */
+  dataSource?: ForecastDataSource
+}
+
+interface ForecastComparisonParams {
+  time: string
+  confidence: number
+  /** 运河情景（仅 cargo 有意义；缺省不传参，后端默认 baseline） */
+  scenario?: string
+}
+
+/** unit 随 ports 一并带出（F4：柱图多指标时由调用方拼进系列名标注） */
+type ForecastComparisonResult = Pick<IndicatorComparisonResponseParsed, 'ports' | 'unit'> & {
+  /** P1-1 降级标记（可选：旧响应缺省） */
+  dataSource?: ForecastDataSource
+}
+
+export const forecastAdapter = {
+  /** 首页概览静态快照（/forecast/overview）：图表数据，schema 校验在 HTTP 边界完成 */
+  async getOverview(signal?: AbortSignal): Promise<ForecastIndicatorIndexParsed> {
+    return apiRequest<ForecastIndicatorIndexParsed>(ENDPOINTS.forecast.overview, {
+      signal,
+      schema: forecastIndicatorIndexSchema,
+    })
+  },
+
+  /** 趋势时序（/forecast/timeseries）：schema 校验在 HTTP 边界完成，返回解析后业务形状 */
+  async getTimeSeries(
+    params: ForecastTimeSeriesParams,
+    signal?: AbortSignal
+  ): Promise<ForecastTimeSeriesResult> {
+    const data = await apiRequest<TimeSeriesResponseParsed>(ENDPOINTS.forecast.timeseries, {
+      method: 'GET',
+      params: {
+        indicator: params.indicator,
+        granularity: params.granularity,
+        confidence: params.confidence,
+        ...scenarioParam(params.scenario),
+      },
+      signal,
+      schema: timeSeriesResponseSchema,
+    })
+    return { series: data.series, unit: data.unit, dataSource: data.metadata?.dataSource }
+  },
+
+  /** 港口对比（/forecast/indicator/:indicator）：同上，schema 校验后透传 ports */
+  async getIndicatorComparison(
+    indicator: string,
+    params: ForecastComparisonParams,
+    signal?: AbortSignal
+  ): Promise<ForecastComparisonResult> {
+    const data = await apiRequest<IndicatorComparisonResponseParsed>(
+      ENDPOINTS.forecast.indicator(indicator),
+      {
+        method: 'GET',
+        params: {
+          time: params.time,
+          confidence: params.confidence,
+          ...scenarioParam(params.scenario),
+        },
+        signal,
+        schema: indicatorComparisonResponseSchema,
+      }
+    )
+    return { ports: data.ports, unit: data.unit, dataSource: data.metadata?.dataSource }
+  },
+}

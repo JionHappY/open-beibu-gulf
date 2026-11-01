@@ -1,0 +1,221 @@
+# 北部湾港 WebGIS 智慧分析平台 —— 本地/生产一键编排（v3 三服务版）
+# 用法：docker compose up --build
+#   前端：      http://localhost:80（nginx，同域反代）
+#   业务 API：  http://localhost:80/nest-api/...（经 nginx 反代 → nest:3000）
+#   PostGIS：   localhost:5432（beibu-gulf-data）
+services:
+  # 前端 + nginx（唯一对外暴露 80/443；API/DEM/瓦片均同域反代）
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 2026-08-09：前端构建需要天地图 key（vite build 打包进产物）。
+      # 值读自 compose 同目录 .env（服务器部署时在项目目录配置 VITE_TIANDITU_KEY=新key）
+      args:
+        VITE_TIANDITU_KEY: ${VITE_TIANDITU_KEY:-}
+        # VITE_USE_NEST_MODULES 已退役（D1a 收口，2026-10-12）：逐模块前缀切换改为单前缀
+    # 镜像由 CI 构建推送 GHCR（服务器 1.6G 内存扛不住 docker 内构建：vite/nest/pip
+    # 峰值 3-5G 会 OOM 卡死系统——部署只 pull 不 build）；build 段保留供本地 dev 用。
+    image: ghcr.io/andy38586/beibu-gulf-project:app-${IMAGE_TAG:-app-latest}
+    container_name: beibu-gulf-webgis
+    # 削峰（2026-09-10，15:30 修订；算法服务退役后为三容器）：为每容器设上限以防单容器失控。
+    # 实测 nginx+静态驻留仅 8.4MB，128m → 64m（仍有 7 倍余量）。
+    # ⚠️ 关键澄清：mem_limit 是「上限」不是「预留」——调低它**不会**释放物理内存，
+    # 也不会「让给」其他容器（空闲配额本来就不占内存）。真正让某服务可用的是
+    # 把属于它的上限给足（nest/postgis 见各自注释）。
+    # 该守的口径：**实际总占用** < 物理 1613m − 宿主机开销（daemon/sshd/系统 ~300m）
+    # ≈ 1300m。原注释按「上限之和 < 物理内存」配置，漏算宿主机开销，是 09-10 OOM 成因。
+    mem_limit: 64m
+    env_file:
+      - ./backend/.env
+    environment:
+      - NODE_ENV=production
+    volumes:
+      # 静态真数据：app 与 nest 共享同一宿主目录（nest 侧 ro；数据资产不烘焙进镜像）
+      - ./backend/data:/app/backend/data
+      # DEM 静态产物（tif 67MB 被 gitignore、CI 镜像不含；本地含 → CI/本地镜像不一致）。
+      - ./backend/static/dem:/app/backend/static/dem
+      - ./backend/static/terrain:/app/backend/static/terrain
+      # 平陆运河 3D Tiles + 离线影像块（9.8MB 随仓库分发，与 dem/terrain 同走宿主挂载、不烘焙进镜像）。
+      # 缺这一行的后果是静默的：nginx 的 /static/ alias 指向空目录 → 前端 fetch 404 被 catch 成
+      # 一条 logger.warn，控制面板连按钮都不渲染，线上看不出"接了 3D Tiles"这件事失败过。
+      - ./backend/static/pinglu:/app/backend/static/pinglu
+      # 钦州港交付包 + 自建层 / 城区桥（B5 裁定①，2026-10-05：gitignored 大资产走宿主挂载）。
+      # ⚠ 部署顺序：先把两个目录放上服务器（scp 到 /opt/beibu-gulf/backend/static/）再 up -d——
+      # Docker 对缺失的宿主路径会自动建成空目录，得到「挂载成功但 404」的假象（§8.21 落地链）。
+      # 部署前哨在 CI deploy 步骤（.github/workflows/ci.yml「阶段 1.6」）：compose pull/up 之前
+      # 逐项 test -s 五个 tileset.json，缺任一即 fail-loud 且不启动新容器（§8.21「外部挂载 + 部署前哨」）。
+      - ./backend/static/qinzhou-port:/app/backend/static/qinzhou-port
+      - ./backend/static/bridges-city:/app/backend/static/bridges-city
+      # TLS 证书（可选）：将 fullchain.pem + privkey.pem 放入 ./certs/ 即启用 HTTPS
+      - ./certs:/etc/nginx/certs:ro
+    ports:
+      - '80:80'
+      - '443:443'
+      - '8443:8443'
+    depends_on:
+      nest:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+  # v3 业务层（NestJS，Express 退役后主 API）——nginx 反代 /nest-api → nest:3000
+  nest:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.nest
+    image: ghcr.io/andy38586/beibu-gulf-project:nest-${IMAGE_TAG:-nest-latest}
+    container_name: beibu-nest
+    # 削峰（15:30 修订）：实测稳态仅 43MB（原注释「~250MB」高估约 6 倍）；320m → 192m。
+    # 属防御性收紧防单容器失控，**不释放物理内存**（mem_limit 是上限非预留）。
+    mem_limit: 192m
+    env_file:
+      # JWT_SECRET 等运行时密钥由部署侧 .env 注入，不烘焙进镜像
+      #（原仅 app 服务挂 env_file，nest 靠"注释约定"注入 → 容器实际拿不到，启动即 FATAL）
+      - ./backend/.env
+    environment:
+      NODE_ENV: production
+      # 端口统一 3000（nginx 反代目标不变）；PG 走 compose 服务名 postgis
+      PORT: '3000'
+      # 反代跳数（d058）：nginx→nest 一跳 = 1。生产环境后端**必填**此项，缺失/0/非法值
+      # 启动即失败（ConfigService.validateStartup）；前面再加 CDN 时按级数递增。
+      # environment 优先级高于 env_file ⇒ 此处是唯一权威（与 PG_* 同口径）。
+      TRUST_PROXY_HOPS: '1'
+      PG_HOST: postgis
+      PG_PORT: '5432'
+      PG_USER: postgres
+      # P0（EP-09 / EH-07）：与 postgis 服务口令同源，强制注入——未注入时 compose 直接报错，
+      # 不再把开发默认口令 postgres 带上生产（environment 优先级高于 env_file，此处是唯一权威）
+      PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须通过 .env 注入，禁止默认口令}
+      # ⚠️ 键名必须是 PG_DATABASE（2026-09-15 修复）：原写 PG_DB，而后端只读 PG_DATABASE
+      #（backend/src/infra/db/db.config.ts:31、config.service.ts:71），PG_DB 是**死键**——
+      # 线上一直靠"代码默认值恰好等于库名"在跑，配置从未生效。改名后必须显式注入。
+      # 注：environment 优先级高于 env_file，故此处是唯一权威，可覆盖部署侧 backend/.env 的旧值。
+      PG_DATABASE: beibu-gulf-data
+      DATA_DIR: /app/backend/data
+      # 镜像身份自证（2026-09-18 CI 审计 D-01）：把镜像 tag 注入容器环境，
+      # 经 /nest-api/health/version 回显——部署链据此判定「线上跑的是哪个 tag」。
+      # **不依赖 SSH**：跨境 SSH 抖动是常态（d117），原先仅靠 ssh docker inspect 校身份，
+      # SSH 一失败就降级成「HTTP 200 即成功」，而旧容器同样 200 ⇒ 部署假绿（run#183）。
+      # 与上方 image: 同一变量源，保证「容器跑的 tag」与「自报的 tag」必然一致。
+      APP_IMAGE_TAG: nest-${IMAGE_TAG:-nest-latest}
+      # JWT_SECRET 由部署 .env 注入（backend/.env），不烘焙进镜像
+    volumes:
+      - ./backend/data:/app/backend/data:ro
+    depends_on:
+      postgis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/nest-api/health/ready || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+  # PostGIS（空间数据，beibu-gulf-data）
+  postgis:
+    # 2026-09-10（阶段 3 前置）：切换为带 pgRouting 的自建镜像。
+    #   local/postgis-pgrouting:16-3.4 = postgis/postgis:16-3.4 + apt 装 postgresql-16-pgrouting
+    #   （实测 pgRouting 3.8.0）。构建步骤见 tools/db/Dockerfile.pgrouting。
+    # 为什么不用官方 pgrouting/pgrouting：其 PG16 tag 只提供 PostGIS 3.5，而本项目用 3.4，
+    #   换用会顺带升级生产空间库的 PostGIS 版本（多一个与本改造无关的风险面）。
+    # ⚠️ pull_policy: never 是必需的：该镜像是服务器本地构建的、不在任何 registry。
+    # 2026-09-18 源码级复核（docker/compose pkg/compose/pull.go: shouldPullImage）：
+    #   **旧注释「会 404 失败并中断整个 pull && up 链」是错的**。该函数对 never/build
+    #   走 `default: return false, "", nil` ⇒ 既不拉取也不产生 error，只打一条
+    #   `Skipped`（Details 为空）事件；`pullErrors` 不纳入该服务 ⇒ compose pull 返回 0。
+    #   ⇒ 阶段二 `docker compose pull`（**无服务名 = 全服务**）不会因 postgis 而失败。
+    #   保留 never 的真实价值：① 声明「不要试图去 registry 找它」的意图
+    #   ② 防止将来有人把 image 改成可拉取 tag 时静默改变行为。
+    image: local/postgis-pgrouting:16-3.4
+    pull_policy: never
+    container_name: beibu-postgis
+    # 削峰（15:30 修订）：实测稳态仅 95MB（原注释「150-300MB」为估算）；384m → 320m。
+    # 属防御性收紧防单容器失控，**不释放物理内存**（mem_limit 是上限非预留）。
+    # 限参（shared_buffers/work_mem 小档）保留；max_connections=20 与 nest/算法池式连接匹配
+    mem_limit: 320m
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - max_connections=20
+      # ── 日志持久化（2026-09-15 新增，起因见下）──────────────────────────────
+      # 事故：09-15 一次 PG 后端以 `exit code 2` 异常退出、postmaster 崩溃恢复；要查它退出前
+      # 打了什么 FATAL，却**查不到**——因为日志只走容器 stdout，而 postgis 容器在 22:05 被
+      # compose 重建（`docker inspect` 实证 Created=2026-09-15T14:05:25Z），**容器一重建日志即丢**。
+      # ⇒ 现场永久丢失，只能凭 dmesg/cgroup 反证"非 OOM、非段错误、非磁盘"，成因不可考。
+      #
+      # 现在改为 logging_collector 落盘到 beibu-pglogs 卷 ⇒ 跨容器重建仍可查。
+      # ⚠️ 代价（务必知道）：开启后 stderr 被收集器接管，**`docker logs beibu-postgis` 会变得很安静**。
+      #    改用： docker exec beibu-postgis sh -c 'ls -lt /var/log/postgresql/ | head'
+      #           docker exec beibu-postgis sh -c 'tail -100 $(ls -t /var/log/postgresql/*.log | head -1)'
+      # ⚠️ 留存缺口：PG **不会自动删除**旧日志文件（只有轮转、没有保留策略）。当前配置
+      #    每 20MB 或每 1 天轮转一个文件，长期会缓慢累积。建议在宿主机加一条定时清理，如：
+      #      find /var/lib/docker/volumes/beibu-gulf-project_beibu-pglogs/_data -name '*.log' -mtime +30 -delete
+      - -c
+      - logging_collector=on
+      - -c
+      - log_directory=/var/log/postgresql
+      - -c
+      - log_filename=postgresql-%Y-%m-%d_%H%M%S.log
+      - -c
+      - log_rotation_age=1d
+      - -c
+      - log_rotation_size=20MB
+    # stdout 侧留存（只跨 restart 有效；跨 recreate 必须靠上面的 beibu-pglogs 卷）。
+    # 保留它是为了 `docker logs` 在容器重启后仍能翻到最近一段。
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+    environment:
+      POSTGRES_USER: postgres
+      # P0（EP-09 / EH-07）：凭据必须注入，禁止默认口令（`:?` = 未设置即中断 compose）
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须通过 .env 注入，禁止默认口令}
+      POSTGRES_DB: beibu-gulf-data
+    # P0（EP-09 / EH-07）：生产**不向宿主机发布**数据库端口——nest 经服务名 `postgis` 内网访问。
+    # 本地调试确需直连时，改用下面注释的 127.0.0.1 绑定（仅本机 + SSH 隧道），切勿暴露公网。
+    # ports:
+    #   - '127.0.0.1:5432:5432'
+    volumes:
+      - beibu-pgdata:/var/lib/postgresql/data
+      # 日志落盘卷：让 PG 日志跨容器重建存活（见上方 command 段的起因说明）
+      - beibu-pglogs:/var/log/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d beibu-gulf-data']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # ⚠️ algorithm-service（FastAPI）已于 2026-09-10（阶段 4）退役下线：
+  #   · 淹没档位 → Nest /flood/flood-areas（PostGIS flood_levels 251 档）
+  #   · 设施影响 → Nest /flood/analysis/disaster（点面判定早已下沉 PostGIS）
+  #   · 路径规划 → Nest /route/path（pgRouting，pgr_createTopology 拓扑持久化）
+  #   能力已被 Nest+PostGIS **全覆盖**（FastAPI 已于 2026-09-10 退役；若未来因"用户上传
+  #   数据实时渲染"回归，则 backend/algorithm-service 源码**保留不删**，桌面另有归档副本）。
+  #   退役收益：容器 4→3，释放该容器实测 ~640MB 内存（曾三次 OOM 的元凶）。
+  #   恢复方法：git revert 本次 compose 变更 + 重新部署（镜像仍在 GHCR）。
+
+volumes:
+  beibu-pgdata:
+  # PG 日志卷（2026-09-15 新增）。为什么用**命名卷**而不是 bind mount 到宿主机目录：
+  # 命名卷首次使用时会继承镜像内目录的属主（postgres:postgres），PG 能直接写；
+  # 而 bind mount 到宿主目录默认 root 所有 ⇒ postgres 用户写不进去、日志收集器启动失败。
+  # （2026-09-15 本地实测：命名卷 `drwxrwxr-t root postgres` + 日志文件 `postgres:postgres` ✅，
+  #   删容器后用同卷重建，旧日志仍在且可读 ✅）
+  beibu-pglogs:

@@ -1,0 +1,1004 @@
+// OpenLayers 2D 渲染器：视图为 Web 墨卡托投影（EPSG:3857），业务坐标用 WGS84 经纬度（EPSG:4326）。
+import type { FeatureCollection } from 'geojson'
+import { Attribution, Zoom } from 'ol/control'
+import type { EventsKey } from 'ol/events'
+import Feature, { type FeatureLike } from 'ol/Feature'
+import GeoJSON from 'ol/format/GeoJSON'
+import MultiPolygon from 'ol/geom/MultiPolygon'
+import Point from 'ol/geom/Point'
+import Polygon from 'ol/geom/Polygon'
+import type BaseLayer from 'ol/layer/Base'
+import Heatmap from 'ol/layer/Heatmap'
+import TileLayer from 'ol/layer/Tile'
+import VectorLayer from 'ol/layer/Vector'
+// 不能 import { Map }：会遮蔽全局 ES Map，new Map()（如 _cullLayers 初始化）会误建 ol/Map 实例
+import OlMap from 'ol/Map'
+import type MapBrowserEvent from 'ol/MapBrowserEvent'
+import Overlay from 'ol/Overlay'
+import VectorSource from 'ol/source/Vector'
+import type XYZ from 'ol/source/XYZ'
+import { Circle, Fill, Stroke, Style, Text } from 'ol/style'
+import type { StyleFunction } from 'ol/style/Style'
+import View from 'ol/View'
+
+import { breathingAlpha, breathingSize, elapsedSeconds } from '@/core/config'
+import { buildTiandituUrl, defaultCameraCenter, heightToZoom, MAP_CONFIG } from '@/core/config'
+import { LAYER_DEFAULTS } from '@/shared'
+import { logger } from '@/shared'
+import { createSpatialIndex, VIEWPORT_CULL_THRESHOLD } from '@/shared'
+import { breathingPoints, normalizePoint } from '@/shared'
+import { isCoverLayerKey } from '@/shared'
+import type { LayerOptions, MapRendererEventMap, PointFeature, PolygonFeature } from '@/types'
+import type { CameraState, FlyToOptions, FlyToTarget, GeoPoint } from '@/types'
+
+import { createBaseTileSource } from '../baseTileSource'
+import { toGeoCoord, toMapCoord, toPointGeometry } from '../olCoord'
+import { type AreaAwareVectorLayer, createVectorLayerByGeometry } from '../perf/areaLayer'
+import { CAMERA_DEBOUNCE_MS } from '../perf/cameraTiming'
+import { MapRenderer } from './MapRenderer'
+/** Web 墨卡托投影标识（View/GeoJSON 读取共用，避免字面量散落） */
+const WEB_MERCATOR = 'EPSG:3857'
+
+/** 通用描边样式单例（OL 不在渲染期改写 Stroke；原 6 处同构造收敛到一处） */
+const OUTLINE_STROKE = new Stroke({ color: LAYER_DEFAULTS.outline, width: 2 })
+
+/**
+ * 解析 #rrggbb → rgb 三元组；非法入参返回 null（解析不内置缺省色，避免与缺省常量相互依赖）。
+ * OL 逐帧拼 rgba 字符串只能吃数值分量，故渲染层需把 hex 拆成三元组
+ */
+function parseBreathingColor(color?: string): [number, number, number] | null {
+  const m = color?.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i)
+  return m
+    ? [Number.parseInt(m[1], 16), Number.parseInt(m[2], 16), Number.parseInt(m[3], 16)]
+    : null
+}
+
+/**
+ * 呼吸灯缺省色：从 LAYER_DEFAULTS.color 派生（现 #409eff），色值仍以 colors.ts 为单一事实源——
+ * 改主色时呼吸动画随之变化（此处曾写死 rgb(64,158,255)，主色变更后呼吸不跟随）。
+ * ?? [0,0,0] 仅在 LAYER_DEFAULTS.color 不再是 hex 时兜底（契约破坏，黑点配白描边仍可见）
+ */
+const DEFAULT_BREATHING_RGB: [number, number, number] = parseBreathingColor(
+  LAYER_DEFAULTS.color
+) ?? [0, 0, 0]
+
+/**
+ * 呼吸样式建构（2026-10-12 收口 A2）：两套呼吸的 Style/Circle 嵌套构造逐字相同，
+ * 只有取色方式不同 ⇒ 取色由调用方算好传入；脉动口径见 core/config/breathing。
+ */
+function pulseStyleAt(startTime: number, rgb: [number, number, number]): Style {
+  const t = elapsedSeconds(startTime)
+  return new Style({
+    image: new Circle({
+      radius: breathingSize(t),
+      fill: new Fill({ color: `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${breathingAlpha(t)})` }),
+      stroke: OUTLINE_STROKE,
+    }),
+  })
+}
+
+/** 热力散点要素 → OL Point Feature（add/update 两路共用；缺失坐标跳过） */
+function toHeatmapOlFeatures(features: PointFeature[]): Feature<Point>[] {
+  return features.flatMap((f) => {
+    const coords = f.geometry?.coordinates
+    const point = normalizePoint(coords ? { lng: coords[0], lat: coords[1] } : f)
+    if (!point) return []
+    const feature = new Feature({
+      geometry: toPointGeometry(point.lng, point.lat),
+    })
+    // 将 properties 展开为 feature 属性（weightField 对应的值用于热力权重）
+    Object.entries(f.properties || {}).forEach(([key, value]) => {
+      feature.set(key, value)
+    })
+    return [feature]
+  })
+}
+
+/** 2D 视图层级限位（ 提常量：与 3D CAMERA_*_ZOOM_DISTANCE 对应；原散落 9/6/20） */
+const OL_VIEW_ZOOM = 9
+const OL_VIEW_MIN_ZOOM = 6
+const OL_VIEW_MAX_ZOOM = 20
+
+/**
+ * hex 颜色加 alpha（OL Fill 用）：'#rrggbb' → 'rgba(r,g,b,a)'。
+ * alpha >= 1 原样返回；非 hex 输入（rgba/命名色）保守降级原样返回——
+ * 选址 POI 色板（FACILITY_COLORS_MAP）均为 hex，此分支仅防御。
+ */
+function withAlpha(cssColor: string, alpha: number): string {
+  if (alpha >= 1) return cssColor
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(cssColor.trim())
+  if (!m) return cssColor
+  const hex6 =
+    m[1].length === 3
+      ? m[1]
+          .split('')
+          .map((c) => c + c)
+          .join('')
+      : m[1]
+  const r = parseInt(hex6.slice(0, 2), 16)
+  const g = parseInt(hex6.slice(2, 4), 16)
+  const b = parseInt(hex6.slice(4, 6), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
+/**
+ * hex 颜色调暗（未激活点「拉低亮度」）：各通道乘 factor（0-1）后回 hex。
+ * 非 hex 输入保守降级原样返回（同 withAlpha 防御口径——色板均为 hex，此分支仅防御）。
+ */
+function dimHex(cssColor: string, factor: number): string {
+  const m = /^#([0-9a-f]{6})$/i.exec(cssColor.trim())
+  if (!m) return cssColor
+  const ch = m[1]
+  const dim = (i: number) =>
+    Math.round(parseInt(ch.slice(i, i + 2), 16) * factor)
+      .toString(16)
+      .padStart(2, '0')
+  return `#${dim(0)}${dim(2)}${dim(4)}`
+}
+
+/** 未激活点亮度系数：per-point alpha<1 即「未激活」语义——低透明 + 暗化（色相不变）。
+ *  0.7 = 向黑混 30%，卫星底图上暗而不隐身；与 POI_BASE_OPACITY 联动裁决 */
+const INACTIVE_DIM_FACTOR = 0.7
+
+/** 呼吸通道状态：默认呼吸（小区/定位）与设施 POI 呼吸各一条，同屏互不顶掉 */
+interface BreathingChannel {
+  layer: VectorLayer<VectorSource> | null
+  animId: number | null
+}
+
+/** 视口裁剪图层条目（_cullLayers 值类型） */
+interface CullLayerEntry {
+  source: VectorSource
+  index: ReturnType<typeof createSpatialIndex<PointFeature>>
+  options: LayerOptions
+  featureType: string
+}
+
+/** OpenLayers 2D 渲染器（实现 MapRenderer 抽象能力） */
+export class OLRenderer extends MapRenderer {
+  map: OlMap | null
+  baseLayers: { image: TileLayer<XYZ>[]; vector: TileLayer<XYZ>[] }
+  _cullLayers: Map<string, CullLayerEntry>
+  _moveendKey: EventsKey | null
+  // C-2：listener 统一用 OL 宽签名 EventsKey['listener']，un 注销无需 as any
+  _pointerMoveHandler: EventsKey['listener'] | null
+  _cameraChangedKey: EventsKey | null
+  _cameraDebounceTimer: ReturnType<typeof setTimeout> | null
+  _clickKey: EventsKey | null
+  _clickHandler: EventsKey['listener'] | null
+  _breathing: BreathingChannel = { layer: null, animId: null }
+  // 设施 POI 专属呼吸（缩放式动效）：独立通道，与 startBreathing（呼吸灯式）同屏并存
+  _facilityBreathing: BreathingChannel = { layer: null, animId: null }
+  // 要素气泡（2D）：Overlay 归渲染器持有（随地图移动自动跟随），元素由 UnifiedMap 渲染树提供
+  _bubbleOverlay: Overlay | null
+  _bubbleElement: HTMLElement | null
+
+  constructor(container: HTMLElement) {
+    super(container)
+    this.map = null
+    this.baseLayers = { image: [], vector: [] }
+    // 视口裁剪：大数量点图层（>阈值）的 R-tree 索引 + moveend 监听
+    this._cullLayers = new Map() // id -> { source, index, allFeatures, options }
+    this._moveendKey = null
+    // pointer-move / camera-changed / click 事件处理器与防抖定时器引用（供 destroy 注销）
+    this._pointerMoveHandler = null
+    this._cameraChangedKey = null
+    this._cameraDebounceTimer = null
+    this._clickKey = null
+    this._clickHandler = null
+    this._bubbleOverlay = null
+    this._bubbleElement = null
+    this._initMap()
+  }
+
+  /**
+   * 图层叠放层级：普通业务层 10；覆盖类（淹没范围/受影响设施/预测图层）15；底图 0、呼吸层 100。
+   *
+   * 判据读**图层 key**（`id`），不读 `options.featureType` —— 两者是两个命名空间。旧实现在
+   * featureType 里比 `'flood-facilities'`（那是 key）和 `'forecast-'`（那是 key 前缀）⇒ 三条判据
+   * 两条恒假。判定收口在 `isCoverLayerKey()`，key 由 `LAYER_KEYS` / `forecastLayerId()` 单源保证。
+   */
+  _resolveLayerZIndex(id: string, options: LayerOptions): number {
+    if (options.zIndex != null) return options.zIndex
+    return isCoverLayerKey(id) ? LAYER_DEFAULTS.zIndexCover : LAYER_DEFAULTS.zIndex
+  }
+  _initMap(): void {
+    const view = new View({
+      // 显式声明投影：业务坐标为 WGS84，地图渲染统一 Web 墨卡托
+      projection: WEB_MERCATOR,
+      center: toMapCoord(MAP_CONFIG.CAMERA.center.lng, MAP_CONFIG.CAMERA.center.lat),
+      zoom: OL_VIEW_ZOOM,
+      minZoom: OL_VIEW_MIN_ZOOM,
+      maxZoom: OL_VIEW_MAX_ZOOM,
+    })
+    this.map = new OlMap({
+      target: this.container,
+      view,
+      layers: [],
+      // 显式 controls 对齐 3D widget 策略——原默认全开会让街景控件与业务 UI 同屏打架
+      // （zoom/rotate/attribution）不可配置；保留 Zoom/Attribution（基础导航 + 版权），
+      // 弃用 Rotate 等噪音控件（北部湾单区域场景，2D/3D 控件行为对称）
+      controls: [new Zoom(), new Attribution()],
+    })
+    this._initBaseLayers()
+    this._setupClickHandler()
+    this._setupPointerHandlers()
+  }
+  _initBaseLayers(): void {
+    const map = this.map
+    if (!map) return
+    // c056：底图专用 className（区分影像/矢量；暗色 filter 见 style.css，矢量走 invert 真变暗）
+    const buildBaseLayers = (codes: string[], type: 'image' | 'vector') =>
+      codes.map((code: string) => {
+        const layer = new TileLayer({
+          source: createBaseTileSource(buildTiandituUrl(code)),
+          className: `ol-base-layer ol-base-${type}`,
+        })
+        layer.set('isBaseMap', true)
+        layer.set('baseType', type)
+        // 矢量底图建层即隐藏（2D 首屏只显示影像，矢量由底图切换指令再显示）
+        if (type === 'vector') layer.setVisible(false)
+        return layer
+      })
+    const imageLayers = buildBaseLayers(MAP_CONFIG.BASE_LAYERS.image.layers, 'image')
+    const vectorLayers = buildBaseLayers(MAP_CONFIG.BASE_LAYERS.vector.layers, 'vector')
+    this.baseLayers.image = imageLayers
+    this.baseLayers.vector = vectorLayers
+
+    // 挂载顺序：先 image 后 vector；行首分号防 ASI 把 [ 接成上一行的下标访问
+    ;[...imageLayers, ...vectorLayers].forEach((l) => {
+      l.setZIndex(LAYER_DEFAULTS.zIndexBase)
+      map.addLayer(l)
+    })
+  }
+  _setupClickHandler(): void {
+    const map = this.map
+    if (!map) return
+    // 具名处理器 + key 保存：destroy 时能注销，匿名回调无引用可解绑
+    this._clickHandler = (event: unknown) => {
+      const evt = event as MapBrowserEvent<PointerEvent>
+      const coordinate = toGeoCoord(evt.coordinate)
+      let clickedFeature = false
+
+      map.forEachFeatureAtPixel(
+        evt.pixel,
+        (feature) => {
+          const featureType = feature.get('featureType')
+          if (featureType) {
+            const properties = feature.getProperties()
+            this.emit('click', {
+              featureType,
+              data: properties,
+              coordinate,
+            })
+            clickedFeature = true
+            return true
+          }
+          return undefined
+        },
+        {
+          layerFilter: (layer) => !layer.get('isBaseMap'),
+        }
+      )
+      if (!clickedFeature) {
+        this.emit('click', {
+          featureType: null,
+          data: null,
+          coordinate,
+        })
+      }
+    }
+    const handler = this._clickHandler
+    if (handler) {
+      this._clickKey = map.on('click', handler as (evt: unknown) => void)
+    }
+  }
+
+  /** pointer-move / camera-changed 事件实现（对应 MapRendererEventMap 声明） */
+  _setupPointerHandlers(): void {
+    const map = this.map
+    if (!map) return
+    // pointer-move：实时回传鼠标经纬度（坐标从 EPSG:3857 反算到 WGS84）+ POI 悬停命中（要素气泡驱动）
+    this._pointerMoveHandler = (evt) => {
+      const mapEvt = evt as MapBrowserEvent<PointerEvent>
+      const coord = toGeoCoord(mapEvt.coordinate)
+      this.emit('pointer-move', { lng: coord[0], lat: coord[1] })
+      this.emit('hover', this._hitTestPort(mapEvt))
+    }
+    const handler = this._pointerMoveHandler
+    if (handler) {
+      map.on('pointermove', handler)
+    }
+
+    // camera-changed：moveend 防抖后回传相机状态（避免每帧触发刷爆订阅方）
+    this._cameraChangedKey = map.on('moveend', () => {
+      if (this._cameraDebounceTimer) {
+        clearTimeout(this._cameraDebounceTimer)
+      }
+      this._cameraDebounceTimer = setTimeout(() => {
+        this.emit('camera-changed', this._getCameraState())
+        this._cameraDebounceTimer = null
+      }, CAMERA_DEBOUNCE_MS)
+    })
+  }
+
+  /** POI 悬停命中检测（要素气泡用）：命中港口点要素返回类型/属性/锚点坐标；拖拽中/未命中返回 null 态 */
+  private _hitTestPort(evt: MapBrowserEvent<PointerEvent>): MapRendererEventMap['hover'] {
+    const miss: MapRendererEventMap['hover'] = { featureType: null, data: null, coordinate: null }
+    if (evt.dragging) return miss
+    const hits: MapRendererEventMap['hover'][] = []
+    this.map?.forEachFeatureAtPixel(
+      evt.pixel,
+      (feature) => {
+        if (feature.get('featureType') !== 'port') return undefined
+        const geometry = feature.getGeometry()
+        if (geometry?.getType() !== 'Point') return undefined
+        hits.push({
+          featureType: 'port',
+          data: feature.getProperties(),
+          // 锚点取要素自身坐标（非光标处）：气泡精确钉在 POI 上
+          coordinate: toGeoCoord((geometry as Point).getCoordinates()),
+        })
+        return true
+      },
+      { layerFilter: (layer) => !layer.get('isBaseMap') }
+    )
+    return hits[0] ?? miss
+  }
+
+  /** 要素气泡宿主挂载（2D Overlay 能力）：元素由 UnifiedMap 的 Vue 渲染树提供，Overlay 懒创建 */
+  attachBubbleElement(element: HTMLElement): void {
+    this._bubbleElement = element
+  }
+
+  /** 设置气泡锚点（WGS84 经纬度）：Overlay 随地图平移缩放自动跟随；null 隐藏 */
+  setBubbleAnchor(coordinate: [number, number] | null): void {
+    if (!this.map || !this._bubbleElement) return
+    if (!this._bubbleOverlay) {
+      this._bubbleOverlay = new Overlay({
+        element: this._bubbleElement,
+        // bottom-center：气泡位于锚点正上方，底部尾针指向 POI；小幅上移留出间隙
+        positioning: 'bottom-center',
+        offset: [0, -10],
+        stopEvent: true,
+        autoPan: false,
+      })
+      this.map.addOverlay(this._bubbleOverlay)
+    }
+    this._bubbleOverlay.setPosition(coordinate ? toMapCoord(...coordinate) : undefined)
+  }
+
+  /** 点要素构造收口：坐标归一化（缺失则跳过）→ Point 几何 → 合并原始属性并写入 featureType */
+  private toPointFeature(item: PointFeature, featureType: string): Feature | null {
+    const point = normalizePoint(item)
+    if (!point) return null
+    const feature = new Feature({
+      geometry: toPointGeometry(point.lng, point.lat),
+    })
+    feature.setProperties({ ...item, featureType })
+    return feature
+  }
+
+  addPointLayer(id: string, features: PointFeature[], options: LayerOptions = {}): void {
+    // 幂等防御（与 CesiumRenderer 对齐）：重复 add 同 id 先移除旧图层——
+    // 否则旧 VectorLayer 仍挂在 map 上而 _layers 引用已被覆盖，成为无法回收的孤儿
+    if (this._layers.has(id)) this.removeLayer(id)
+    // 数据中存在 opacity<1 或 per-point color 的点 → 走 per-feature 样式分支
+    // （选址命中高亮 + 附近设施合并图层 6 色异色）；否则零开销静态样式
+    const hasPerPointStyle =
+      features.some((f) => typeof f.opacity === 'number' && f.opacity >= 0 && f.opacity < 1) ||
+      features.some((f) => typeof f.color === 'string')
+    const style = this._createPointStyle(options, hasPerPointStyle)
+
+    // 大数量点图层启用视口裁剪：R-tree 索引 + moveend 增量更新
+    if (features.length > VIEWPORT_CULL_THRESHOLD) {
+      this._addCulledPointLayer(id, features, options, style)
+      return
+    }
+
+    const olFeatures = features.flatMap((item: PointFeature) => {
+      // item.featureType 因索引签名推断 unknown：按既有契约断言为 string（运行时不转换）
+      const feature = this.toPointFeature(
+        item,
+        (options?.featureType || item?.featureType || 'point') as string
+      )
+      return feature ? [feature] : []
+    })
+
+    const vectorLayer = new VectorLayer({
+      source: new VectorSource({ features: olFeatures }),
+      style,
+    })
+    vectorLayer.setZIndex(this._resolveLayerZIndex(id, options))
+    this.map?.addLayer(vectorLayer)
+    this.registerLayer(id, vectorLayer, options)
+  }
+
+  /** 大数量点图层的视口裁剪：R-tree 索引（EPSG:3857 投影坐标），初始只渲染视口内要素，moveend 增量更新 */
+  _addCulledPointLayer(
+    id: string,
+    features: PointFeature[],
+    options: LayerOptions,
+    style: Style | StyleFunction
+  ): void {
+    const featureType = options?.featureType || 'point'
+
+    // 构建 R-tree 索引项：[minX, minY, maxX, maxY] + 原始数据；缺失坐标跳过
+    const index = createSpatialIndex<PointFeature>()
+    const indexItems = features.flatMap((item: PointFeature) => {
+      const point = normalizePoint(item)
+      if (!point) return []
+      const coord = toMapCoord(point.lng, point.lat)
+      return [{ minX: coord[0], minY: coord[1], maxX: coord[0], maxY: coord[1], data: item }]
+    })
+    index.load(indexItems)
+
+    const source = new VectorSource()
+    const vectorLayer = new VectorLayer({ source, style })
+    vectorLayer.setZIndex(this._resolveLayerZIndex(id, options))
+    this.map?.addLayer(vectorLayer)
+    this.registerLayer(id, vectorLayer, options)
+
+    this._cullLayers.set(id, { source, index, options, featureType })
+    this._ensureMoveendListener()
+
+    // 初始加载视口内要素
+    this._refreshCulledLayer(id)
+
+    if (import.meta.env.DEV) {
+      logger.info(`[OLRenderer] 图层 ${id} 启用视口裁剪，共 ${features.length} 个要素`)
+    }
+  }
+
+  /** 确保 moveend 监听只注册一次 */
+  _ensureMoveendListener(): void {
+    if (this._moveendKey) return
+    this._moveendKey =
+      this.map?.on('moveend', () => {
+        for (const id of this._cullLayers.keys()) {
+          this._refreshCulledLayer(id)
+        }
+      }) ?? null
+  }
+
+  /** 刷新单个裁剪图层：查询当前视口内要素并替换 source */
+  _refreshCulledLayer(id: string): void {
+    const entry = this._cullLayers.get(id)
+    if (!entry) return
+
+    // 隐藏图层不参与 moveend 刷新：visible 是面板/registry 权威值，隐藏时跳过省查询
+    const layerEntry = this._layers.get(id)
+    if (layerEntry && layerEntry.visible === false) return
+
+    const map = this.map
+    if (!map) return
+    const extent = map.getView().calculateExtent(map.getSize()) as [number, number, number, number]
+    const visible = entry.index.query(extent)
+
+    const olFeatures = visible.flatMap((item) => {
+      const feature = this.toPointFeature(item.data, entry.featureType)
+      return feature ? [feature] : []
+    })
+
+    entry.source.clear()
+    entry.source.addFeatures(olFeatures)
+  }
+  _createPointStyle(options: LayerOptions, hasPerPointStyle = false): Style | StyleFunction {
+    const baseColor = options.color || LAYER_DEFAULTS.color
+    const radius = options.size || 12
+    const makeImage = (color: string, alpha: number) =>
+      new Circle({
+        radius,
+        // alpha<1 即「未激活」：亮度拉低 + 低透明（色相不变）；alpha=1 激活原色实体
+        fill: new Fill({
+          color: alpha >= 1 ? color : withAlpha(dimHex(color, INACTIVE_DIM_FACTOR), alpha),
+        }),
+        stroke: OUTLINE_STROKE,
+      })
+    const baseStyle = new Style({ image: makeImage(baseColor, 1) })
+    // (color, alpha) 样式缓存：附近设施合并图层 6 色 × 2 档透明度，命中缓存则零分配
+    const styleCache = new Map<string, Style>()
+    const styleFor = (color: string, alpha: number): Style => {
+      if (color === baseColor && alpha >= 1) return baseStyle
+      const key = `${color}|${alpha}`
+      let cached = styleCache.get(key)
+      if (!cached) {
+        cached = new Style({ image: makeImage(color, alpha) })
+        styleCache.set(key, cached)
+      }
+      return cached
+    }
+
+    if (!options.labelField) {
+      if (!hasPerPointStyle) return baseStyle
+      return (feature: FeatureLike) => {
+        const color = (feature.get('color') as string | undefined) ?? baseColor
+        const alpha = feature.get('opacity') as number | undefined
+        return styleFor(color, alpha ?? 1)
+      }
+    }
+    return (feature: FeatureLike) => {
+      const color = (feature.get('color') as string | undefined) ?? baseColor
+      const alpha = feature.get('opacity') as number | undefined
+      // getImage() 类型为 ImageStyle | null，Style 构造器只收 undefined——null 视为未设置
+      const image = styleFor(color, alpha ?? 1).getImage() ?? undefined
+      return new Style({
+        image,
+        text: new Text({
+          text: feature.get(options.labelField as string),
+          font: '12px sans-serif',
+          fill: new Fill({ color: LAYER_DEFAULTS.text }),
+          stroke: OUTLINE_STROKE,
+          offsetY: 15,
+        }),
+      })
+    }
+  }
+  addPolygonLayer(id: string, features: PolygonFeature[], options: LayerOptions = {}): void {
+    // 幂等防御（与 CesiumRenderer 对齐）：重复 add 同 id 先移除旧图层
+    if (this._layers.has(id)) this.removeLayer(id)
+    // 辅助函数 - 确保坐标环闭合
+    const ensureRingClosed = (ring: [number, number][]): [number, number][] | null => {
+      if (!ring || ring.length < 3) return null
+      const first = ring[0]
+      const last = ring[ring.length - 1]
+      // 如果首尾坐标不相同，添加闭合点
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        return [...ring, first]
+      }
+      return ring
+    }
+
+    const olFeatures = features
+      .map((item: PolygonFeature) => {
+        const coordinates = item.coordinates || item.geometry?.coordinates
+        if (!coordinates) return null
+
+        // 验证坐标数组有效性
+        if (!Array.isArray(coordinates) || coordinates.length === 0) return null
+
+        // 环判别：环 = 点数组（首元素是 [lng,lat]）。环组契约以 CesiumRenderer
+        // 权威实现为准——geometry.type='Polygon' 时 coordinates=[外环,...内环]，
+        // 内环挖洞；无类型元数据的裸 coordinates 取首环（与 Cesium 同口径，不猜孔洞）
+        const isRing = (r: unknown): r is [number, number][] =>
+          Array.isArray(r) && Array.isArray(r[0]) && typeof r[0][0] === 'number'
+
+        // 环组归一：[外环, ...内环] 全量保留（OL Polygon 坐标本就支持内环挖洞），
+        // 每环独立闭合——丢内环会让 2D 把孔洞填实，与 3D 视觉分裂
+        const toClosedRings = (rings: unknown[]): [number, number][][] | null => {
+          const closed = rings
+            .filter(isRing)
+            .map((ring) => ensureRingClosed(ring))
+            .filter((r): r is [number, number][] => r !== null)
+            .map((ring) => ring.map(([lng, lat]) => toMapCoord(lng, lat)))
+          return closed.length > 0 ? closed : null
+        }
+
+        let geometry: Polygon | MultiPolygon
+        if (item.geometry?.type === 'MultiPolygon') {
+          // MultiPolygon：每部件 [外环, ...内环]，构造 ol MultiPolygon
+          //（旧实现把部件数组当单 Polygon 环组——部件 2..N 被当成第 1 部件的孔洞挖掉）
+          const multi = coordinates as unknown as unknown[][] // why: coordinates 来自 GeoJSON unknown，先按数组收窄；exit: 改用 GeoJSON 类型守卫后单断言
+          if (!Array.isArray(multi[0]) || !Array.isArray(multi[0][0])) return null
+          const polygons = multi
+            .map((poly) => toClosedRings(poly))
+            .filter((p): p is [number, number][][] => p !== null)
+          if (polygons.length === 0) return null
+          geometry = new MultiPolygon(polygons)
+        } else {
+          // Polygon（有类型）：coordinates 即环组，内环保留
+          // 无类型：裸 coordinates 取首环（Cesium 同口径）
+          const rawRings: unknown[] = // why: coordinates 来自 GeoJSON unknown，先按数组收窄；exit: 改用 GeoJSON 类型守卫后单断言
+            item.geometry?.type === 'Polygon'
+              ? (coordinates as unknown as unknown[])
+              : [coordinates[0]]
+          const closedRings = toClosedRings(rawRings)
+          if (!closedRings) return null
+          geometry = new Polygon(closedRings)
+        }
+        const feature = new Feature({ geometry })
+        // 剥离输入形状字段（geometry/coordinates 是渲染器入参结构，非业务展示属性）：
+        // 铺进 setProperties 会把普通对象写进 'geometry' 属性位，OL Feature 的
+        // propertychange 处理器会对它重绑 change 监听（addEventListener 崩溃）
+        const { geometry: _shapeGeom, coordinates: _shapeCoords, ...props } = item
+        feature.setProperties({ ...props, featureType: options.featureType || 'polygon' })
+        return feature
+      })
+      .filter((f) => f !== null) as Feature[]
+
+    const style = this._createPolygonStyle(options)
+
+    const map = this.map
+    if (!map) return
+    const vectorLayer = createVectorLayerByGeometry(olFeatures, {
+      source: new VectorSource({ features: olFeatures }),
+      style,
+    })
+    vectorLayer.setZIndex(this._resolveLayerZIndex(id, options))
+    this.map?.addLayer(vectorLayer)
+    this.registerLayer(id, vectorLayer, options)
+  }
+
+  /** 增量更新 GeoJSON 图层：复用图层实例，仅替换 source 数据，避免重建闪烁 */
+  updateGeoJsonLayer(id: string, geojson: FeatureCollection, options: LayerOptions = {}): void {
+    const entry = this._layers.get(id)
+    if (!entry || !entry.instance) {
+      this.addGeoJsonLayer(id, geojson, options)
+      return
+    }
+    const layer = entry.instance as AreaAwareVectorLayer
+    const source = layer.getSource()
+    if (!source) {
+      this.addGeoJsonLayer(id, geojson, options)
+      return
+    }
+
+    const features = new GeoJSON().readFeatures(geojson, {
+      featureProjection: WEB_MERCATOR,
+    })
+    features.forEach((feature) => {
+      feature.set('featureType', options.featureType || 'geojson')
+    })
+    // 样式选项更新（style 是 layer 级，直接替换）
+    if (options.style) layer.setStyle(options.style)
+    entry.options = { ...entry.options, ...options }
+
+    source.clear()
+    source.addFeatures(features)
+  }
+  _createPolygonStyle(options: LayerOptions): Style {
+    return new Style({
+      fill: new Fill({ color: options.fillColor || LAYER_DEFAULTS.fill }),
+      stroke: new Stroke({
+        color: options.strokeColor || LAYER_DEFAULTS.stroke,
+        width: options.strokeWidth || 2,
+      }),
+    })
+  }
+  addGeoJsonLayer(id: string, geojson: FeatureCollection, options: LayerOptions = {}): void {
+    // 幂等防御（与 CesiumRenderer 对齐）：重复 add 同 id 先移除旧图层
+    if (this._layers.has(id)) this.removeLayer(id)
+    const features = new GeoJSON().readFeatures(geojson, {
+      featureProjection: WEB_MERCATOR,
+    })
+    features.forEach((feature) => {
+      feature.set('featureType', options.featureType || 'geojson')
+    })
+    // 按几何类型分派样式，点要素支持 markerColor/markerSize
+    const polygonStyle = this._createPolygonStyle(options)
+    const pointStyle = new Style({
+      image: new Circle({
+        radius: (options.markerSize || 10) / 2,
+        fill: new Fill({ color: options.markerColor || LAYER_DEFAULTS.marker }),
+        stroke: OUTLINE_STROKE,
+      }),
+    })
+    // per-feature 样式走 options.style（由调用方提供）；未提供时下文 defaultStyle 按几何类型分派。
+    const defaultStyle = (feature: FeatureLike): Style => {
+      const geom = feature.getGeometry()
+      return geom?.getType() === 'Point' ? pointStyle : polygonStyle
+    }
+    const vectorLayer = createVectorLayerByGeometry(features, {
+      source: new VectorSource({ features }),
+      style: options.style || defaultStyle,
+    })
+    vectorLayer.setZIndex(this._resolveLayerZIndex(id, options))
+    this.map?.addLayer(vectorLayer)
+    this.registerLayer(id, vectorLayer, options)
+  }
+
+  addHeatmapLayer(id: string, features: PointFeature[], options: LayerOptions = {}): boolean {
+    // 幂等防御（与 CesiumRenderer 对齐）：重复 add 同 id 先移除旧图层
+    if (this._layers.has(id)) this.removeLayer(id)
+    const {
+      weightField = 'value',
+      radius = 20,
+      blur = 15,
+      gradient = LAYER_DEFAULTS.heatmapGradient,
+      opacity = 0.6,
+    } = options
+
+    // 将 features 数组转为 OpenLayers Feature（坐标归一化走 normalizePoint，含 longitude 别名；缺失坐标跳过）
+    const olFeatures = toHeatmapOlFeatures(features)
+
+    const source = new VectorSource({ features: olFeatures })
+
+    const layer = new Heatmap({
+      source,
+      radius: Number(radius),
+      blur: Number(blur),
+      weight: (feature) => {
+        const val = feature.get(weightField)
+        return val !== undefined && val !== null ? Number(val) : 0
+      },
+      gradient: [...gradient],
+      opacity,
+    })
+
+    layer.set('id', id)
+    layer.setZIndex(this._resolveLayerZIndex(id, options))
+    const map = this.map
+    if (!map) return false
+    map.addLayer(layer)
+    this.registerLayer(id, layer, options)
+
+    return true
+  }
+
+  updateHeatmapLayer(id: string, features: PointFeature[], options: LayerOptions = {}): boolean {
+    const entry = this._layers.get(id)
+    if (!entry) return false
+
+    const layer = entry.instance as VectorLayer<VectorSource>
+    const source = layer.getSource()
+    if (!source) return false
+
+    const olFeatures = toHeatmapOlFeatures(features)
+
+    source.clear()
+    source.addFeatures(olFeatures)
+    // 更新层内缓存的 options 以便后续使用
+    if (options) entry.options = options
+    return true
+  }
+
+  _doSetVisibility(id: string, visible: boolean): void {
+    const layer = this._layers.get(id)
+    if (!layer?.instance) return
+    ;(layer.instance as { setVisible: (v: boolean) => void }).setVisible(visible)
+    if (visible && this._cullLayers.has(id)) this._refreshCulledLayer(id)
+  }
+  /** 覆写基类 removeLayer：先清理裁剪图层状态（索引 + moveend 监听）再走基类移除，防止 _cullLayers 残留与监听泄漏 */
+  removeLayer(id: string): void {
+    this._removeCullLayer(id)
+    super.removeLayer(id)
+  }
+  _doRemoveLayer(layer: { instance: unknown; visible: boolean; options?: LayerOptions }): void {
+    if (layer.instance) {
+      this.map?.removeLayer(layer.instance as BaseLayer)
+      const instance = layer.instance as {
+        getSource?: () => { clear?: () => void; dispose?: () => void }
+      }
+      if (instance.getSource) {
+        const source = instance.getSource()
+        if (source && source.clear) {
+          source.clear()
+        }
+        if (source && source.dispose) {
+          source.dispose()
+        }
+      }
+    }
+  }
+
+  /** 移除视口裁剪图层时清理索引和监听 */
+  _removeCullLayer(id: string): void {
+    this._cullLayers.delete(id)
+    const moveendKey = this._moveendKey
+    if (this._cullLayers.size === 0 && moveendKey) {
+      // EventsKey.type 为宽 string，un 需 cast 对齐字面量 union 类型
+      this.map?.un(moveendKey.type as 'moveend', moveendKey.listener)
+      this._moveendKey = null
+    }
+  }
+  _doFlyTo(target: FlyToTarget, options: FlyToOptions = {}): void {
+    const map = this.map
+    if (!map) return
+    const view = map.getView()
+    if ('layerId' in target && target.layerId) {
+      const layer = this._layers.get(target.layerId)
+      if (layer && layer.instance) {
+        // 验证 source 和 getExtent 方法存在性
+        const instance = layer.instance as { getSource?: () => { getExtent?: () => unknown } }
+        const source = instance.getSource?.()
+        if (source && typeof source.getExtent === 'function') {
+          const extent = source.getExtent()
+          if (extent) {
+            view.fit(extent as [number, number, number, number], {
+              duration: options.duration ?? 1000,
+            })
+            return
+          }
+        }
+      }
+    }
+    // 数据入口归一化：统一 lng/lon/longitude 字段名；缺失坐标不执行飞行
+    const point = normalizePoint(target as { lng?: number; lat?: number; lon?: number })
+    if (!point) return
+    // height → heightToZoom 同步缩放（曾只认 options.zoom、忽略 height，2D 只有位移没有缩放动画）
+    const zoom =
+      options.zoom ?? (options.height != null ? heightToZoom(options.height) : view.getZoom())
+    view.animate({
+      center: toMapCoord(point.lng, point.lat),
+      zoom,
+      // duration 读 FlyToOptions.duration（毫秒）?? 默认 1000
+      duration: options.duration ?? 1000,
+    })
+  }
+  _getCameraState(): CameraState {
+    const view = this.map?.getView()
+    const center = view?.getCenter()
+    if (!view || !center) {
+      // 与 CesiumRenderer._getCameraState 同源兜底：视图未就绪时回退配置相机中心。
+      // 曾硬编码 (0,0)/zoom6，被跨引擎相机恢复当作真实目标 → 飞向几内亚湾（审查 M-13）
+      return {
+        center: defaultCameraCenter(),
+        zoom: heightToZoom(MAP_CONFIG.CAMERA.center.height),
+      }
+    }
+    const [lng0, lat0] = toGeoCoord(center)
+    const zoom = view.getZoom()
+
+    const state: CameraState = {
+      center: { lng: lng0, lat: lat0 },
+      zoom: zoom ?? undefined,
+    }
+
+    logger.debug('[OLRenderer._getCameraState] 导出状态:', state)
+
+    return state
+  }
+  _setCameraState(state: CameraState): void {
+    logger.debug('[OLRenderer._setCameraState] 导入原始状态:', state)
+
+    const view = this.map?.getView()
+    if (!view) return
+    let zoom: number | undefined
+
+    // 从 Cesium 的 height 反算 OL zoom
+    if (state.height != null) {
+      zoom = heightToZoom(state.height)
+    } else if (state.zoom != null) {
+      zoom = state.zoom
+    }
+
+    // 钳制在合法范围内
+    // 限位取 OL_VIEW_MIN/MAX_ZOOM（2026-10-12 收口 A2）：原手抄 6/20，与 _initMap 的 View 限位是同一条规则的两份口径
+    const clampedZoom =
+      zoom != null
+        ? Math.min(Math.max(zoom, OL_VIEW_MIN_ZOOM), OL_VIEW_MAX_ZOOM)
+        : (view.getZoom() ?? OL_VIEW_MIN_ZOOM)
+
+    // 原子设置 center+zoom，避免分离调用触发的动画冲突导致 view 状态错乱
+    view.animate({
+      center: toMapCoord(state.center.lng, state.center.lat),
+      zoom: clampedZoom,
+      duration: 0,
+    })
+  }
+  setBaseLayer(type: 'image' | 'vector'): void {
+    this.baseLayers.image.forEach((l) => l.setVisible(type === 'image'))
+    this.baseLayers.vector.forEach((l) => l.setVisible(type === 'vector'))
+  }
+  startBreathing(target: GeoPoint | GeoPoint[], color?: string): void {
+    this.stopBreathing()
+    // 单点定位（小区/受影响设施）不传色，取缺省主色
+    this.startBreathingLayer(this._breathing, target, color, false)
+  }
+
+  /**
+   * 设施 POI 专属呼吸（第二层筛选主角）：旧版缩放式动效——半径 10±5 脉动 + 透明度随动，视觉显眼。
+   * 点可携带 per-point color（多类型混合呼吸各按类型色），缺省用统一 color 参数
+   */
+  startFacilityBreathing(target: Array<GeoPoint & { color?: string }>, color?: string): void {
+    this.stopFacilityBreathing()
+    this.startBreathingLayer(this._facilityBreathing, target, color, true)
+  }
+
+  /**
+   * 两路呼吸的共同骨架：非有限坐标剔除 → 建点要素 → 建层置顶 → rAF 帧循环。
+   * 唯一差异是取色口径（`perPoint`）：真则按要素属性逐点解析（多类型混合呼吸各按类型色），
+   * 假则整层共用同一基准色——与原 startBreathing 的常量取色逐字等价（样式函数仍每帧重建）。
+   */
+  private startBreathingLayer(
+    channel: BreathingChannel,
+    target: Array<GeoPoint & { color?: string }> | (GeoPoint & { color?: string }),
+    color: string | undefined,
+    perPoint: boolean
+  ): void {
+    const points = breathingPoints(target)
+    if (points.length === 0) return
+    const startTime = Date.now()
+    const fallback = parseBreathingColor(color) ?? DEFAULT_BREATHING_RGB
+    const rgbOf: (f: FeatureLike) => [number, number, number] = perPoint
+      ? (f) => parseBreathingColor((f.get('color') as string) || color) ?? fallback
+      : () => fallback
+    const layer = new VectorLayer({
+      source: new VectorSource({
+        features: points.map((p) => {
+          const f = new Feature({
+            geometry: toPointGeometry(p.lng, p.lat),
+          })
+          // per-point color 挂到 feature 属性，样式函数按点取色（多类型混合呼吸）
+          if (p.color) f.set('color', p.color)
+          return f
+        }),
+      }),
+      // 脉动参数取自 core/config/breathing（与 Cesium 侧同源；此前两处逐行复制）
+      style: (feature: FeatureLike) => pulseStyleAt(startTime, rgbOf(feature)),
+    })
+    channel.layer = layer
+    // 呼吸动画层必须置顶（覆盖业务层），保持改动前"最后 add 即最上"的视觉语义
+    layer.setZIndex(LAYER_DEFAULTS.zIndexOverlay)
+    this.map?.addLayer(layer)
+    const animate = () => {
+      if (channel.layer) {
+        channel.layer.changed()
+        channel.animId = requestAnimationFrame(animate)
+      }
+    }
+    channel.animId = requestAnimationFrame(animate)
+  }
+
+  /** 呼吸层公共清理：先停帧再摘层释放；字段置空由调用方负责（保持原执行顺序） */
+  private disposeBreathing(channel: BreathingChannel): void {
+    if (channel.animId) cancelAnimationFrame(channel.animId)
+    if (channel.layer) {
+      this.map?.removeLayer(channel.layer)
+      channel.layer.dispose()
+    }
+  }
+
+  stopBreathing(): void {
+    this.disposeBreathing(this._breathing)
+    this._breathing.animId = null
+    this._breathing.layer = null
+  }
+
+  stopFacilityBreathing(): void {
+    this.disposeBreathing(this._facilityBreathing)
+    this._facilityBreathing.animId = null
+    this._facilityBreathing.layer = null
+  }
+  getType() {
+    // 返回 '2d' 与 MapType 一致：原 'ol' 与 mapType==='2d'/'3d' 比较错位（切换白屏、同类型短路）
+    return '2d'
+  }
+  getMap() {
+    return this.map
+  }
+  updateSize() {
+    this.map?.updateSize()
+  }
+  // 水面为 3D 专有能力（Water3DCapability），调用方做能力检查后跳过 2D；呼吸动画为双引擎公共能力，实现见上方
+  destroy() {
+    super.destroy()
+    this.stopBreathing()
+    this.stopFacilityBreathing()
+    // 清理视口裁剪图层
+    this._cullLayers.clear()
+    if (this._moveendKey) {
+      // EventsKey.listener 为 OL 宽签名，业务回调为窄类型——cast 对齐运行时注销契约
+      this.map?.un(this._moveendKey.type as 'moveend', this._moveendKey.listener)
+      this._moveendKey = null
+    }
+    // 注销 click 监听（具名处理器配对注销）
+    if (this._clickKey && this._clickHandler) {
+      this.map?.un(this._clickKey.type as 'click', this._clickHandler)
+      this._clickKey = null
+      this._clickHandler = null
+    }
+    // 注销 pointer-move / camera-changed 监听与防抖定时器
+    if (this._pointerMoveHandler) {
+      this.map?.un('pointermove', this._pointerMoveHandler)
+      this._pointerMoveHandler = null
+    }
+    if (this._cameraChangedKey) {
+      this.map?.un(this._cameraChangedKey.type as 'moveend', this._cameraChangedKey.listener)
+      this._cameraChangedKey = null
+    }
+    if (this._cameraDebounceTimer) {
+      clearTimeout(this._cameraDebounceTimer)
+      this._cameraDebounceTimer = null
+    }
+    // 气泡 Overlay 随 map.dispose 一并释放，这里清引用防悬空
+    this._bubbleOverlay = null
+    this._bubbleElement = null
+    this.map?.dispose()
+    this.map = null
+    // 清空 baseLayers 引用——已 dispose 的 TileLayer 不留在数组中，
+    // 否则渲染器对象被多处持有时不可 GC
+    this.baseLayers.image = []
+    this.baseLayers.vector = []
+  }
+}

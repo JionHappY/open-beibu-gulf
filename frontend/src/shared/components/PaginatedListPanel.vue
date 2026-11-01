@@ -1,0 +1,410 @@
+<script setup lang="ts">
+/**
+ * PaginatedListPanel — 通用分页列表面板：
+ * 分页 + 收藏逻辑（对接 usePlans 的真实登录与 savedXiaoqu 判断）。
+ * 具名插槽只有 #item；#loading / #empty 全仓 0 填充者，2026-10-20 收窄为直写兜底内容。
+ * 前端称"收藏"，后端 API/数据库称 saved/save——字段名沿用后端约定，前端不做转换；
+ * 点击项的地图跳转（flyTo）由业务层注入，shared 不依赖 core。
+ */
+import { computed, ref, watch } from 'vue'
+
+import EmptyState from './EmptyState.vue'
+import { useAuth } from '../composables/useAuth'
+import { useFavorites } from '../composables/useFavorites'
+import { useGCS } from '../layout/useGCS'
+import { showError } from '../utils/errorHandler'
+import { showToast } from '../utils/gcsFeedback'
+import { logger } from '../utils/logger'
+import type { FavoriteAddInput, FavoriteItemType } from '@/types'
+import type { ScoredXiaoqu } from '@/types/xiaoqu'
+
+interface Props {
+  items?: ScoredXiaoqu[]
+  pageSize?: number
+  title?: string
+  emptyText?: string
+  emptyHint?: string
+  /** 收藏方案的业务类型键（随面板业务类型：flood → facility）。留给调用方注入，故为 string */
+  planType?: string
+  /** 加载进行态 */
+  loading?: boolean
+  showFavorite?: boolean
+  /** 点击列表项自动跳转（flyTo）：由业务层注入实现，页面不再各自处理 */
+  flyTo?: (item: ScoredXiaoqu) => void
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  items: () => [],
+  pageSize: 4,
+  title: '',
+  emptyText: '暂无数据',
+  emptyHint: '',
+  planType: 'flood',
+  loading: false,
+  showFavorite: true,
+  // 显式 undefined：flyTo 为可选能力（个人中心 PlansPanel 无地图上下文），非遗漏默认值
+  flyTo: undefined,
+})
+
+// 从 useGCS 解构 CSS 变量供 v-bind() 使用
+const { css } = useGCS()
+const { cell8px, cell16px, cell40px, fontSizeTitle, fontSizeBody, fontSizeSmall } = css
+// 收藏走全局 favorites 单例（2026-08-29 与方案解耦）：同用户 itemType+itemId 全局唯一
+const {
+  isFavorite: isFavoriteInStore,
+  addFavorite,
+  removeFavorite,
+  promptLoginForFavorite,
+} = useFavorites()
+const { isAuthenticated } = useAuth()
+
+/** 统一的登录状态判断：使用 isAuthenticated 而非 user.value */
+const isLoggedIn = computed(() => isAuthenticated.value)
+
+/** 收藏对象类型：随面板业务类型（flood → facility） */
+const favoriteItemType = computed<FavoriteItemType>(() =>
+  props.planType === 'flood' ? 'facility' : 'xiaoqu'
+)
+
+/** 当前页码（从1开始） */
+const currentPage = ref(1)
+
+/** 总页数 */
+const totalPages = computed(() => {
+  if (props.pageSize <= 0) return 1
+  return Math.ceil(props.items.length / props.pageSize)
+})
+
+/** 当前页数据 */
+const currentPageItems = computed(() => {
+  if (props.pageSize <= 0) return props.items
+  const start = (currentPage.value - 1) * props.pageSize
+  return props.items.slice(start, start + props.pageSize)
+})
+
+/** 是否有数据 */
+const hasData = computed(() => props.items.length > 0)
+
+/** 是否需要分页控件 */
+const needPagination = computed(() => props.pageSize > 0 && totalPages.value > 1)
+
+/**
+ * 分页按钮配置：四个按钮只有 label 与跳转目标不同，按「左组 / 右组」两组收口。
+ * 组内 disabled 判据是同一个（已在首页 / 已在末页），故配置驱动优于四段重复模板；
+ * 中间的 page-info 把两组隔开，所以是两次 v-for 而不是一次（顺序即渲染顺序）。
+ */
+const prevPageActions = computed(() => [
+  { key: 'first', label: '<<', target: 1 },
+  { key: 'prev', label: '<', target: currentPage.value - 1 },
+])
+const nextPageActions = computed(() => [
+  { key: 'next', label: '>', target: currentPage.value + 1 },
+  { key: 'last', label: '>>', target: totalPages.value },
+])
+
+/** 收藏判定（全局 favorites 单例，itemType 随面板业务类型） */
+function isFav(item: ScoredXiaoqu): boolean {
+  return isFavoriteInStore(favoriteItemType.value, item.id)
+}
+
+/** 列表项转收藏入参（快照带业务字段：选址 score/breakdown；浸没 type/loss） */
+function toFavoriteInput(item: ScoredXiaoqu): FavoriteAddInput {
+  // crs.ts 禁止 (0,0) 哨兵：坐标缺失不落哨兵，由调用方前置校验守卫（toggleFavorite 已校验 Number.isFinite）
+  if (!Number.isFinite(item.lng) || !Number.isFinite(item.lat)) {
+    throw new Error(`收藏失败：小区 ${item.name} 坐标无效`)
+  }
+  return {
+    itemType: favoriteItemType.value,
+    itemId: item.id,
+    name: item.name,
+    lng: item.lng,
+    lat: item.lat,
+    snapshot: {
+      score: item.score ?? 0,
+      breakdown: item.breakdown ?? {},
+      type: item.type ?? null,
+      loss: item.loss ?? null,
+    },
+  }
+}
+
+/** 切换收藏状态：未登录 → 记录收藏意图并引导登录（登录成功后自动补完）；已登录 → 全局收藏增删 */
+async function toggleFavorite(item: ScoredXiaoqu) {
+  if (!Number.isFinite(item.lng) || !Number.isFinite(item.lat)) {
+    showError(new Error('该小区坐标无效，无法收藏'), { fallback: '坐标无效，无法收藏' })
+    return
+  }
+  if (!isLoggedIn.value) {
+    promptLoginForFavorite(toFavoriteInput(item))
+    return
+  }
+
+  const already = isFav(item)
+  try {
+    if (already) {
+      await removeFavorite(favoriteItemType.value, item.id)
+      showToast(`已取消收藏：${item.name}`, 'success')
+    } else {
+      const { existed } = await addFavorite(toFavoriteInput(item))
+      showToast(existed ? '已在收藏中' : `已收藏：${item.name}`, 'success')
+    }
+  } catch (error) {
+    showError(error, {
+      fallback: already ? '取消收藏失败，请稍后重试' : '收藏失败，请稍后重试',
+    })
+    logger.error('[PaginatedListPanel] 收藏操作失败:', error)
+  }
+}
+
+/** 跳转到指定页 */
+function goToPage(page: number) {
+  if (page >= 1 && page <= totalPages.value) {
+    currentPage.value = page
+  }
+}
+
+/** 点击列表项：把规范化副本交给调用方注入的 flyTo（shared 不依赖 core） */
+function handleItemClick(item: ScoredXiaoqu) {
+  logger.debug('[PaginatedListPanel] 点击项:', item)
+  logger.debug('[PaginatedListPanel] breakdown:', item.breakdown)
+
+  // 浅拷贝后透传（2026-10-12 收敛，A2）：原写法先取 `const lng/lat = item.lng/lat`
+  // 再塞回 `{ ...item, lng, lat }`——是 **no-op**：展开本就含这两个字段，
+  // 注释所称「规范化数据对象，确保字段一致性」实际什么都没做。保留浅拷贝本身
+  // （不改身份语义：调用方拿到的是副本而非原件引用）。
+  const normalizedItem = { ...item }
+
+  // 地图交互由业务层注入（shared 不依赖 core）
+  props.flyTo?.(normalizedItem)
+}
+
+/** 监听数据变化，重置到第一页 */
+watch(
+  () => props.items.length,
+  () => {
+    currentPage.value = 1
+  }
+)
+</script>
+
+<template>
+  <div class="paginated-list-panel">
+    <!-- 标题区 -->
+    <div v-if="title" class="panel-header">
+      <div class="header-title">{{ title }}</div>
+    </div>
+
+    <!-- 灰色背景板（包裹列表和分页） -->
+    <div class="gray-container">
+      <!-- 列表内容区 -->
+      <!-- key 固定 item.id：回退 index 会致 Vue diff 复用错位，items 契约恒有 id -->
+      <div v-if="hasData" class="list-content">
+        <div
+          v-for="(item, index) in currentPageItems"
+          :key="item.id"
+          class="list-item"
+          @click="handleItemClick(item)"
+        >
+          <slot name="item" :item="item" :index="index" />
+          <ElButton
+            v-if="showFavorite"
+            class="favorite-btn"
+            :type="isFav(item) ? 'warning' : 'default'"
+            size="small"
+            text
+            @click.stop="toggleFavorite(item)"
+          >
+            {{ isFav(item) ? '★' : '☆' }}
+          </ElButton>
+        </div>
+      </div>
+
+      <!-- 加载进行态（loading 与空态分离，不变量8） -->
+      <div v-else-if="loading" class="no-data-section">
+        <div class="loading-hint">
+          <span class="loading-spinner" aria-hidden="true"></span>
+          <span>计算中…</span>
+        </div>
+      </div>
+
+      <!-- 无数据提示（c057：统一走 EmptyState，含图标/引导文案） -->
+      <div v-else class="no-data-section">
+        <EmptyState :message="emptyText" :hint="emptyHint" icon="📭" />
+      </div>
+
+      <!-- 分页控制区：左右两组同形按钮由配置驱动（见 prevPageActions / nextPageActions） -->
+      <div v-if="needPagination" class="pagination-section">
+        <ElButton
+          v-for="action in prevPageActions"
+          :key="action.key"
+          size="small"
+          :disabled="currentPage === 1"
+          @click="goToPage(action.target)"
+        >
+          {{ action.label }}
+        </ElButton>
+
+        <div class="page-info">
+          <span class="current-page">{{ currentPage }}</span>
+          <span class="page-separator">/</span>
+          <span class="total-pages">{{ totalPages }}</span>
+        </div>
+
+        <ElButton
+          v-for="action in nextPageActions"
+          :key="action.key"
+          size="small"
+          :disabled="currentPage === totalPages"
+          @click="goToPage(action.target)"
+        >
+          {{ action.label }}
+        </ElButton>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.paginated-list-panel {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: var(--GCS-bg-panel-translucent);
+  border-radius: var(--GCS-radius-md);
+  box-sizing: border-box;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: v-bind(cell16px);
+  flex-shrink: 0;
+}
+
+.header-title {
+  font-size: v-bind(fontSizeTitle);
+  font-weight: 600;
+  color: var(--GCS-text-primary);
+}
+
+/* 灰色背景板：距外层panel 0.1cell，距标题 0.1cell */
+.gray-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  margin: 0 v-bind(cell8px) v-bind(cell8px);
+  padding: v-bind(cell8px);
+  background: var(--GCS-bg-container);
+  border-radius: var(--GCS-radius-sm);
+  box-sizing: border-box;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.list-content {
+  display: flex;
+  flex-direction: column;
+  gap: v-bind(cell8px);
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* 单行列表项：不换行 */
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: v-bind(cell8px);
+  padding: v-bind(cell8px) 10px;
+  background: var(--GCS-bg-panel);
+  border-radius: var(--GCS-radius-sm); /* 非档位 4px 归 sm */
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: pointer;
+  transition: background var(--GCS-duration-base);
+}
+
+.list-item:hover {
+  background: var(--GCS-bg-hover);
+}
+
+.no-data-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: v-bind(cell40px) 20px;
+  gap: v-bind(cell8px);
+  flex: 1;
+}
+
+/* 计算中提示（空态与加载态分离） */
+.loading-hint {
+  display: flex;
+  align-items: center;
+  gap: v-bind(cell8px);
+  font-size: v-bind(fontSizeBody);
+  color: var(--GCS-text-secondary);
+}
+
+.loading-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--GCS-color-primary);
+  border-top-color: transparent;
+  border-radius: var(--GCS-radius-round);
+  animation: gcs-spin 0.8s linear infinite;
+}
+
+@keyframes gcs-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pagination-section {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: v-bind(cell8px);
+  flex-shrink: 0;
+}
+
+.page-info {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: v-bind(fontSizeBody);
+  color: var(--GCS-text-primary);
+  min-width: 60px;
+  justify-content: center;
+}
+
+.current-page {
+  font-weight: 600;
+  color: var(--GCS-color-primary);
+}
+
+.page-separator {
+  color: var(--GCS-text-muted);
+}
+
+.total-pages {
+  color: var(--GCS-text-secondary);
+}
+
+.pagination-section .el-button {
+  min-width: 40px;
+  font-size: v-bind(fontSizeSmall);
+}
+
+.favorite-btn {
+  flex-shrink: 0;
+  padding: 0 4px;
+  min-width: auto;
+}
+</style>

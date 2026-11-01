@@ -1,0 +1,770 @@
+// UnifiedMap 组件挂载集成回归测试（地图渲染链路）
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import type { Point } from 'geojson'
+import { createPinia, setActivePinia } from 'pinia'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { BusinessLayerManager } from '@/core/map/BusinessLayerManager'
+import { BUSINESS_LAYER_MANAGER_KEY } from '@/core/map/composables/useBusinessLayers'
+import { buildPortGeoJson, loadPorts, PORT_STYLE } from '@/core/map/composables/usePortLayer'
+import { createRenderer } from '@/core/map/renderers'
+import { useMapStore } from '@/stores'
+import type { Port } from '@/types'
+
+import UnifiedMap from '../UnifiedMap.vue'
+
+// vi.mock 在运行时将 createRenderer 替换为 mock，但 TS 仍按真实模块推断类型，
+// 这里用 vi.mocked 放宽为 MockedFunction 以便访问 .mock / .mockImplementation API。
+const mockedCreateRenderer = vi.mocked(createRenderer)
+
+// jsdom 容器默认尺寸为 0，mock offsetWidth/Height 避免 waitForContainerVisible 超时
+const origOffsetWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth')
+const origOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight')
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+    configurable: true,
+    get: () => 800,
+  })
+  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+    configurable: true,
+    get: () => 600,
+  })
+})
+afterAll(() => {
+  if (origOffsetWidth) Object.defineProperty(HTMLElement.prototype, 'offsetWidth', origOffsetWidth)
+  if (origOffsetHeight)
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', origOffsetHeight)
+})
+
+vi.mock('@/core/map/composables/usePortLayer', () => ({
+  loadPorts: vi
+    .fn()
+    .mockResolvedValue([{ id: 1, name: 'test-port', lng: 108.1, lat: 21.5, type: 'container' }]),
+  buildPortGeoJson: (ports: Port[]) => ({
+    type: 'FeatureCollection',
+    features: ports.map((port: Port) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [port.lng, port.lat] },
+      properties: { ...port, featureType: 'port' },
+    })),
+  }),
+  PORT_STYLE: { size: 12, color: '#409eff', labelField: 'name', featureType: 'port' },
+}))
+
+vi.mock('@/core/map/composables/useBoundaryLayer', () => ({
+  loadBoundaryGeoJson: vi.fn().mockResolvedValue({
+    type: 'FeatureCollection',
+    features: [],
+  }),
+  BOUNDARY_STYLE: {
+    strokeColor: '#4dabf7',
+    strokeWidth: 2,
+    fillColor: 'rgba(77,171,247,0.15)',
+    featureType: 'boundary',
+  },
+}))
+
+vi.mock('@/core/map/renderers', () => {
+  const createMockRenderer = (type: string) => ({
+    _layers: new Map(),
+    on: vi.fn(),
+    off: vi.fn(),
+    emit: vi.fn(),
+    addPointLayer: vi.fn(),
+    addGeoJsonLayer: vi.fn(),
+    setVisibility: vi.fn(),
+    setBaseLayer: vi.fn(),
+    exportState: vi.fn().mockReturnValue({}),
+    importState: vi.fn(),
+    destroy: vi.fn(),
+    updateSize: vi.fn(),
+    getMap: vi.fn().mockReturnValue({}),
+    getViewer: vi.fn().mockReturnValue({}),
+    getType: vi.fn().mockReturnValue(type === '2d' ? '2d' : '3d'),
+    setBubbleAnchor: vi.fn(),
+    startBreathing: vi.fn(),
+    stopBreathing: vi.fn(),
+  })
+
+  const createRenderer = vi.fn((type) => createMockRenderer(type))
+
+  return { createRenderer }
+})
+
+function makeMountOptions(store: ReturnType<typeof useMapStore>) {
+  // 提供 BusinessLayerManager 实例（boundary/ports 收口到 BLM）
+  const businessLayerManager = new BusinessLayerManager(store)
+  return {
+    global: {
+      provide: {
+        mapStore: store,
+        [BUSINESS_LAYER_MANAGER_KEY]: businessLayerManager,
+      },
+    },
+    attachTo: document.body!,
+  }
+}
+
+describe('UnifiedMap Integration Tests', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let pinia: ReturnType<typeof createPinia>
+  let mapStore: ReturnType<typeof useMapStore>
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    mapStore = useMapStore()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  it('should initialize Renderer correctly when mounted', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(createRenderer).toHaveBeenCalledWith('2d', expect.any(HTMLElement))
+  })
+
+  it('should load port data and add point layer', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(createRenderer).toHaveBeenCalled()
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    expect(renderer.addPointLayer).toHaveBeenCalledWith(
+      'ports',
+      expect.any(Array),
+      expect.objectContaining({ size: 12, color: '#409eff' })
+    )
+
+    const portData = renderer.addPointLayer.mock.calls[0][1]
+    expect(portData[0].name).toBe('test-port')
+    expect(portData[0].lng).toBe(108.1)
+    expect(portData[0].lat).toBe(21.5)
+  })
+
+  it('should switch between 2d and 3d correctly', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    await wrapper.setProps({ mapType: '3d' })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const renderer3d = mockedCreateRenderer.mock.results[1].value
+    expect(renderer3d).toBeDefined()
+    expect(createRenderer).toHaveBeenCalledWith('3d', expect.any(HTMLElement))
+  })
+
+  it('should register click handler on renderer（组件不再向上 emit click）', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // click 只在组件内部驱动气泡，向上 emit 全仓零监听已删；
+    // 本判据保留「渲染器 click 已接线」，不再断言 emitted('click')。
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+
+    expect(clickHandler).toBeDefined()
+  })
+})
+
+describe('Composable + Renderer Integration', () => {
+  it('buildPortGeoJson should produce valid GeoJSON', () => {
+    const ports = [
+      { id: 1, name: 'port1', lng: 108.1, lat: 21.5, type: 'container' },
+      { id: 2, name: 'port2', lng: 108.2, lat: 21.6, type: 'bulk' },
+    ]
+
+    const geojson = buildPortGeoJson(ports as unknown as Port[])
+
+    expect(geojson.type).toBe('FeatureCollection')
+    expect(geojson.features.length).toBe(2)
+    expect(geojson.features[0].geometry.type).toBe('Point')
+    expect((geojson.features[0].geometry as Point).coordinates).toEqual([108.1, 21.5])
+    expect(geojson.features[0].properties!.featureType).toBe('port')
+  })
+
+  it('PORT_STYLE should have required properties', () => {
+    expect(PORT_STYLE).toHaveProperty('size')
+    expect(PORT_STYLE).toHaveProperty('color')
+    expect(PORT_STYLE).toHaveProperty('labelField')
+    expect(PORT_STYLE).toHaveProperty('featureType')
+  })
+})
+
+describe('UnifiedMap Click Interaction Tests', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let mapStore: ReturnType<typeof useMapStore>
+  let pinia: ReturnType<typeof createPinia>
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    vi.clearAllMocks()
+    mapStore = useMapStore()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  it('should show pinned bubble with close button when clicking a port feature', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+
+    await wrapper.vm.$nextTick()
+
+    // 点击 → 钉住气泡：渲染港口信息 + 关闭按钮（随 POI 跟随由 OL Overlay 承担，此处验证状态）
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+    expect(wrapper.find('.map-feature-bubble').text()).toContain('test-port')
+    expect(wrapper.find('.bubble-close').exists()).toBe(true)
+  })
+
+  it('should close bubble when clicking the same port again or blank area', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+    const portEvent = {
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    }
+
+    // 点击 → 钉住；同 POI 再点 → 撤销
+    clickHandler(portEvent)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+
+    clickHandler(portEvent)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+
+    // 再次钉住后点击空白 → 关闭
+    clickHandler(portEvent)
+    await wrapper.vm.$nextTick()
+    clickHandler({ detail: { featureType: null, data: null, coordinate: [108.1, 21.5] } })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+  })
+
+  it('should switch bubble to another port on click and keep pinned bubble on hover', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+    const hoverHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'hover')?.[1]
+
+    // 钉住港口 1
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').text()).toContain('test-port')
+
+    // 钉住时悬浮其他港口 → 不打扰当前气泡
+    hoverHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '2', name: 'hover-port', lng: 108.2, lat: 21.6 },
+        coordinate: [108.2, 21.6],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').text()).toContain('test-port')
+
+    // 点击另一港口 → 气泡切换（一次仅一个）
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '3', name: 'other-port', lng: 108.3, lat: 21.7 },
+        coordinate: [108.3, 21.7],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').text()).toContain('other-port')
+  })
+
+  it('should pin facility bubble on click, close on same-point click and on blank', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+    const facilityEvent = {
+      detail: {
+        featureType: 'site-nearby-facility',
+        data: { id: 'p1', name: '市人民医院', poiType: 'hospital', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    }
+
+    // 点击设施 → 设施气泡（名字只走气泡，不常显）
+    clickHandler(facilityEvent)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(true)
+    expect(wrapper.find('.map-facility-bubble').text()).toContain('市人民医院')
+    expect(wrapper.find('.map-facility-bubble').text()).toContain('医院')
+
+    // 同点再点 → 关闭
+    clickHandler(facilityEvent)
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(false)
+
+    // 再次钉住后点空白 → 关闭
+    clickHandler(facilityEvent)
+    await wrapper.vm.$nextTick()
+    clickHandler({ detail: { featureType: null, data: null, coordinate: [108.1, 21.5] } })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(false)
+  })
+
+  it('should keep exactly one bubble when port and facility clicks interleave', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+    const hoverHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'hover')?.[1]
+
+    // 钉住设施气泡
+    clickHandler({
+      detail: {
+        featureType: 'site-nearby-facility',
+        data: { id: 'p1', name: '市人民医院', poiType: 'hospital', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(true)
+
+    // 设施气泡钉住时悬浮港口 → 不打扰（设施气泡无 hover 通道，也不被 hover 抢占）
+    hoverHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '9', name: 'hover-port', lng: 108.2, lat: 21.6 },
+        coordinate: [108.2, 21.6],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(true)
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+
+    // 点击港口 → 气泡切换为港口（全局唯一气泡）
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.3, lat: 21.7 },
+        coordinate: [108.3, 21.7],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(false)
+  })
+
+  it('should show hover bubble without close button and hide on hover-out', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const hoverHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'hover')?.[1]
+
+    // 悬浮命中 → 气泡出现，无关闭按钮（悬浮态）
+    hoverHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '2', name: 'hover-port', lng: 108.2, lat: 21.6 },
+        coordinate: [108.2, 21.6],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+    expect(wrapper.find('.map-feature-bubble').text()).toContain('hover-port')
+    expect(wrapper.find('.bubble-close').exists()).toBe(false)
+
+    // 移开/未命中 → 消失
+    hoverHandler({ detail: { featureType: null, data: null, coordinate: null } })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+  })
+
+  it('🔴 指针移出地图容器：清未钉住的悬浮气泡并解锚（无 pointerleave 绑定即红）', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const hoverHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'hover')?.[1]
+
+    hoverHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '2', name: 'hover-port', lng: 108.2, lat: 21.6 },
+        coordinate: [108.2, 21.6],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+
+    // 指针直接移出容器（OL 不再派发 pointermove）⇒ 悬浮气泡必须收
+    await wrapper.find('.unified-map-wrapper').trigger('pointerleave')
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+    expect(renderer.setBubbleAnchor).toHaveBeenLastCalledWith(null)
+  })
+
+  it('指针移出地图容器：已钉住的港口/设施气泡保留（离开 ≠ 关闭钉住）', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    await wrapper.find('.unified-map-wrapper').trigger('pointerleave')
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(true)
+    expect(wrapper.find('.bubble-close').exists()).toBe(true)
+
+    // 设施气泡同属「钉住」通道，同样不随指针离开关闭
+    clickHandler({
+      detail: {
+        featureType: 'site-nearby-facility',
+        data: { id: 'p1', name: '市人民医院', poiType: 'hospital', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+    await wrapper.vm.$nextTick()
+    await wrapper.find('.unified-map-wrapper').trigger('pointerleave')
+    expect(wrapper.find('.map-facility-bubble').exists()).toBe(true)
+  })
+
+  it('should not show bubble on 3d clicks (bubble is 2d-only capability)', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '3d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer = mockedCreateRenderer.mock.results[0].value
+    const clickHandler = renderer.on.mock.calls.find((c: unknown[]) => c[0] === 'click')?.[1]
+
+    clickHandler({
+      detail: {
+        featureType: 'port',
+        data: { id: '1', name: 'test-port', lng: 108.1, lat: 21.5 },
+        coordinate: [108.1, 21.5],
+      },
+    })
+
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.map-feature-bubble').exists()).toBe(false)
+  })
+})
+
+describe('UnifiedMap Layer State Persistence', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let pinia: ReturnType<typeof createPinia>
+  let mapStore: ReturnType<typeof useMapStore>
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    mapStore = useMapStore()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  it('should export and import layer visibility state during switch', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const renderer2d = mockedCreateRenderer.mock.results[0].value
+    renderer2d.exportState.mockReturnValue({
+      ports: { visible: false },
+      boundary: { visible: true },
+    })
+
+    await wrapper.setProps({ mapType: '3d' })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const renderer3d = mockedCreateRenderer.mock.results[1].value
+    expect(renderer3d.importState).toHaveBeenCalledWith({
+      ports: { visible: false },
+      boundary: { visible: true },
+    })
+  })
+})
+
+describe('UnifiedMap Error Handling', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let pinia: ReturnType<typeof createPinia>
+  let mapStore: ReturnType<typeof useMapStore>
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    mapStore = useMapStore()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  it('should surface renderer init failure in loadError tip（组件不再向上 emit error）', async () => {
+    // 用 Once 而非 mockImplementation：后者会永久改写实现，污染本文件后续所有
+    // 用例的渲染器（测试间无恢复点时表现为 createRenderer 恒抛错、getRenderer() 恒 null）
+    mockedCreateRenderer.mockImplementationOnce(() => {
+      throw new Error('Renderer init failed')
+    })
+
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // error 通道零监听已删；失败必须仍落到用户可见的错误提示（loadError → .map-error）
+    expect(wrapper.find('.map-error').text()).toContain('Renderer init failed')
+  })
+})
+
+describe('UnifiedMap 呼吸灯透传（设施 POI 多点 + 自定义色）', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let mapStore: ReturnType<typeof useMapStore>
+  let pinia: ReturnType<typeof createPinia>
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    vi.clearAllMocks()
+    mapStore = useMapStore()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  /** 挂载并等待渲染器就绪，返回 mock renderer */
+  async function mountAndGetRenderer() {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // 取组件实际持有的渲染器（比 mock.results 更贴近真实调用路径）
+    const renderer = wrapper.vm.getRenderer() as unknown as Record<string, unknown>
+    return renderer as unknown as {
+      startBreathing: ReturnType<typeof vi.fn>
+      stopBreathing: ReturnType<typeof vi.fn>
+    }
+  }
+
+  it('多点 + 设施色应原样透传给渲染器（设施 POI 图层按类型唤醒）', async () => {
+    const renderer = await mountAndGetRenderer()
+    const points = [
+      { lng: 108.6, lat: 21.85 },
+      { lng: 108.7, lat: 21.9 },
+      { lng: 108.8, lat: 21.95 },
+    ]
+
+    wrapper.vm.startBreathing(points, '#eb2f96')
+
+    expect(renderer.startBreathing).toHaveBeenCalledWith(points, '#eb2f96')
+  })
+
+  it('单点且不传色应向后兼容（小区定位沿用渲染器默认色）', async () => {
+    const renderer = await mountAndGetRenderer()
+    const point = { lng: 108.6, lat: 21.85 }
+
+    wrapper.vm.startBreathing(point)
+
+    expect(renderer.startBreathing).toHaveBeenCalledWith(point, undefined)
+  })
+
+  it('stopBreathing 应到达渲染器（撤图层时停掉 rAF，防泄漏）', async () => {
+    const renderer = await mountAndGetRenderer()
+
+    wrapper.vm.startBreathing([{ lng: 108.6, lat: 21.85 }], '#e74c3c')
+    wrapper.vm.stopBreathing()
+
+    expect(renderer.stopBreathing).toHaveBeenCalled()
+  })
+})
+
+describe('UnifiedMap 港口空数据提示（W01，2026-10-20）', () => {
+  let wrapper: VueWrapper<InstanceType<typeof UnifiedMap>>
+  let pinia: ReturnType<typeof createPinia>
+  let mapStore: ReturnType<typeof useMapStore>
+  const mockedLoadPorts = vi.mocked(loadPorts)
+
+  beforeEach(() => {
+    pinia = createPinia()
+    setActivePinia(pinia)
+    mapStore = useMapStore()
+    vi.clearAllMocks()
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+  })
+
+  // 失效场景：接口 fulfilled 但返回 0 条港口时，港口图层不注册（:343 validFeatures
+  // 为空），此前面板无任何提示——用户只看到「港口开关在、图上没点」，无法区分
+  // 「没数据」与「坏了」。
+  it('@guard-red-sample 港口返回空数组 ⇒ 显示空数据提示，且不建图层', async () => {
+    mockedLoadPorts.mockResolvedValueOnce([])
+
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const warning = wrapper.find('.port-empty-warning')
+    expect(warning.exists()).toBe(true)
+    expect(warning.text()).toContain('港口数据为空')
+
+    const renderer = mockedCreateRenderer.mock.results[0]?.value
+    expect(renderer?.addPointLayer).not.toHaveBeenCalledWith(
+      'ports',
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  // 阳性对照：有数据时不出现空态提示（否则提示恒显，用户被误导）
+  it('阳性对照：有港口数据 ⇒ 无空数据提示', async () => {
+    wrapper = mount(UnifiedMap, {
+      props: { mapType: '2d' },
+      ...makeMountOptions(mapStore),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await flushPromises()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(wrapper.find('.port-empty-warning').exists()).toBe(false)
+  })
+})

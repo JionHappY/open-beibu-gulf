@@ -1,0 +1,109 @@
+import { createPinia, setActivePinia } from 'pinia'
+import { beforeEach, describe, expect, it } from 'vitest'
+
+import type { FloodFeature, FloodStatistics } from '@/types'
+
+import { useFloodStore } from '../floodStore'
+
+/**
+ * useFloodStore 单测
+ * 覆盖工厂化（Setup Store）后的核心 API：
+ * - 初始状态
+ * - startFloodAnalysis
+ * - saveState / consumeState（跨页面持久化快照）
+ * - clearState
+ * 经核对：本测试断言与真实 store 实现（frontend/src/stores/floodStore.ts）一致。
+ */
+describe('useFloodStore', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+  })
+
+  describe('初始状态', () => {
+    it('应为无分析数据', () => {
+      const store = useFloodStore()
+      expect(store.floodStatistics).toBeNull()
+      expect(store.hasAnalysisData).toBe(false)
+      expect(store.hasPersistedState).toBe(false)
+    })
+  })
+
+  describe('startFloodAnalysis', () => {
+    it('应正确设置分析数据', () => {
+      const store = useFloodStore()
+      const stats: FloodStatistics = { riskLevel: '低', affectedFacilityCount: 5 }
+      const features: FloodFeature[] = []
+
+      store.startFloodAnalysis(stats, features, '低')
+
+      expect(store.floodStatistics).toEqual(stats)
+      expect(store.hasAnalysisData).toBe(true)
+    })
+  })
+
+  describe('saveState / consumeState', () => {
+    it('应正确保存和恢复状态', () => {
+      const store = useFloodStore()
+      const stats: FloodStatistics = { riskLevel: '中', affectedFacilityCount: 10 }
+
+      store.saveState({
+        waterLevel: 5,
+        floodStatistics: stats,
+        floodFeatures: [],
+        floodRiskLevel: '中',
+        affectedFacilities: [],
+        totalLoss: 100,
+      })
+
+      expect(store.hasPersistedState).toBe(true)
+
+      const consumed = store.consumeState()
+      expect(consumed).not.toBeNull()
+      expect(consumed!.waterLevel).toBe(5)
+      expect(consumed!.totalLoss).toBe(100)
+
+      // consume 后标志应清除
+      expect(store.hasPersistedState).toBe(false)
+      // 再次 consume 应返回 null
+      expect(store.consumeState()).toBeNull()
+    })
+  })
+
+  describe('clearState', () => {
+    it('应彻底重置所有状态', () => {
+      const store = useFloodStore()
+      store.startFloodAnalysis({ riskLevel: '低', affectedFacilityCount: 1 }, [], '低')
+      store.saveState({
+        waterLevel: 3,
+        floodStatistics: null,
+        floodFeatures: [],
+        floodRiskLevel: '低',
+        affectedFacilities: [],
+        totalLoss: 0,
+      })
+
+      store.clearState()
+
+      expect(store.floodStatistics).toBeNull()
+      expect(store.hasPersistedState).toBe(false)
+    })
+  })
+
+  describe('resetSubStates（resetWaterLevel / resetPortImpact 内联后行为不变）', () => {
+    it('清空水位与港口影响，但保留分析数据', () => {
+      const store = useFloodStore()
+      store.startFloodAnalysis({ riskLevel: '低', affectedFacilityCount: 2 }, [], '中')
+      store.setWaterLevel(4.5)
+      store.setPortImpactResult([{ lng: 1, lat: 2, type: 'port', name: 'x' }] as never, 123)
+
+      store.resetSubStates()
+
+      expect(store.waterLevel).toBe(0)
+      expect(store.affectedFacilities).toEqual([])
+      expect(store.totalLoss).toBe(0)
+      // 分析数据不受影响（跨页面保留）
+      expect(store.floodStatistics).not.toBeNull()
+      expect(store.floodRiskLevel).toBe('中')
+    })
+  })
+})

@@ -1,0 +1,274 @@
+<script setup lang="ts">
+/**
+ * AppLayout - GCS（网格化布局系统）V2 布局基座
+ * 用 PPS（面板定位系统）直接定位所有 Panel（无容器/Zone/TopArea），slot（Vue 插槽）供业务页注入面板内容。
+ * 底部 nav 3 按钮（首页/个人中心/菜单），业务入口与城市切换在抽屉菜单中；
+ * 抽屉模式（<960px）下抽屉同时承载业务面板（slot left/right）。
+ */
+
+import { computed, defineAsyncComponent, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+import { MAP_CONFIG } from '@/core/config/map'
+import { useMapControls } from '@/core/map/composables/useMapControls'
+import LayerControlPanel from '@/core/map/components/LayerControlPanel.vue'
+import { PanelTitle, useGCS, useTheme } from '@/shared'
+
+import BottomNavBar from './components/BottomNavBar.vue'
+import GCSPanel from './components/GCSPanel.vue'
+import MobileDrawer from './components/MobileDrawer.vue'
+import NavButton from './components/NavButton.vue'
+import { type NavItem, navItems } from './navConfig'
+import { useMobileDrawer } from './useMobileDrawer'
+import { useSliderFocus } from './useSliderFocus'
+
+const route = useRoute()
+const router = useRouter()
+const { showPanels, showTopArea } = useGCS()
+const { flyTo } = useMapControls()
+// 城市切换（必要性审判波次二·单元 F）：原 useScreenActions 只是 flyTo 的同义转发层，
+// 就地按 MAP_CONFIG.CITY_CENTERS（单一权威源）取坐标，不新增第二份城市表。
+function flyToCity(city: string): void {
+  const target = MAP_CONFIG.CITY_CENTERS[city]
+  if (!target) return
+  flyTo({ lng: target.lng, lat: target.lat }, { height: target.height, zoom: target.zoom })
+}
+// 主题切换：图标显示当前模式的另一侧（暗色显示 ☀️、亮色显示 🌙）
+const { isDark, toggleTheme } = useTheme()
+// 抽屉开关（模块级单例，nav 菜单按钮与抽屉共享）
+const { drawerOpen, closeDrawer } = useMobileDrawer()
+// 滑块专注模式（模块级单例，滑块组件调用 begin/end）
+const { active: sliderFocusActive, activePanel: sliderActivePanel } = useSliderFocus()
+
+// 抽屉业务行：取 navConfig 中 type=business 的项（core 不引 business，由 App.vue 注入）
+const businessNavItems = computed<NavItem[]>(() => [
+  ...navItems.value.filter((i) => i.type === 'business'),
+])
+
+// 雷达图依赖 ECharts；保持动态加载，避免布局基座把它并进首屏入口图。
+const GlobalRadarPanel = defineAsyncComponent(() => import('./components/GlobalRadarPanel.vue'))
+
+// 专注模式 class 挂 body 而非根节点：抽屉 Teleport 到 body，根节点选择器匹配不到抽屉内面板。
+// body 加 slider-focus-mode（CSS 透明化其他面板），滑块所在面板标记 slider-focus-panel，底部 nav 排除。
+watch(sliderFocusActive, (act) => {
+  document.body.classList.toggle('slider-focus-mode', act)
+  document.querySelectorAll('.GCS-panel').forEach((p) => {
+    p.classList.toggle('slider-focus-panel', act && p === sliderActivePanel.value)
+  })
+})
+
+// 专注态激活期间切路由 ⇒ 旧页 AppLayout 卸载，而 useSliderFocus 的
+// onScopeDispose(endSliderFocus) 与本 watch 的效果在同一批 scope.stop() 里停掉，
+// 排队的 pre-flush 回调被丢弃（真 vue 3.5.41 实测 after stop: class 仍在）⇒
+// body class 永久残留，style.css:350 令全站面板 opacity:0 但仍吃指针事件。
+// 本组件是 body class 的唯一写方，卸载时必须显式摘除（含面板标记）。
+onUnmounted(() => {
+  document.body.classList.remove('slider-focus-mode')
+  document.querySelectorAll('.GCS-panel.slider-focus-panel').forEach((p) => {
+    p.classList.remove('slider-focus-panel')
+  })
+})
+
+function isActive(path: string): boolean {
+  return route.path === path
+}
+
+/** 跳转业务模块并关闭抽屉（navConfig 注入项） */
+function goBusiness(item: NavItem): void {
+  if (item.disabled || !item.path) return
+  void router.push(item.path)
+  closeDrawer()
+}
+</script>
+
+<template>
+  <div class="app-layout">
+    <!-- ===== 桌面端：绝对定位 PPS 面板（≥960px） ===== -->
+    <template v-if="showPanels">
+      <!-- Title Panel（4×1，左上，第一行） -->
+      <GCSPanel
+        v-show="showTopArea"
+        :w="4"
+        :h="1"
+        anchor="top-left"
+        :offset-x="0"
+        :offset-y="0"
+        class="title-panel"
+      >
+        <PanelTitle :title="(route.meta?.title as string) || '北部湾智慧港口平台'" />
+      </GCSPanel>
+
+      <!-- 顶部城市切换按钮组（4×1 右上，档位 1 原位显示；<960px 时在抽屉菜单内） -->
+      <GCSPanel
+        v-show="showTopArea"
+        :w="4"
+        :h="1"
+        anchor="top-right"
+        :offset-x="0"
+        :offset-y="0"
+        class="top-button-panel"
+      >
+        <div class="top-button-inner">
+          <!-- 城市列表由 MAP_CONFIG.CITY_CENTERS 驱动（勿手写城市名双轨） -->
+          <NavButton
+            v-for="city in Object.keys(MAP_CONFIG.CITY_CENTERS)"
+            :key="city"
+            :label="city"
+            @click="flyToCity(city)"
+          />
+          <!-- 主题切换（🌙/☀️） -->
+          <NavButton
+            :icon="isDark ? '☀️' : '🌙'"
+            class="theme-toggle"
+            aria-label="切换主题"
+            @click="toggleTheme"
+          />
+        </div>
+      </GCSPanel>
+
+      <!-- 左侧 Panel 组：由业务页通过 #left slot 注入 -->
+      <slot name="left" />
+
+      <!-- 右侧 Panel 组 -->
+      <div v-show="showPanels">
+        <slot name="right">
+          <!-- 右上：雷达图 4×4（与选址分析同源：分析结果第一名，未分析时快照兜底） -->
+          <GlobalRadarPanel />
+          <!-- 右下：图层控制 4×4 -->
+          <GCSPanel :w="4" :h="4" anchor="top-right" :offset-x="0" :offset-y="5.5">
+            <LayerControlPanel />
+          </GCSPanel>
+        </slot>
+      </div>
+    </template>
+
+    <!-- ===== 抽屉菜单（抽屉模式 <960px） =====
+         业务入口（sticky 冻结首行）+ 城市切换 + 业务面板；档位 1 时菜单键不存在 -->
+    <MobileDrawer :open="drawerOpen" @close="closeDrawer">
+      <div class="drawer-menu">
+        <!-- 业务入口行：滚动时冻结（sticky） -->
+        <div class="drawer-menu__row drawer-menu__row--sticky" aria-label="业务功能">
+          <NavButton
+            v-for="m in businessNavItems"
+            :key="m.label"
+            :label="m.label"
+            :icon="m.icon"
+            :disabled="m.disabled"
+            :active="isActive(m.path)"
+            @click="goBusiness(m)"
+          />
+        </div>
+        <!-- 城市切换 + 主题切换行 -->
+        <div class="drawer-menu__row" aria-label="城市切换">
+          <!-- 同上：CITY_CENTERS 驱动（z154②） -->
+          <NavButton
+            v-for="city in Object.keys(MAP_CONFIG.CITY_CENTERS)"
+            :key="city"
+            :label="city"
+            @click="flyToCity(city)"
+          />
+          <NavButton
+            :icon="isDark ? '☀️' : '🌙'"
+            class="theme-toggle"
+            aria-label="切换主题"
+            @click="toggleTheme"
+          />
+        </div>
+        <!-- 抽屉面板内容：只放功能面板；首页→图层控制，个人中心→right slot，业务页→left/right slot -->
+        <template v-if="!showPanels">
+          <template v-if="route.name === 'Home'">
+            <GCSPanel :w="4" :h="4"><LayerControlPanel /></GCSPanel>
+            <!-- 桌面左侧的两张概览图在窄屏原本完全不可达（Home 分支只注入图层控制）；
+                 补 #left 后抽屉内可滚动查看，数据与桌面同源。 -->
+            <slot name="left" />
+          </template>
+          <template v-else-if="route.name === 'Profile'">
+            <slot name="right" />
+          </template>
+          <template v-else>
+            <!-- 操作/控制面板（right slot）在前，可视化面板（left slot）在后：避免首屏全是空白图表 -->
+            <slot name="right" />
+            <slot name="left" />
+          </template>
+        </template>
+      </div>
+    </MobileDrawer>
+
+    <!-- 底部导航（3 按钮：首页/个人中心/菜单） -->
+    <BottomNavBar />
+  </div>
+</template>
+
+<style scoped>
+.app-layout {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: var(--GCS-z-layout); /* 壳层档（原散落 50） */
+}
+
+/* 所有 Panel 子元素恢复 pointer-events */
+.app-layout > * {
+  pointer-events: auto;
+}
+
+/* Title Panel 容器样式 */
+.title-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 顶部城市切换按钮组内部样式 */
+.top-button-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.top-button-inner {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  box-sizing: border-box;
+}
+
+/* ===== 抽屉菜单 ===== */
+.drawer-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.drawer-menu__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  padding: 8px 0;
+}
+
+/* 业务入口行冻结：抽屉 body 滚动时保持可见（sticky 相对 .GCS-drawer__body） */
+.drawer-menu__row--sticky {
+  position: sticky;
+  top: 0;
+
+  /* 局部层叠上下文（抽屉 body 内），不参与全局 --GCS-z-* 刻度 */
+  z-index: 5;
+  background: var(--GCS-bg-panel);
+  border-bottom: 1px solid var(--GCS-border-light);
+
+  /* 5 个业务入口默认在 294px 抽屉里排成 4+1（第 5 项单吊一行）观感失衡；
+     限宽到 200px 后稳定 3+2 两行居中，行高不变。 */
+  max-width: 200px;
+  margin-inline: auto;
+}
+
+/* 主题切换按钮 emoji 放大（默认偏小，仅作用于 .theme-toggle） */
+:deep(.theme-toggle .button-icon) {
+  font-size: 1.6em;
+  margin-top: 0;
+}
+</style>

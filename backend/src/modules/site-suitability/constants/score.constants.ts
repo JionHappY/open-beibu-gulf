@@ -1,0 +1,112 @@
+// 选址适宜性评分归一化口径——**定稿**（2026-09-30 用户认可，与 AHP 矩阵同批）。
+// 评分语义：全部为 [0,1] 的**适宜度**（越大越适宜），浸没风险取其补（安全余量）。
+//
+// 依据分级纪律（论文口径）：〔硬锚〕= 有文献/规范原文直接支撑；
+// 〔语境化〕= 文献锚 + 北部湾语境调整（调整理由成文）；〔作者设定〕= 无硬文献，
+// 如实标注 + 论文附敏感性分析。不冒充——没有依据的阈值不说自己有。
+
+/** ── 土地覆盖类 → 适宜度（WorldCover PUM 类码）────────────────────────────
+ * 〔硬锚·两端〕刘梦霞（2021）现状用地分级：建设用地五级（最优）→ 草地 → 耕地 →
+ * 林地 → 水域/未利用地一级（最差）——"建设用地最优、水域最差"两端直接引用。
+ * 〔语境化·中段〕北京城市语境草地(4级)＞耕地(3级)；本选址为**临港产业用地**语境：
+ * 北部湾沿海耕地转用受占补平衡制度约束（政策成本），裸地/草地转用成本最低——
+ * 耕地与草地在临港口径下反转，且裸地升为次优。此调整为作者判断，论文附说明。
+ * 湿地/红树林低分另有生态红线依据（红树林为保护地，项目库内有 mangroves 表）。 */
+/**
+ * 评分维度键（顺序与 `SITE_CRITERIA` 的五个准则一一对应：浸没风险/高程地形/土地适宜/交通可达/需求引力）。
+ *
+ * 2026-10-13 收口（B3）：此前 `dto/site-suitability.dto.ts` 与 `services/scoring.ts`
+ * **各手抄一份逐字相同**的清单 ⇒ 同一事实两份，增删维度必漏一处（且两处失配的表现是
+ * 「DTO 收了、评分不认」或反之，静默）。现收为模块内单一来源，两处 import。
+ * 注意与 `SITE_CRITERIA`（中文标签）是**平行关系**而非派生关系——两者的顺序必须手工对齐。
+ */
+export const WEIGHT_KEYS = ['inundation', 'terrain', 'land', 'access', 'demand'] as const
+
+export const LAND_CLASS_SCORE: Readonly<Record<number, number>> = {
+  50: 1.0, // 人造地表（≈刘文"建设用地"五级，硬锚）
+  60: 0.85, // 裸地（转用成本最低，语境化次优）
+  30: 0.6, // 草地（刘文四级，语境化保留高序位）
+  20: 0.55, // 灌木（刘文未单列，介于草地与林地之间，作者插值）
+  40: 0.5, // 耕地（刘文三级；临港语境下调——占补平衡约束，语境化反转）
+  10: 0.35, // 乔木林（刘文二级）
+  70: 0.2, // 冰雪（本地不出现，占位）
+  100: 0.2, // 苔藓（同上）
+  90: 0.15, // 湿地（刘文一级侧；生态约束）
+  95: 0.1, // 红树林（保护地，严于湿地——作者设定，项目 mangroves 表佐证其存在）
+  80: 0.0, // 水体（刘文一级，硬锚）
+}
+
+/**
+ * ── 浸没安全适宜度 ← mean_elev（EGM96 正高，与 flood_levels 档位同基准）──
+ * 〔作者设定，无硬文献〕阈值 1m/6m：北部湾沿海 0~6m 带直接暴露于台风风暴潮增水，
+ * 本系统淹没档位体系（flood_levels 0~25m、251 档、0.1m 步长）即为此而建——阈值
+ * 取档位体系内的工程判断：<1m 滩涂/高潮位即淹（0.05）；1~6m 线性升至 1.0；
+ * >6m 远超历史增水量级（1.0）。论文附敏感性分析（1m/6m 各 ±50% 扰动）。
+ */
+/** 阈值集（敏感性分析的可扰动参数；默认值=定稿值，见上方各级注释） */
+export interface ScoreThresholds {
+  inundLowM: number
+  inundHighM: number
+  slopeBestDeg: number
+  slopeWorstDeg: number
+  portScaleM: number
+  roadScaleM: number
+}
+
+export const DEFAULT_THRESHOLDS: ScoreThresholds = {
+  inundLowM: 1,
+  inundHighM: 6,
+  slopeBestDeg: 5,
+  slopeWorstDeg: 20,
+  portScaleM: 8000,
+  roadScaleM: 2000,
+}
+
+export function inundationScore(
+  meanElevM: number,
+  t: ScoreThresholds = DEFAULT_THRESHOLDS
+): number {
+  if (meanElevM <= t.inundLowM) return 0.05
+  if (meanElevM >= t.inundHighM) return 1
+  return 0.05 + ((meanElevM - t.inundLowM) / (t.inundHighM - t.inundLowM)) * 0.95
+}
+
+/**
+ * ── 地形施工适宜度 ← mean_slope（度）──
+ * 〔硬锚〕刘梦霞（2021）坡度分级：<5° 五级（最优）→ 5~10° 四级 → 10~15° 三级 →
+ * 15~20° 二级 → ≥20° 一级（最差）。采纳其两端（<5° 满分、≥20° 谷底 0.1），
+ * 中段线性过渡（原文为五级离散赋值，本系统取连续线性等价形式——等价重构
+ * 不改变排序语义）。
+ */
+export function terrainScore(
+  meanSlopeDeg: number,
+  t: ScoreThresholds = DEFAULT_THRESHOLDS
+): number {
+  if (meanSlopeDeg <= t.slopeBestDeg) return 1
+  if (meanSlopeDeg >= t.slopeWorstDeg) return 0.1
+  return 1 - ((meanSlopeDeg - t.slopeBestDeg) / (t.slopeWorstDeg - t.slopeBestDeg)) * 0.9
+}
+
+/**
+ * ── 交通可达适宜度 ← 到港/到路球面距离（米）──
+ * 〔作者设定，无硬文献〕指数衰减形式（光滑、无跳变），尺度锚 8km/2km 为量级
+ * 假设：港口直接集疏运圈取 10km 量级（access_factors 实测 149m~158.5km 全距的
+ * 近端分位），道路接入取 2km。权重 0.6/0.4 反映"到港是目的、到路是接入"的
+ * 结构。论文附敏感性分析（尺度 ±50% 扰动）。
+ */
+export function accessScore(
+  distPortM: number | null,
+  distRoadM: number | null,
+  t: ScoreThresholds = DEFAULT_THRESHOLDS
+): number {
+  // 缺距离不是「零距离」：返回 0，避免 exp(0)=1 把无数据格抬成满分
+  if (
+    typeof distPortM !== 'number' ||
+    typeof distRoadM !== 'number' ||
+    !Number.isFinite(distPortM) ||
+    !Number.isFinite(distRoadM)
+  ) {
+    return 0
+  }
+  return 0.6 * Math.exp(-distPortM / t.portScaleM) + 0.4 * Math.exp(-distRoadM / t.roadScaleM)
+}

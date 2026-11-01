@@ -1,0 +1,230 @@
+<script setup lang="ts">
+/**
+ * 雷达图面板：顶部标题、中部雷达图（最大化居中）、底部可点击综合评分。
+ * hover 综合评分出现提示框，点击弹出具体得分详情面板（居中，1 列 6 行）。
+ * 渲染与交互逻辑封装在 useRadarChart
+ *
+ * 2026-10-26：轴名点击 → 设施 POI 图层 的 show/hide-facility-layer 两条 emit
+ * 与 facilityPoi prop 全仓零生产消费，已整批删除（挂载点 AppLayout.vue 从未监听）。
+ */
+
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+
+import { EmptyState } from '@/shared'
+import { useGCS } from '@/shared'
+import { logger } from '@/shared'
+import type { ScoredXiaoqu } from '@/types/xiaoqu'
+
+import RadarScoreTooltip from './components/RadarScoreTooltip.vue'
+import { useRadarChart } from './composables/useRadarChart'
+
+interface Props {
+  visible?: boolean
+  xiaoqu?: ScoredXiaoqu | null
+  selectedTypes?: string[]
+  /** 雷达图标题，默认显示"xx小区评分详情图" */
+  title?: string
+  /** 数据源为硬编码示例快照（未完成分析时的兜底）——为真时角标明示"示例数据"，
+   *  避免把看似真实的评分当分析结果读（快照来自 2026-08 一次实测） */
+  snapshot?: boolean
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  visible: true,
+  xiaoqu: null,
+  selectedTypes: () => [],
+  title: '',
+  snapshot: false,
+})
+
+const chartRef = ref<HTMLElement | null>(null)
+const scoreAreaRef = ref<HTMLElement | null>(null)
+
+const { cellPixel } = useGCS()
+const unitPx = computed(() => `${cellPixel.value * 0.1}px`)
+
+/** 使用 useRadarChart composable 处理雷达图逻辑（chartRef 由组件声明，模板 v-if 绑定） */
+const { tooltipVisible, tooltipPosition, renderRadar, handleScoreClick, handleGlobalClick } =
+  useRadarChart({
+    chartRef,
+    getScoreAreaRef: () => scoreAreaRef.value,
+    getProps: () => props,
+  })
+
+// 标记监听器是否已添加，防止泄漏
+let globalClickListenerAdded = false
+
+watch(
+  () => tooltipVisible.value,
+  (val) => {
+    if (val) {
+      // 立即添加监听器，不使用 setTimeout 延迟
+      if (!globalClickListenerAdded) {
+        window.addEventListener('click', handleGlobalClick)
+        globalClickListenerAdded = true
+      }
+    } else {
+      window.removeEventListener('click', handleGlobalClick)
+      globalClickListenerAdded = false
+    }
+  }
+)
+
+watch(
+  () => props.visible,
+  (val) => {
+    if (val) {
+      void nextTick(() => renderRadar())
+    }
+  }
+)
+
+watch(
+  [() => props.xiaoqu, () => props.selectedTypes],
+  ([newXiaoqu, newTypes]) => {
+    logger.debug('[RadarChart] 数据变化:', { xiaoqu: newXiaoqu, types: newTypes })
+    void nextTick(() => renderRadar())
+  },
+  {
+    flush: 'post',
+  }
+)
+
+// 组件卸载时清理全局监听器
+onBeforeUnmount(() => {
+  window.removeEventListener('click', handleGlobalClick)
+  globalClickListenerAdded = false
+})
+</script>
+
+<template>
+  <div class="radar-panel">
+    <!-- 中部：雷达图容器（标题由 ECharts 绘制，与 LineChart/BarChart 一致） -->
+    <div class="radar-container">
+      <!-- c057：无数据时统一 EmptyState 占位（原为空白区域，无任何引导） -->
+      <EmptyState v-if="!xiaoqu" icon="📊" message="暂无评分数据" hint="请先完成选址分析" />
+      <div v-else ref="chartRef" class="radar-chart"></div>
+      <!-- 示例数据角标：数据源是硬编码快照时明示，不让实测快照伪装成分析结果 -->
+      <div v-if="snapshot && xiaoqu" class="radar-snapshot-badge" role="note">示例数据</div>
+    </div>
+
+    <!-- 底部：综合评分（hover 出现提示框，点击查看详细得分） -->
+    <div v-if="xiaoqu" ref="scoreAreaRef" class="score-area">
+      <div class="score-text clickable" @click.stop="handleScoreClick">
+        综合评分：{{ xiaoqu.score }}
+      </div>
+      <div class="score-hint" @click.stop="handleScoreClick">点击查看详细得分</div>
+    </div>
+
+    <!-- 具体得分详情面板（在雷达面板内居中，不遮挡综合评分） -->
+    <RadarScoreTooltip
+      :visible="tooltipVisible"
+      :xiaoqu="xiaoqu"
+      :selected-types="selectedTypes"
+      :position="tooltipPosition"
+    />
+  </div>
+</template>
+
+<style scoped>
+.radar-panel {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  box-sizing: border-box;
+  position: relative;
+}
+
+/* 雷达图容器：flex 占满剩余空间，内部用 absolute 确保 ECharts 有确定尺寸 */
+.radar-container {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  z-index: 2;
+}
+
+/* 示例数据角标：快照兜底数据源的明示（不用透明度伪装成真实结果）。
+ * 配色走主题 token（stylelint 禁 hex）：warning 底色 + text-inverse 文字，
+ * 亮/暗两侧对比度均达标（#a36300/#fff、#f0b35a/#0d1b2a）。 */
+.radar-snapshot-badge {
+  position: absolute;
+  top: calc(2 * v-bind(unitPx));
+  right: calc(2 * v-bind(unitPx));
+  z-index: 3;
+  padding: calc(1 * v-bind(unitPx)) calc(2 * v-bind(unitPx));
+
+  /* 圆角随 unitPx 缩放，属动态几何，不走四档 token */
+  border-radius: calc(1 * v-bind(unitPx));
+  background: var(--GCS-color-warning);
+  color: var(--GCS-text-inverse);
+  font-size: 12px;
+  line-height: 1.2;
+  pointer-events: none;
+}
+
+.radar-chart {
+  position: absolute;
+  inset: 0;
+
+  /* 高于评分 hover 提示框：雷达画布始终在评分区域上方，不被文字留白遮挡 */
+  z-index: 2;
+}
+
+/* 综合评分：低于雷达图层（z 1 < radar-container z 2），确保雷达图内容不被文字/留白遮挡 */
+.score-area {
+  position: relative;
+  z-index: 1;
+}
+
+.score-text {
+  color: var(--GCS-color-primary);
+  font-weight: 500;
+  margin: 0;
+  font-size: 14px;
+  text-align: center;
+  margin-top: calc(2 * v-bind(unitPx));
+  margin-bottom: calc(2 * v-bind(unitPx));
+}
+
+.score-text.clickable {
+  cursor: pointer;
+  transition: color var(--GCS-duration-base);
+}
+
+.score-text.clickable:hover {
+  color: var(--GCS-color-primary-hover);
+}
+
+/* 提示框：紧贴综合评分文字上方居中，hover 评分区域时浮现 */
+.score-hint {
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1;
+  white-space: nowrap;
+  padding: 2px 6px;
+  font-size: var(--GCS-font-size-xs); /* 越档 11px 归 12px 档 */
+  color: var(--GCS-text-secondary);
+  background: var(--GCS-bg-elevated);
+  border: 1px solid var(--GCS-border-default);
+  border-radius: var(--GCS-radius-sm);
+  box-shadow: var(--GCS-shadow-sm);
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity var(--GCS-duration-fast) ease,
+    visibility var(--GCS-duration-fast);
+
+  /* 负间距 hack 用途说明——score-hint 为绝对定位 tooltip，
+     此处 margin-bottom:-20px 抵消 score-area 底部内边距，使悬浮提示与评分区域视觉对齐 */
+  margin-bottom: -20px;
+}
+
+.score-area:hover .score-hint {
+  opacity: 1;
+  visibility: visible;
+}
+</style>

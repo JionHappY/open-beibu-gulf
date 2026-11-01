@@ -1,0 +1,99 @@
+/**
+ * GIS 业务数据基础类型（浸没/选址/预测分析模块在此之上扩展）。
+ * 坐标统一 WGS84(EPSG:4326) lng/lat，Web Mercator 投影由 OL/Cesium 内部处理，
+ * 前端不做投影运算（北部湾横跨 UTM 49N/50N 交界带）。
+ */
+
+// D1：浸没要素/受影响设施与 zod schema 编译期绑定（z.infer 同源）——
+// 运行时形状由 schemas.ts 深校验把关，业务类型不再是独立漂移副本
+// ===== 通用 GIS 要素 =====
+// GeoPoint 收敛为单一权威（crs.ts 带 CRS 泛型版本）；
+// 原 base.ts 独立定义（无 crs 字段）与 crs.ts 同名不同义，已移除，此处仅 re-export 兼容既有引用。
+// 注意：re-export 不引入本地作用域，本文件内部使用需显式 import。
+import type {
+  AffectedFacilityParsed,
+  FloodFeatureParsed,
+  FloodStatisticsResponseParsed,
+} from '../schemas'
+export type { GeoPoint } from '../crs'
+
+// ===== 浸没分析业务类型 =====
+
+/**
+ * 淹没统计数据——从 floodStatisticsResponseSchema z.infer 派生（D1：schema 与业务类型编译期绑定）。
+ * 原为手抄 interface：漏了 `requestedWaterLevel`/`actualWaterLevel` 两字段（后端与 schema 都有），
+ * adapter 用 `as FloodStatistics` 缝合 ⇒ 漂移无编译期提示；z039④ 收口为同源派生。
+ */
+export type FloodStatistics = FloodStatisticsResponseParsed
+
+/** 淹没区域要素（GeoJSON Feature）——从 floodFeatureSchema z.infer 派生（D1：schema 与业务类型编译期绑定） */
+export type FloodFeature = FloodFeatureParsed & {
+  properties: {
+    riskLevel: string
+    depth?: number
+    /** 开放扩展：淹没要素可携带 areaId、submergedArea 等业务属性 */
+    [key: string]: unknown
+  }
+}
+
+/** 受影响设施——从 affectedFacilitySchema z.infer 派生（D1） */
+export type AffectedFacility = AffectedFacilityParsed
+
+/** 淹没分析保存状态 */
+export interface FloodSavedState {
+  waterLevel: number
+  floodStatistics: FloodStatistics | null
+  floodFeatures: FloodFeature[]
+  floodRiskLevel: string
+  // 语义注意：此处为「受影响设施数组」，与 FloodStatistics.affectedFacilities（计数）同名不同型
+  affectedFacilities: AffectedFacility[]
+  totalLoss: number
+}
+
+/** 淹没分析消费状态 */
+export interface FloodConsumedState {
+  waterLevel: number
+  floodStatistics: FloodStatistics | null
+  floodFeatures: FloodFeature[]
+  floodRiskLevel: string
+  affectedFacilities?: AffectedFacility[]
+  totalLoss?: number
+}
+
+import type { FavoriteItemParsed } from '../schemas'
+
+// ===== 预测分析业务类型 =====
+
+/** 置信度阈值 */
+export interface ConfidenceThresholds {
+  cargo: number
+  container: number
+  activity: number
+  [key: string]: number
+}
+
+// ===== 全局收藏（用户数据，后端 favorites.json 持久化） =====
+
+/**
+ * 收藏对象类型：选址小区 / 浸没设施。
+ *
+ * 权威源是后端 `FAVORITE_ITEM_TYPES` 数组：此处只做 type-only 派生，
+ * 不再手写联合——新增类型只改后端一处，前端漏改会在类型检查/跨端对照测试处红。
+ * 注意：re-export 不引入本地作用域，下面的 FavoriteAddInput 需要显式 import。
+ */
+import type { FavoriteItemType } from '@backend/modules/favorites/dto/favorites.dto'
+
+export type { FavoriteItemType }
+
+/** 全局收藏项：字段以 favoriteItemSchema 为唯一契约（savedAt 可空） */
+export type FavoriteItem = FavoriteItemParsed
+
+/** 收藏添加入参（id/userId/savedAt 由后端生成） */
+export interface FavoriteAddInput {
+  itemType: FavoriteItemType
+  itemId: string
+  name: string
+  lng: number
+  lat: number
+  snapshot?: Record<string, unknown> | null
+}
