@@ -18,16 +18,13 @@ import { PanelTitle, useGCS, useTheme } from '@/shared'
 import BottomNavBar from './components/BottomNavBar.vue'
 import ConsoleRail from './components/ConsoleRail.vue'
 import GCSPanel from './components/GCSPanel.vue'
-import MobileDrawer from './components/MobileDrawer.vue'
 import NavButton from './components/NavButton.vue'
-import { businessNavItems, type NavItem } from './navConfig'
 import { GCS_TASK_CHIPS_KEY, type ChipDragPoint } from './taskChipsContext'
-import { useMobileDrawer } from './useMobileDrawer'
 import { useSliderFocus } from './useSliderFocus'
 
 const route = useRoute()
 const router = useRouter()
-const { showPanels, showTopArea, navCompact, cellPixel } = useGCS()
+const { showPanels, showTopArea, consoleMode, cellPixel } = useGCS()
 const { flyTo } = useMapControls()
 // 城市切换（必要性审判波次二·单元 F）：原 useScreenActions 只是 flyTo 的同义转发层，
 // 就地按 MAP_CONFIG.CITY_CENTERS（单一权威源）取坐标，不新增第二份城市表。
@@ -39,7 +36,6 @@ function flyToCity(city: string): void {
 // 主题切换：图标显示当前模式的另一侧（暗色显示 ☀️、亮色显示 🌙）
 const { isDark, toggleTheme } = useTheme()
 // 抽屉开关（模块级单例，nav 菜单按钮与抽屉共享）
-const { drawerOpen, closeDrawer } = useMobileDrawer()
 // 滑块专注模式（模块级单例，滑块组件调用 begin/end）
 const { active: sliderFocusActive, activePanel: sliderActivePanel } = useSliderFocus()
 
@@ -83,7 +79,9 @@ watch(sliderFocusActive, (act) => {
 
 // 手机档（<640）把地图压到上半屏：统一挂在 body 上，由 style.css 收 .unified-map-wrapper 高度。
 // 用 body class 而非媒体查询，断点仍只由 useGCS 的 layoutTierFor 一处判定。
-watch(navCompact, (on) => document.body.classList.toggle('layout-console', on), { immediate: true })
+watch(consoleMode, (on) => document.body.classList.toggle('layout-console', on), {
+  immediate: true,
+})
 onUnmounted(() => {
   // AppLayout 是页面级组件（HomePage/ProfilePage/业务页各自包一层），路由切换时
   // 新实例先挂、旧实例后卸；此处若同步摘 class，会把新实例刚挂上的 layout-console
@@ -98,6 +96,14 @@ onUnmounted(() => {
 // 控制台底部让开 dock（dock 是 1 cell 高的 GCSPanel，同源取 cellPixel，不写死像素）
 const consoleStyle = computed(() => ({ bottom: `${Math.round(cellPixel.value * 1.7)}px` }))
 
+/**
+ * 控制台的阅读顺序（a1）：默认「参数 → 结果」（right → left），因为多数页面右列是
+ * 操作/参数；选址页反过来——先给结论（画像 + 候选名单）再给权重，所以由页面声明。
+ */
+withDefaults(defineProps<{ consoleOrder?: 'right-first' | 'left-first' }>(), {
+  consoleOrder: 'right-first',
+})
+
 // 专注态激活期间切路由 ⇒ 旧页 AppLayout 卸载，而 useSliderFocus 的
 // onScopeDispose(endSliderFocus) 与本 watch 的效果在同一批 scope.stop() 里停掉，
 // 排队的 pre-flush 回调被丢弃（真 vue 3.5.41 实测 after stop: class 仍在）⇒
@@ -109,17 +115,6 @@ onUnmounted(() => {
     p.classList.remove('slider-focus-panel')
   })
 })
-
-function isActive(path: string): boolean {
-  return route.path === path
-}
-
-/** 跳转业务模块并关闭抽屉（navConfig 注入项） */
-function goBusiness(item: NavItem): void {
-  if (item.disabled || !item.path) return
-  void router.push(item.path)
-  closeDrawer()
-}
 </script>
 
 <template>
@@ -189,7 +184,7 @@ function goBusiness(item: NavItem): void {
     <!-- ===== 控制台（手机档 <640px） =====
          地图收上半屏，原抽屉里的图层控制 / 业务面板整体搬到下半屏（压缩排版，尽量一屏放完）。
          抽屉在手机档不再渲染——入口是 dock 的 ＋ 半圆，内容是这张控制台。 -->
-    <section v-if="navCompact" class="mobile-console" :style="consoleStyle" aria-label="控制台">
+    <section v-if="consoleMode" class="mobile-console" :style="consoleStyle" aria-label="控制台">
       <!-- 中转带：已完成任务结果的芯片，点一下上图/撤下（App 供给，桌面档在右下浮条里）。
            放在滚动区外：结果下来时控制台常已滚到参数区，放在里面会跟着滚走 -->
       <ConsoleRail
@@ -226,6 +221,15 @@ function goBusiness(item: NavItem): void {
         <template v-else-if="route.name === 'Profile'">
           <slot name="right" />
         </template>
+        <template v-else-if="consoleOrder === 'left-first'">
+          <slot name="left" />
+          <!-- 参数默认折叠成一条：结果页先给结论，调参是第二动作（a1） -->
+          <details class="console-fold">
+            <summary>调参：准则权重与阈值</summary>
+            <slot name="right" />
+          </details>
+          <slot name="layers" />
+        </template>
         <template v-else>
           <slot name="right" />
           <slot name="left" />
@@ -234,60 +238,6 @@ function goBusiness(item: NavItem): void {
         </template>
       </div>
     </section>
-
-    <!-- ===== 抽屉菜单（平板档 640–959px） =====
-         业务入口（sticky 冻结首行）+ 城市切换 + 业务面板；手机档已由上方控制台承接 -->
-    <MobileDrawer v-if="!navCompact" :open="drawerOpen" @close="closeDrawer">
-      <div class="drawer-menu">
-        <!-- 业务入口行：滚动时冻结（sticky） -->
-        <div class="drawer-menu__row drawer-menu__row--sticky" aria-label="业务功能">
-          <NavButton
-            v-for="m in businessNavItems"
-            :key="m.label"
-            :label="m.label"
-            :icon="m.icon"
-            :disabled="m.disabled"
-            :active="isActive(m.path)"
-            @click="goBusiness(m)"
-          />
-        </div>
-        <!-- 城市切换 + 主题切换行 -->
-        <div class="drawer-menu__row" aria-label="城市切换">
-          <!-- 同上：CITY_CENTERS 驱动（z154②） -->
-          <NavButton
-            v-for="city in Object.keys(MAP_CONFIG.CITY_CENTERS)"
-            :key="city"
-            :label="city"
-            @click="flyToCity(city)"
-          />
-          <NavButton
-            :icon="isDark ? '☀️' : '🌙'"
-            class="theme-toggle"
-            aria-label="切换主题"
-            @click="toggleTheme"
-          />
-        </div>
-        <!-- 抽屉面板内容：只放功能面板；首页→图层控制，个人中心→right slot，业务页→left/right slot -->
-        <template v-if="!showPanels">
-          <template v-if="route.name === 'Home'">
-            <GCSPanel :w="4" :h="4"><LayerControlPanel /></GCSPanel>
-            <!-- 桌面左侧的两张概览图在窄屏原本完全不可达（Home 分支只注入图层控制）；
-                 补 #left 后抽屉内可滚动查看，数据与桌面同源。 -->
-            <slot name="left" />
-          </template>
-          <template v-else-if="route.name === 'Profile'">
-            <slot name="right" />
-          </template>
-          <template v-else>
-            <!-- 操作/控制面板（right slot）在前，可视化面板（left slot）次之，图层控制最后：
-                 与手机档控制台同序（right → left → layers），图层不再夹在参数与结果之间 -->
-            <slot name="right" />
-            <slot name="left" />
-            <slot name="layers" />
-          </template>
-        </template>
-      </div>
-    </MobileDrawer>
 
     <!-- 底部导航（3 按钮：首页/个人中心/菜单） -->
     <BottomNavBar :drag-point="railDragPoint" />
@@ -378,6 +328,20 @@ function goBusiness(item: NavItem): void {
 }
 
 /* 内容区唯一可滚动的地方；面板改为正常流堆叠，压缩后尽量一屏放完 */
+.console-fold > summary {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--GCS-text-regular);
+  background: var(--GCS-bg-container);
+  border: 1px solid var(--GCS-border-light);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.console-fold[open] > summary {
+  margin-bottom: 4px;
+}
+
 .console-body {
   flex: 1;
   min-height: 0;
@@ -401,7 +365,7 @@ function goBusiness(item: NavItem): void {
 
 /* 面板进控制台后按内容高度堆叠。
    GCSPanel 把 left/top/width/height 写成内联 CSS 变量，所以这里必须 !important 才压得住
-   （与 style.css 里 .GCS-drawer__body .GCS-panel 的抽屉归一化同一手法）。 */
+   （抽屉退役后这里是唯一的「面板进普通流」归一化点）。 */
 .console-body :deep(.GCS-panel) {
   /* 选择器特异度（.console-body[data-v-x] .GCS-panel）已经高于 .GCS-panel 自身，
      这里不需要 !important——GCSPanel 的定位走的是 CSS 变量，不是内联属性 */
@@ -499,35 +463,8 @@ function goBusiness(item: NavItem): void {
 }
 
 /* ===== 抽屉菜单 ===== */
-.drawer-menu {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
 
-.drawer-menu__row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: center;
-  padding: 8px 0;
-}
-
-/* 业务入口行冻结：抽屉 body 滚动时保持可见（sticky 相对 .GCS-drawer__body） */
-.drawer-menu__row--sticky {
-  position: sticky;
-  top: 0;
-
-  /* 局部层叠上下文（抽屉 body 内），不参与全局 --GCS-z-* 刻度 */
-  z-index: 5;
-  background: var(--GCS-bg-panel);
-  border-bottom: 1px solid var(--GCS-border-light);
-
-  /* 5 个业务入口默认在 294px 抽屉里排成 4+1（第 5 项单吊一行）观感失衡；
-     限宽到 200px 后稳定 3+2 两行居中，行高不变。 */
-  max-width: 200px;
-  margin-inline: auto;
-}
+/* 业务入口行冻结：控制台滚动时保持可见（sticky 相对 .console-body） */
 
 /* 主题切换按钮 emoji 放大（默认偏小，仅作用于 .theme-toggle） */
 :deep(.theme-toggle .button-icon) {

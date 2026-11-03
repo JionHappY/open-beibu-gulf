@@ -2,14 +2,14 @@
  * 信息气泡共享样式（MapFeatureBubble 港口气泡 / MapFacilityBubble 设施气泡）
  *
  * 抽取理由（D21 批 6）：两个 SFC 的这套规则原本逐字各写一份（约 90 行 × 2），
- * 改一处漏一处即样式漂移。此处为唯一副本，两件以 <style scoped src="./bubble.css"> 消费。
+ * 改一处漏一处即样式漂移。此处为唯一副本，两件以 \3c style scoped src="./bubble.css"> 消费。
  *
  * 根类用中性的 .map-bubble：原 .map-feature-bubble / .map-facility-bubble 是
  * UnifiedMap.test.ts 的元素选择器（测试契约），故**保留在各自模板上作身份钩子**，
  * 样式统一由 .map-bubble 承担。
  *
  * 各件私有规则不进本文件：
- *   MapFacilityBubble 的 .bubble-actions / .bubble-fav-btn 留在自身 <style> 内。
+ *   MapFacilityBubble 的 .bubble-actions / .bubble-fav-btn 留在自身 \3c style> 内。
  */
 .map-bubble {
   position: relative;

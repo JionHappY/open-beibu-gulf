@@ -3,13 +3,18 @@
 一个面向港口运营的 WebGIS 演示系统：二维（OpenLayers）/三维（Cesium）双引擎，Vue 3 + NestJS + PostGIS。
 本仓是从主仓按「只带产品本身」原则抽取的精简版——**不带**论文文档、门禁与审查工具链、大体积地形/倾斜摄影资产。
 
+## 界面
+
+| 总览 | 港址适宜性 | 吞吐量预测 |
+| --- | --- | --- |
+| ![总览](docs/screenshots/readme-home.jpg) | ![港址适宜性](docs/screenshots/readme-site.jpg) | ![吞吐量预测](docs/screenshots/readme-forecast.jpg) |
+
 ## 业务模块
 
 | 路由 | 模块 | 说明 |
 | --- | --- | --- |
 | `/` | 总览 | 港口吞吐量概览、雷达对比、图层开关 |
 | `/site-suitability` | 港址适宜性 | AHP 层次分析 + 多因子加权，输出适宜性分级 |
-| `/diversion-analysis` | 分洪分析 | 分洪通道方案、三港分摊、影响范围 |
 | `/forecast` | 吞吐量预测 | 时间序列/指数平滑/灰色预测，含置信区间 |
 | `/flood-analysis` | 洪涝分析 | 水位～淹没范围、设施受损、地形剖面 |
 | `/route-analysis` | 航线分析 | 3D 航线规划、相机沿路径取景、通视分析 |
@@ -30,7 +35,7 @@ Dockerfile          后端镜像
 ```bash
 # 前端（仓库根统一管理前端依赖与脚本）
 npm install
-npm test                 # 160 个测试文件 / 1105 个用例
+npm test                 # 174 个测试文件 / 1208 个用例
 npm run typecheck        # vue-tsc
 npm run dev              # http://localhost:5173
 
@@ -63,15 +68,16 @@ psql -f db/db-schema.sql ...
 | `scripts/`、`.github/`、`.husky/` 门禁 | 不带 |
 | 大体积 DEM / 倾斜摄影 / 影像 | 只带元数据 |
 | 完整 CI 脚本（ci:local 等） | 只留 `test` / `typecheck` / `build` / `lint` |
+| `backend/test/data-freshness.spec.ts`（比对数据戳记与 git 改动日） | 不带：本仓单次提交必然误红，语义依赖主仓逐日提交历史 |
 
-## 验证状态（2026-11-01）
+## 验证状态（2026-11-04）
 
 已验证：
 
 - 前端 `vue-tsc --noEmit` 通过；
-- 前端 `vitest run`：**160 文件 / 1105 用例全绿**（与主仓同数）；
+- 前端 `vitest run`：**174 文件 / 1208 用例全绿**（与主仓同数）；
 - 后端 `nest build` 通过；
-- 后端 `vitest run`：**59 文件通过 / 8 跳过，593 用例通过 / 83 跳过**（需 DB 的 e2e 自动跳过）。
+- 后端 `vitest run`：**60 文件通过 / 8 跳过，603 用例通过 / 84 跳过**（需 DB 的 e2e 自动跳过）。
 
 以上四项在与主仓相同的 `node_modules` 下复现，数字与主仓逐项相同。
 

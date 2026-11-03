@@ -57,6 +57,8 @@ interface CityFlyToTarget {
 
 /** 视图层级集合 */
 interface MapViewLevels {
+  /** 首屏档：钦州港（进页面即落在港区，不先给全域） */
+  PORT: MapViewLevel
   REGION: MapViewLevel
 }
 
@@ -98,6 +100,14 @@ export const MAP_CONFIG: MapConfig = {
     roll: 0,
   },
   VIEW_LEVELS: {
+    // 首屏档（c2）：进页面就落在钦州港，而不是北部湾全域——「看得见港区」比「看得见省」
+    // 更接近这个产品要回答的问题；需要全域时城市按钮/缩放仍可到 REGION。
+    PORT: {
+      center: { lng: 108.590379, lat: 21.726917 },
+      height: 60000,
+      zoom: 12,
+      label: '钦州港',
+    },
     REGION: {
       center: { lng: 108.5752963, lat: 21.760409 },
       height: 1600000,

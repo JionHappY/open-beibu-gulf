@@ -69,7 +69,7 @@ const ownedLayers = useOwnedLayers('route-analysis')
 /**
  * 航线图层的 owner 册在**页面作用域**创建（不是在面板里）——
  *
- * 移动端「关抽屉」会卸载面板（`AppLayout` 的 `MobileDrawer` 用 `v-if="open"`），
+ * 移动端「收起控制台」会卸载面板（旧抽屉时代 `v-if="open"` 的约束仍成立），
  * 若归属建在面板上，航线图层会随面板一起被 `onScopeDispose` 清掉，而**页面还在、
  * 后端任务照旧跑** ⇒ 用户看到「查询在跑、图上没有线」（N-08）。
  * 图层归属必须与业务同寿，故由页面建册、面板只消费。

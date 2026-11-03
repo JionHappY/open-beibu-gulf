@@ -672,7 +672,7 @@ export class CesiumRenderer extends MapRenderer {
     // 首屏必须落在地球上：直接进入 3D（无 2D→3D 状态迁移）时相机默认停在外太空，叠加按需渲染
     // 会停在纯星空黑帧。这里瞬时 setView 到区域视角保证首帧可见地球；后续业务 flyTo 仍会从该
     // 视角飞向城市（保留"地球飞转"动画，只是起点从外太空改为区域上空），importState 的相机迁移也会覆盖它。
-    const region = MAP_CONFIG.VIEW_LEVELS.REGION
+    const region = MAP_CONFIG.VIEW_LEVELS.PORT
     viewer.camera.setView({
       destination: Cartesian3.fromDegrees(region.center.lng, region.center.lat, region.height),
       orientation: {

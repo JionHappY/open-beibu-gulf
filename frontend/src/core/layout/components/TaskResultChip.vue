@@ -21,16 +21,25 @@ const props = withDefaults(
   { color: IR_FALLBACK_COLOR, active: false }
 )
 
-const emit = defineEmits<{ (e: 'toggle'): void }>()
+const emit = defineEmits<{
+  (e: 'toggle'): void
+  /** 位移超过阈值后松手：带宽移前后的坐标，父层据此判断落点是否命中导航项 */
+  (e: 'dragend', payload: { x: number; y: number }): void
+}>()
+
+/** 与中转带同阈值：超过它才算拖拽，松手不再当「切换图层」 */
+const DRAG_THRESHOLD = 8
 
 const dragging = ref(false)
 let startX = 0
 let startY = 0
+let moved = false
 
 function onPointerDown(e: PointerEvent): void {
   ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
   startX = e.clientX
   startY = e.clientY
+  moved = false
   dragging.value = true
 }
 
@@ -38,6 +47,7 @@ function onPointerMove(e: PointerEvent): void {
   if (!dragging.value) return
   const dx = e.clientX - startX
   const dy = e.clientY - startY
+  if (Math.hypot(dx, dy) >= DRAG_THRESHOLD) moved = true
   ;(e.currentTarget as HTMLElement).style.transform = `translate(${dx}px, ${dy}px)`
 }
 
@@ -46,8 +56,10 @@ function onPointerUp(e: PointerEvent): void {
   dragging.value = false
   ;(e.currentTarget as HTMLElement).style.transform = ''
   ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
-  // 点击与拖拽松开同义：都是"上图/撤下"开关（拖拽是可发现的显式动作，点击是快捷路径）
-  emit('toggle')
+  // 拖过阈值 = 一次「投递」动作，落点由父层判定（命中导航项则换页，否则仍按上图处理）；
+  // 未过阈值 = 点击，直接切换图层。
+  if (moved) emit('dragend', { x: e.clientX, y: e.clientY })
+  else emit('toggle')
 }
 </script>
 

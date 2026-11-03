@@ -179,7 +179,8 @@ onUnmounted(() => {
 
 <template>
   <div class="ss-page">
-    <AppLayout>
+    <!-- 选址页结果前置（a1）：控制台先给画像与候选名单，权重放后面 -->
+    <AppLayout console-order="left-first">
       <!-- 左侧（样式对齐旧版选址页）：左上雷达图 + 左下候选格名单 -->
       <template #left>
         <GCSPanel

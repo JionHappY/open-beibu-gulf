@@ -197,6 +197,21 @@ const resultChips = computed(() => {
   return chips
 })
 
+/**
+ * 桌面档的结果投递：芯片拖过阈值后松手，落点若是导航项就换页（结果图层挂在
+ * App 作用域，换页后仍压在新页面的地图上）；落点不在导航项上则维持原来的
+ * 「拖到地图 = 上图/撤下」语义，不引入第三种结果。
+ */
+function onResultChipDragEnd(ir: LayerIR, point: { x: number; y: number }): void {
+  const hit = document.elementFromPoint(point.x, point.y)?.closest<HTMLElement>('[data-dock-route]')
+  const path = hit?.dataset.dockRoute
+  if (path && path !== route.path) {
+    void router.push(path)
+    return
+  }
+  onResultChipToggle(ir)
+}
+
 function onResultChipToggle(ir: LayerIR): void {
   const action = layerIR.toggleIR(ir)
   logger.debug('[App] 任务结果拖出上图 toggle:', ir.meta.label, action)
@@ -369,6 +384,7 @@ onUnmounted(() => {
         :color="chip.color"
         :active="chip.active"
         @toggle="onResultChipToggle(chip.ir)"
+        @dragend="onResultChipDragEnd(chip.ir, $event)"
       />
     </div>
   </div>

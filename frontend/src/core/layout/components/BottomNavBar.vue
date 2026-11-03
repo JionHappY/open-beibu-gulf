@@ -4,9 +4,9 @@ export default { name: 'GCSBottomNavBar' }
 <script setup lang="ts">
 /**
  * BottomNavBar - 底部业务导航条（消费 navConfig 注入项，core 不引 business）
- * 三档形态：档位 1（≥960px）首页+业务+个人中心原位、无菜单键；
- * 档位 2（640~959px）追加菜单键；档位 3（<640px）首页 / ＋ / 个人中心——
- * 业务入口收进 ＋ 展开的半圆（DockFan），菜单作为半圆末项保留抽屉入口。
+ * 三档形态：档位 1（≥960px）首页+业务+个人中心原位；
+ * 档位 2（640~959px）同样全量原位（抽屉已退役，控制台承接参数）；档位 3（<640px）
+ * 首页 / ＋ / 个人中心，业务入口收进 ＋ 展开的半圆（DockFan）。
  */
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -16,7 +16,6 @@ import { useGCS } from '@/shared'
 import { preloadCesium } from '../../map/renderers'
 import { businessNavItems, type NavItem, navItems } from '../navConfig'
 import { getTaskIndicator, taskIndicatorVersion } from '../taskIndicator'
-import { useMobileDrawer } from '../useMobileDrawer'
 
 import DockFan from './DockFan.vue'
 import GCSButton from './GCSButton.vue'
@@ -26,10 +25,7 @@ import TaskProgressRing from './TaskProgressRing.vue'
 
 const route = useRoute()
 const router = useRouter()
-const { cellPixel, navCompact, showPanels } = useGCS()
-// 抽屉开关（模块级单例）：菜单按钮与抽屉共享，激活时高亮
-const { drawerOpen, toggleDrawer } = useMobileDrawer()
-
+const { cellPixel, navCompact } = useGCS()
 /** 中转带正在拖拽的指针位置（AppLayout 传入）；靠近 ＋ 时半圆自动展开，松手才落点 */
 const props = withDefaults(defineProps<{ dragPoint?: { x: number; y: number } | null }>(), {
   dragPoint: null,
@@ -41,10 +37,8 @@ const profileItem = computed(() => navItems.value.find((i) => i.type === 'profil
 // 手机档的入口就是这 5 个分析页：抽屉内容已迁到下半屏控制台，弧上不再需要「更多」
 const fanItems = computed<NavItem[]>(() => [...businessNavItems.value])
 
-/** 档位 3：首页 / ＋ / 个人中心 三格；其余档位：全部项 + 菜单键 */
-const dockCellCount = computed(() =>
-  navCompact.value ? 3 : navItems.value.length + (showPanels.value ? 0 : 1)
-)
+/** 档位 3（<640）：首页 / ＋ / 个人中心 三格；其余档位：全部导航项（抽屉退役后不再有菜单键） */
+const dockCellCount = computed(() => (navCompact.value ? 3 : navItems.value.length))
 
 const fanOpen = ref(false)
 
@@ -183,6 +177,7 @@ function preloadIf3D(item: NavItem): void {
         <NavButton
           v-for="item in navItems"
           :key="item.label"
+          :data-dock-route="item.path || undefined"
           :label="item.label"
           :icon="item.icon"
           :disabled="item.disabled"
@@ -191,16 +186,6 @@ function preloadIf3D(item: NavItem): void {
           @click="go(item)"
           @mouseenter="preloadIf3D(item)"
           @focusin="preloadIf3D(item)"
-        />
-        <!-- 菜单键（抽屉模式 640~959px） -->
-        <GCSButton
-          v-if="!showPanels"
-          :w="0.8"
-          :h="0.8"
-          label="菜单"
-          icon="☰"
-          :active="drawerOpen"
-          @click="toggleDrawer"
         />
       </template>
     </div>

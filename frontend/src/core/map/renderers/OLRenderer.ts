@@ -95,7 +95,7 @@ function toHeatmapOlFeatures(features: PointFeature[]): Feature<Point>[] {
 }
 
 /** 2D 视图层级限位（ 提常量：与 3D CAMERA_*_ZOOM_DISTANCE 对应；原散落 9/6/20） */
-const OL_VIEW_ZOOM = 9
+const OL_VIEW_ZOOM = MAP_CONFIG.VIEW_LEVELS.PORT.zoom
 const OL_VIEW_MIN_ZOOM = 6
 const OL_VIEW_MAX_ZOOM = 20
 

@@ -44,7 +44,6 @@ vi.mock('@/core/map/components/LayerControlPanel.vue', () => ({
 
 import { MAP_CONFIG } from '@/core'
 import AppLayout from '../AppLayout.vue'
-import { useMobileDrawer } from '../useMobileDrawer'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CORE = resolve(HERE, '..', '..')
@@ -157,17 +156,20 @@ describe('城市飞行行为（桌面顶部按钮组 + 抽屉按钮组）', () =
     )
   })
 
-  it('抽屉城市组：同源驱动，点击同样触发 flyTo', async () => {
+  // 抽屉退役（b2）后，平板/手机档的城市组在控制台头部；判据不变：同源驱动、点击即 flyTo
+  it('控制台城市组：同源驱动，点击同样触发 flyTo', async () => {
     const cities = Object.keys(MAP_CONFIG.CITY_CENTERS)
+    // useGCS 的档位只读 windowWidth（resize 时更新），jsdom 默认 1024 属桌面档 ⇒ 先压到平板档
+    const prev = window.innerWidth
+    Object.defineProperty(window, 'innerWidth', { value: 800, configurable: true, writable: true })
+    window.dispatchEvent(new Event('resize'))
+    // useGCS 的 resize 处理带 150ms 防抖（避免拖动窗口时反复重排），这里等它落定再挂载
+    await new Promise((r) => setTimeout(r, 200))
     const wrapper = mount(AppLayout, { attachTo: document.body })
-    const { toggleDrawer } = useMobileDrawer()
-    toggleDrawer()
     await wrapper.vm.$nextTick()
     await wrapper.vm.$nextTick()
 
-    const buttons = document.querySelectorAll(
-      '.drawer-menu__row[aria-label="城市切换"] .GCS-button'
-    )
+    const buttons = document.querySelectorAll('.mobile-console .console-cities .GCS-button')
     expect(buttons.length).toBe(cities.length + 1)
     ;(buttons[1] as HTMLElement).click()
     await wrapper.vm.$nextTick()
@@ -178,5 +180,8 @@ describe('城市飞行行为（桌面顶部按钮组 + 抽屉按钮组）', () =
       { lng: target.lng, lat: target.lat },
       { height: target.height, zoom: target.zoom }
     )
+    Object.defineProperty(window, 'innerWidth', { value: prev, configurable: true, writable: true })
+    window.dispatchEvent(new Event('resize'))
+    await new Promise((r) => setTimeout(r, 200))
   })
 })

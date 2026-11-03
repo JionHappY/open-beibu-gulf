@@ -32,7 +32,7 @@ interface Props {
    * 图层操作由**页面**注入 —— 本面板不自己建 owner 册（N-08 / owned-layers 判据 D）。
    *
    * 为什么：owner 建在面板作用域时，移动端「关抽屉」会卸载面板（`AppLayout` 的
-   * `MobileDrawer` 用 `v-if="open"`），航线图层随之被 `onScopeDispose` 清掉，而
+   * 控制台卸载面板（旧抽屉 `v-if="open"` 时代遗留的约束）），航线图层随之被 `onScopeDispose` 清掉，而
    * **页面还在、后端任务照旧跑** —— 图层生命周期短于业务生命周期。归属必须与业务同寿。
    */
   updateRouteLayers: (segments: RoutePathResult[], slots: RouteSlot[]) => void

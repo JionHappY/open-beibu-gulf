@@ -22,7 +22,6 @@ vi.mock('vue-router', () => ({
 
 import BottomNavBar from '../components/BottomNavBar.vue'
 import { registerNavItems } from '../navConfig'
-import { useMobileDrawer } from '../useMobileDrawer'
 
 /** 模拟视口宽度并触发 useGCS 的 resize 防抖 */
 async function setViewport(width: number) {
@@ -74,13 +73,14 @@ describe('BottomNavBar 三档位', () => {
     expect(hasLabel(labels, '菜单')).toBe(false)
   })
 
-  it('档位 2（640~959px）：7 键——业务保留 + 菜单键', async () => {
+  // 抽屉退役（b2）：平板档由下半屏控制台承接参数，导航只留 6 个入口，不再有菜单键
+  it('档位 2（640~959px）：6 键——与控制台并存，无菜单键', async () => {
     await setViewport(800)
     const wrapper = mount(BottomNavBar)
     const labels = buttonLabels(wrapper)
-    expect(labels).toHaveLength(7)
+    expect(labels).toHaveLength(6)
     expect(hasLabel(labels, '选址')).toBe(true)
-    expect(hasLabel(labels, '菜单')).toBe(true)
+    expect(hasLabel(labels, '菜单')).toBe(false)
   })
 
   it('档位 3（<640px）：3 键——首页/＋/个人中心，业务收进半圆', async () => {
@@ -207,15 +207,5 @@ describe('BottomNavBar 三档位', () => {
     await nextTick()
 
     expect(document.body.querySelector('.dock-fan')).toBeNull()
-  })
-
-  it('档位 2/3 菜单键点击切换抽屉状态', async () => {
-    const { drawerOpen, closeDrawer } = useMobileDrawer()
-    closeDrawer()
-    await setViewport(800)
-    const wrapper = mount(BottomNavBar)
-    const menuBtn = wrapper.findAll('.GCS-button').find((b) => b.text().includes('菜单'))!
-    await menuBtn.trigger('click')
-    expect(drawerOpen.value).toBe(true)
   })
 })
