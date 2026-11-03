@@ -6,25 +6,28 @@
  * 抽屉模式（<960px）下抽屉同时承载业务面板（slot left/right）。
  */
 
-import { computed, defineAsyncComponent, onUnmounted, watch } from 'vue'
+import { computed, defineAsyncComponent, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { MAP_CONFIG } from '@/core/config/map'
 import { useMapControls } from '@/core/map/composables/useMapControls'
 import LayerControlPanel from '@/core/map/components/LayerControlPanel.vue'
+import HomeAnalysisGrid from './components/HomeAnalysisGrid.vue'
 import { PanelTitle, useGCS, useTheme } from '@/shared'
 
 import BottomNavBar from './components/BottomNavBar.vue'
+import ConsoleRail from './components/ConsoleRail.vue'
 import GCSPanel from './components/GCSPanel.vue'
 import MobileDrawer from './components/MobileDrawer.vue'
 import NavButton from './components/NavButton.vue'
-import { type NavItem, navItems } from './navConfig'
+import { businessNavItems, type NavItem } from './navConfig'
+import { GCS_TASK_CHIPS_KEY, type ChipDragPoint } from './taskChipsContext'
 import { useMobileDrawer } from './useMobileDrawer'
 import { useSliderFocus } from './useSliderFocus'
 
 const route = useRoute()
 const router = useRouter()
-const { showPanels, showTopArea } = useGCS()
+const { showPanels, showTopArea, navCompact, cellPixel } = useGCS()
 const { flyTo } = useMapControls()
 // 城市切换（必要性审判波次二·单元 F）：原 useScreenActions 只是 flyTo 的同义转发层，
 // 就地按 MAP_CONFIG.CITY_CENTERS（单一权威源）取坐标，不新增第二份城市表。
@@ -40,10 +43,31 @@ const { drawerOpen, closeDrawer } = useMobileDrawer()
 // 滑块专注模式（模块级单例，滑块组件调用 begin/end）
 const { active: sliderFocusActive, activePanel: sliderActivePanel } = useSliderFocus()
 
-// 抽屉业务行：取 navConfig 中 type=business 的项（core 不引 business，由 App.vue 注入）
-const businessNavItems = computed<NavItem[]>(() => [
-  ...navItems.value.filter((i) => i.type === 'business'),
-])
+// 任务结果芯片（手机档进控制台；桌面档由 App.vue 自己渲染浮条）。
+// 未 provide 时（单测/独立挂载）为 undefined ⇒ 中转带不渲染。
+const taskChips = inject(GCS_TASK_CHIPS_KEY, undefined)
+
+/**
+ * 中转带拖拽：芯片拖到 dock 的 ＋ 附近时半圆展开（判距在 BottomNavBar），
+ * 松手落在弧上某项即跳该分析页——结果图层本来就挂在 App 作用域，换页后仍压在地图上。
+ * 命中区用 elementFromPoint 找弧项的 data-dock-route，不新建一套坐标表。
+ */
+const railDragPoint = ref<{ x: number; y: number } | null>(null)
+
+function onRailDragMove(payload: ChipDragPoint): void {
+  railDragPoint.value = { x: payload.x, y: payload.y }
+}
+
+function onRailDragEnd(payload: ChipDragPoint): void {
+  railDragPoint.value = null
+  const target = document
+    .elementFromPoint(payload.x, payload.y)
+    ?.closest<HTMLElement>('[data-dock-route]')
+  const path = target?.dataset.dockRoute
+  if (path) void router.push(path)
+}
+
+// 抽屉业务行：取 navConfig 派生的业务项（core 不引 business，由 App.vue 注入）
 
 // 雷达图依赖 ECharts；保持动态加载，避免布局基座把它并进首屏入口图。
 const GlobalRadarPanel = defineAsyncComponent(() => import('./components/GlobalRadarPanel.vue'))
@@ -56,6 +80,23 @@ watch(sliderFocusActive, (act) => {
     p.classList.toggle('slider-focus-panel', act && p === sliderActivePanel.value)
   })
 })
+
+// 手机档（<640）把地图压到上半屏：统一挂在 body 上，由 style.css 收 .unified-map-wrapper 高度。
+// 用 body class 而非媒体查询，断点仍只由 useGCS 的 layoutTierFor 一处判定。
+watch(navCompact, (on) => document.body.classList.toggle('layout-console', on), { immediate: true })
+onUnmounted(() => {
+  // AppLayout 是页面级组件（HomePage/ProfilePage/业务页各自包一层），路由切换时
+  // 新实例先挂、旧实例后卸；此处若同步摘 class，会把新实例刚挂上的 layout-console
+  // 抹掉。真机复现：390 下从首页点「个人中心」，body 类名变空、地图撑回 844px
+  // （清零的是地图上沿高度，控制台还压在它上面）。延后一拍，等新布局已在 DOM 里
+  // 再判断是否真的没有任何 AppLayout 存活。
+  void nextTick(() => {
+    if (document.querySelector('.app-layout')) return
+    document.body.classList.remove('layout-console')
+  })
+})
+// 控制台底部让开 dock（dock 是 1 cell 高的 GCSPanel，同源取 cellPixel，不写死像素）
+const consoleStyle = computed(() => ({ bottom: `${Math.round(cellPixel.value * 1.7)}px` }))
 
 // 专注态激活期间切路由 ⇒ 旧页 AppLayout 卸载，而 useSliderFocus 的
 // onScopeDispose(endSliderFocus) 与本 watch 的效果在同一批 scope.stop() 里停掉，
@@ -139,12 +180,64 @@ function goBusiness(item: NavItem): void {
             <LayerControlPanel />
           </GCSPanel>
         </slot>
+        <!-- 图层控制单独一口：桌面档按 placements 绝对定位，位置与在 #right 里无差别；
+             手机档控制台按「参数 → 结果 → 图层」排阅读顺序，必须能把它排到最后 -->
+        <slot name="layers" />
       </div>
     </template>
 
-    <!-- ===== 抽屉菜单（抽屉模式 <960px） =====
-         业务入口（sticky 冻结首行）+ 城市切换 + 业务面板；档位 1 时菜单键不存在 -->
-    <MobileDrawer :open="drawerOpen" @close="closeDrawer">
+    <!-- ===== 控制台（手机档 <640px） =====
+         地图收上半屏，原抽屉里的图层控制 / 业务面板整体搬到下半屏（压缩排版，尽量一屏放完）。
+         抽屉在手机档不再渲染——入口是 dock 的 ＋ 半圆，内容是这张控制台。 -->
+    <section v-if="navCompact" class="mobile-console" :style="consoleStyle" aria-label="控制台">
+      <!-- 中转带：已完成任务结果的芯片，点一下上图/撤下（App 供给，桌面档在右下浮条里）。
+           放在滚动区外：结果下来时控制台常已滚到参数区，放在里面会跟着滚走 -->
+      <ConsoleRail
+        v-if="taskChips && taskChips.chips.value.length"
+        :chips="taskChips.chips.value"
+        @toggle="taskChips.toggle"
+        @dragmove="onRailDragMove"
+        @dragend="onRailDragEnd"
+      />
+      <div class="console-head">
+        <span class="console-title">{{
+          (route.meta?.title as string) || '北部湾智慧港口平台'
+        }}</span>
+        <div class="console-cities">
+          <NavButton
+            v-for="city in Object.keys(MAP_CONFIG.CITY_CENTERS)"
+            :key="city"
+            :label="city"
+            @click="flyToCity(city)"
+          />
+          <NavButton
+            :icon="isDark ? '☀️' : '🌙'"
+            class="theme-toggle"
+            aria-label="切换主题"
+            @click="toggleTheme"
+          />
+        </div>
+      </div>
+      <div class="console-body">
+        <template v-if="route.name === 'Home'">
+          <HomeAnalysisGrid />
+          <div class="console-card"><LayerControlPanel /></div>
+        </template>
+        <template v-else-if="route.name === 'Profile'">
+          <slot name="right" />
+        </template>
+        <template v-else>
+          <slot name="right" />
+          <slot name="left" />
+          <!-- 图层控制放最后：控制台是按 DOM 顺序自上而下读的 -->
+          <slot name="layers" />
+        </template>
+      </div>
+    </section>
+
+    <!-- ===== 抽屉菜单（平板档 640–959px） =====
+         业务入口（sticky 冻结首行）+ 城市切换 + 业务面板；手机档已由上方控制台承接 -->
+    <MobileDrawer v-if="!navCompact" :open="drawerOpen" @close="closeDrawer">
       <div class="drawer-menu">
         <!-- 业务入口行：滚动时冻结（sticky） -->
         <div class="drawer-menu__row drawer-menu__row--sticky" aria-label="业务功能">
@@ -186,16 +279,18 @@ function goBusiness(item: NavItem): void {
             <slot name="right" />
           </template>
           <template v-else>
-            <!-- 操作/控制面板（right slot）在前，可视化面板（left slot）在后：避免首屏全是空白图表 -->
+            <!-- 操作/控制面板（right slot）在前，可视化面板（left slot）次之，图层控制最后：
+                 与手机档控制台同序（right → left → layers），图层不再夹在参数与结果之间 -->
             <slot name="right" />
             <slot name="left" />
+            <slot name="layers" />
           </template>
         </template>
       </div>
     </MobileDrawer>
 
     <!-- 底部导航（3 按钮：首页/个人中心/菜单） -->
-    <BottomNavBar />
+    <BottomNavBar :drag-point="railDragPoint" />
   </div>
 </template>
 
@@ -233,6 +328,174 @@ function goBusiness(item: NavItem): void {
   align-items: center;
   justify-content: space-around;
   box-sizing: border-box;
+}
+
+/* ===== 手机档控制台 ===== */
+.mobile-console {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 46vh;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background-color: var(--GCS-bg-container);
+  border-top: 1px solid var(--GCS-border-light);
+  pointer-events: auto;
+  box-sizing: border-box;
+}
+
+.console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+}
+
+.console-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--GCS-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.console-cities {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.console-cities :deep(.GCS-button) {
+  --GCS-button-w: 44px;
+  --GCS-button-h: 26px;
+
+  font-size: 11px;
+}
+
+/* 内容区唯一可滚动的地方；面板改为正常流堆叠，压缩后尽量一屏放完 */
+.console-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  /* 末端留白：最后一行（如年份刻度）贴到滚动区底边时会被 dock 上沿的
+     拖拽手柄压住半个字，实测 390×844 预测页 */
+  padding-bottom: 12px;
+}
+
+.console-card {
+  background-color: var(--GCS-bg-panel);
+  border-radius: var(--GCS-radius-md);
+  box-shadow: var(--GCS-shadow-sm);
+  padding: 6px;
+}
+
+/* 面板进控制台后按内容高度堆叠。
+   GCSPanel 把 left/top/width/height 写成内联 CSS 变量，所以这里必须 !important 才压得住
+   （与 style.css 里 .GCS-drawer__body .GCS-panel 的抽屉归一化同一手法）。 */
+.console-body :deep(.GCS-panel) {
+  /* 选择器特异度（.console-body[data-v-x] .GCS-panel）已经高于 .GCS-panel 自身，
+     这里不需要 !important——GCSPanel 的定位走的是 CSS 变量，不是内联属性 */
+  position: static;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  overflow: visible;
+
+  /* flex 列里不能压缩：被压扁时内层内容会溢出到面板外、盖住 dock */
+  flex: 0 0 auto;
+  padding: 6px;
+}
+
+.console-body :deep(.GCS-panel > *) {
+  height: auto;
+}
+
+/* 图表给确定高度：面板改 auto 后 flex:1 的挂载点会塌成 0，ECharts 按 0 高初始化。
+   170 不是随手取的：CHART_GRID 上下各留 40px（标题 + 图例），110px 时绘图区只剩 30px，
+   纵轴刻度挤在一起、双轴图右侧 700,000 这类六位数会被画布边缘裁掉；150px 仍会重叠，
+   170px 是实测刻度互不压且右轴完整的第一个高度。 */
+.console-body :deep(.line-chart),
+.console-body :deep(.bar-chart),
+.console-body :deep(.suit-radar-chart),
+.console-body :deep(.transfer-chart),
+.console-body :deep(.chart-container) {
+  flex: 0 0 auto;
+  height: 170px;
+}
+
+/* 图层控制在控制台里按「2×1 GCS 按钮」排：列数与行高由组件按容器实测宽度反推
+   （LayerControlPanel 的 compactGridStyle 写入 --layer-cols/--layer-row-h/--layer-gap），
+   这里只负责解除面板内的高度约束，不再写死列数与行高——
+   写死过 3 列 / 44px，与组件的 2×1 尺寸各说各话（用户截图：比城市按钮和 dock 宽一档）。 */
+.console-body :deep(.layer-grid) {
+  grid-template-columns: repeat(var(--layer-cols, 3), 1fr);
+  grid-auto-rows: var(--layer-row-h, 44px);
+  height: auto;
+  overflow: visible;
+}
+
+.console-body :deep(.layer-btn) {
+  flex-direction: row;
+  gap: 4px;
+  padding: 0 6px;
+  font-size: var(--layer-font, 12px);
+}
+
+.console-body :deep(.layer-icon) {
+  font-size: calc(var(--layer-font, 12px) * 1.1);
+}
+
+/* 浸没报告的内容区在桌面档用绝对定位钉在 2.8cell 的灰框里（宽高 top/left 都是内联算出来的）。
+   控制台里面板高度是 auto，绝对定位的内容不再为面板贡献高度 ⇒ 面板塌成标题那条、
+   报告行整块溢到下一块面板上。这里把它放回正常流，高度由行数决定。 */
+.console-body :deep(.flood-analysis-report-panel .report-content) {
+  position: static !important;
+  width: auto !important;
+  height: auto !important;
+  top: auto !important;
+  left: auto !important;
+}
+
+/* 个人中心是「占满 4×8 面板」写的：内容区 height:100% + 子块 flex:1 1 0。
+   控制台里面板高度变 auto 后，flex-basis 0 的子块会被算成 0 高、再被内容区的
+   overflow:hidden 裁掉，只剩顶上一条。这里让它们按内容展开。 */
+.console-body :deep(.profile-content) {
+  height: auto !important;
+  overflow: visible !important;
+}
+
+.console-body :deep(.profile-login),
+.console-body :deep(.profile-logged-in) {
+  flex: 0 0 auto !important;
+}
+
+/* 压缩：面板内的区块间距与字号整体收一档（目标是一屏放完，不靠滑） */
+.console-body :deep(.GCS-panel) {
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+/* 内容区不许再按 cell 高度 flex 撑满 */
+.console-body :deep(.GCS-panel > * > *) {
+  min-height: 0;
+}
+
+.console-body :deep(.GCS-panel .layer-grid),
+.console-body :deep(.GCS-panel .btn-grid),
+.console-body :deep(.GCS-panel .criteria-grid) {
+  gap: 4px;
 }
 
 /* ===== 抽屉菜单 ===== */

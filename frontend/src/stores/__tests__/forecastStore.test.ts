@@ -46,14 +46,6 @@ describe('useForecastStore', () => {
     })
   })
 
-  describe('setTimeGranularity', () => {
-    it('应更新时间粒度', () => {
-      const store = useForecastStore()
-      store.setTimeGranularity('year')
-      expect(store.timeGranularity).toBe('year')
-    })
-  })
-
   describe('setConfidenceThreshold', () => {
     it('应更新对应指标的置信度阈值', () => {
       const store = useForecastStore()

@@ -6,6 +6,7 @@
 export * from './config'
 export * from './layout/navConfig'
 export * from './layout/routeReadiness'
+export * from './layout/taskChipsContext'
 export * from './layout/taskIndicator'
 export * from './layout/useMobileDrawer'
 export * from './layout/useSliderFocus'

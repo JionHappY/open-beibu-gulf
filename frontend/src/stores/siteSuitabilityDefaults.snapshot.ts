@@ -30,6 +30,13 @@ export const SNAPSHOT_WEIGHTS: SuitabilityWeightsState = {
 }
 
 export const SNAPSHOT_MIN_LAND_FRAC = 0.5
+/**
+ * 陆地占比上限（与后端 DEFAULT_MAX_LAND_FRAC 同值）：0.99 = 只留"格内有水"的格，
+ * 等价于水陆交界带；1 表示不设上限（可复现旧行为）。
+ */
+export const SNAPSHOT_MAX_LAND_FRAC = 0.99
+/** 距最近既有港口上限（km）：与后端 DEFAULT_MAX_PORT_DISTANCE_KM 同值（作者设定） */
+export const SNAPSHOT_MAX_PORT_DISTANCE_KM = 50
 
 /** 快照身份：每次 warn 兜底时原样输出，凭它判定"这次是兜底" */
 export const SNAPSHOT_PROVENANCE = {

@@ -50,19 +50,6 @@ export const businessModules: BusinessModule[] = [
     reset: () => useSiteSuitabilityStore().reset(),
   },
   {
-    name: 'DiversionAnalysis',
-    path: '/diversion-analysis',
-    // Cesium ③：3D 弧线可视化前提。引擎切换/导航进度环判据均由 meta.engine 派生（App.vue）
-    engine: '3d',
-    title: '分流分析',
-    navLabel: '分流分析',
-    navIcon: 'diversion',
-    component: () => import('@/business/diversion').then((m) => m.DiversionPage),
-    // 页面状态为本地 ref（年份/结果），无持久 store；登出时路由保留，
-    // reset 声明为 no-op 以维持"已实现模块必须声明 reset"的清单不变量（同上一条）
-    reset: () => {},
-  },
-  {
     name: 'Forecast',
     path: '/forecast',
     engine: '2d',

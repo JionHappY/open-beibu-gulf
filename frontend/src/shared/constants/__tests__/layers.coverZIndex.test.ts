@@ -39,7 +39,6 @@ describe('isCoverLayerKey — 覆盖层 key 判据（W50 修复的判据面）',
       LAYER_KEYS.terrain,
       LAYER_KEYS.routePath,
       LAYER_KEYS.routeEndpoint,
-      LAYER_KEYS.diversionCanal,
       LAYER_KEYS.floodWaterSurface,
       '',
     ]) {

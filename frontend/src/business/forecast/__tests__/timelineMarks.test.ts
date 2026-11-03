@@ -21,13 +21,7 @@ import { describe, expect, it } from 'vitest'
 
 import { BASE_YEAR, END_YEAR } from '@/shared'
 
-import {
-  currentTimeToStep,
-  monthMaxSteps,
-  timelineYears,
-  yearMarkPosition,
-  yearMaxSteps,
-} from '../timeline'
+import { currentTimeToStep, monthMaxSteps, timelineYears, yearMarkPosition } from '../timeline'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PANEL = join(HERE, '..', 'components', 'ForecastControlPanel.vue')
@@ -89,11 +83,14 @@ describe('刻度域单源：年份与位置公式一律派生自 ../timeline', (
     expect(scriptOf(PANEL)).toMatch(/timelineYears\(\)/)
 
     const tmpl = templateOf(PANEL)
-    const calls = [...tmpl.matchAll(/yearMarkPosition\(m\.year,\s*isYearMode,\s*maxSteps\)/g)]
+    // 年粒度入口已删除（G1）：yearMode 形参也一并撤掉，模板只剩 (年, 上限) 两参
+    const calls = [...tmpl.matchAll(/yearMarkPosition\(m\.year,\s*maxSteps\)/g)]
     // 两处调用：t-tick--end 判据 + left 百分比
     expect(calls.length).toBe(2)
     // 阳性对照：模板里刻度确实在渲染（不是空分母）
     expect(tmpl).toMatch(/v-for="\(m, i\) in YEAR_MARKS"/)
+    // G1：年粒度入口整块移除，面板脚本里不应再有 isYearMode
+    expect(stripComments(scriptOf(PANEL))).not.toMatch(/isYearMode/)
   })
 
   it('timeline 的 yearMarkPosition 经 currentTimeToStep 派生，不复制步长公式', () => {
@@ -122,29 +119,18 @@ describe('timelineYears / yearMarkPosition 行为（派生自权威源 BASE_YEAR
     const years = timelineYears()
     const mid = Math.round((BASE_YEAR + END_YEAR) / 2)
     expect(years).toEqual([BASE_YEAR, mid, END_YEAR])
-    // 阳性对照：年数差非零，位置分母才有效
-    expect(yearMaxSteps()).toBeGreaterThan(0)
+    // 阳性对照：位置分母非零，百分比才有意义
     expect(monthMaxSteps()).toBeGreaterThan(0)
   })
 
-  it('年模式位置：起止 0% / 100%，中点落 50%', () => {
-    const max = yearMaxSteps()
-    const mid = Math.round((BASE_YEAR + END_YEAR) / 2)
-    expect(yearMarkPosition(BASE_YEAR, true, max)).toBe(0)
-    expect(yearMarkPosition(END_YEAR, true, max)).toBe(100)
-    expect(yearMarkPosition(mid, true, max)).toBeCloseTo(50, 10)
-  })
-
-  it('月模式位置 = 该年 1 月月步 / 月步上限（与 currentTimeToStep 逐值一致）', () => {
+  it('位置 = 该年 1 月月步 / 月步上限（与 currentTimeToStep 逐值一致）', () => {
     const max = monthMaxSteps()
     const mid = Math.round((BASE_YEAR + END_YEAR) / 2)
     for (const year of [BASE_YEAR, mid, END_YEAR]) {
-      const expected = (currentTimeToStep(`${year}-01`, false) / max) * 100
-      expect(yearMarkPosition(year, false, max)).toBe(expected)
+      const expected = (currentTimeToStep(`${year}-01`) / max) * 100
+      expect(yearMarkPosition(year, max)).toBe(expected)
     }
     // 终点刻度：末月步落 100%
-    expect(yearMarkPosition(END_YEAR, false, max)).toBe(
-      ((monthMaxSteps() - 11) / monthMaxSteps()) * 100
-    )
+    expect(yearMarkPosition(END_YEAR, max)).toBe(((monthMaxSteps() - 11) / monthMaxSteps()) * 100)
   })
 })

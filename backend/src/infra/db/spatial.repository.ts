@@ -13,7 +13,7 @@ import { isFatalDbError } from './db-error'
 // 坐标系统一 4326：本模块几何全部由入参经纬度现算，不读取库表几何（表为 4490/CGCS2000），
 // 故无混合 SRID 风险。若后续改为直读表几何参与运算，必须显式 ST_Transform 到同一 SRID。
 
-export interface LngLat {
+interface LngLat {
   lng: number
   lat: number
 }

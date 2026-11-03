@@ -25,7 +25,6 @@ describe('business/manifest 登出重置注册', () => {
   it('已实现业务模块均声明 reset（登出重置）', () => {
     const implemented = businessModules.filter((m) => m.component !== null)
     expect(implemented.map((m) => m.name).sort()).toEqual([
-      'DiversionAnalysis',
       'FloodAnalysis',
       'Forecast',
       'RouteAnalysis',
@@ -34,11 +33,6 @@ describe('business/manifest 登出重置注册', () => {
     for (const m of implemented) {
       expect(m.reset, `${m.name} 缺少登出 reset`).toBeDefined()
     }
-  })
-
-  it('分流分析已切 3D 引擎（Cesium ③：弧线可视化前提；翻回 2d 即红）', () => {
-    const diversion = businessModules.find((m) => m.name === 'DiversionAnalysis')
-    expect(diversion?.engine).toBe('3d')
   })
 
   it('RouteAnalysis 已实现（组件非 null、注册路由、声明 reset）', () => {
@@ -70,8 +64,8 @@ describe('business/manifest 登出重置注册', () => {
       )
       expect(resolved, `${String(r.path)} 解析成 undefined`).not.toBeUndefined()
     }
-    expect(report.length, '路由数为 0：判据空转').toBe(5)
-    // 本用例串行导航 5 条业务路由，每条 lazy import 一整页 SFC 与其依赖树；
+    expect(report.length, '路由数为 0：判据空转').toBe(4)
+    // 本用例串行导航 4 条业务路由，每条 lazy import 一整页 SFC 与其依赖树；
     // 在 --coverage（pre-push 第 14 步 test:report:fe）下 v8 逐模块插桩放大约 16 倍，
     // 实测 2.3s → 36.6s，撞全局 30s 上限（本机 2026-10-21 复现）。
     // 只抬本用例上限，不动全局 testTimeout 与任何断言；同族先例见

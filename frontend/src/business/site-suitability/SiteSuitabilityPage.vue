@@ -51,6 +51,12 @@ type CellProperties = { id: number; score: number } & Partial<
 const CANDIDATE_LIMIT = 60
 
 /**
+ * 格网总格数：候选名单只列前 60，面板上必须写清「总共多少格、取的是前多少」，
+ * 否则 15 页翻完会让人以为整个格网只有 60 个候选（截断不透明，见 data-audit 的口径要求）。
+ */
+const totalCells = computed(() => state.data?.features?.length ?? 0)
+
+/**
  * 候选格名单：复用共享 PaginatedListPanel（与旧版选址页的「小区名单」同一组件、同一视觉）。
  * 其 items 契约是「带坐标的评分点 + breakdown」，本页把格子按同一形状映射，
  * 五准则子分装进 breakdown（既满足契约也语义正确）。
@@ -113,13 +119,32 @@ useProfileSnapshot({
   clear: () => state.reset(),
 })
 
+/**
+ * 同一组权重「在途」标记。
+ *
+ * 默认值回写会触发一次 300ms 防抖的 doUpdate：若首刷请求（AHP 栅格，重）还没回来，
+ * 第二次就会 cache miss 再发一遍同样的请求（实测进页面就发两次 /site-suitability/map，
+ * 参数逐字相同）。这里按「签名相同且在途」丢弃重复，请求回来后再同权重只会命中缓存。
+ */
+let inFlightSignature: string | null = null
+
+function requestSignature(): string {
+  return JSON.stringify({ w: state.weights, land: state.minLandFrac })
+}
+
 async function doUpdate() {
   if (!renderer.value) return
-  // 权重权威源在后端：首刷前拉一次 defaults（幂等 once；失败走快照兜底，
-  // 写回 weights 会触发下方 weights watch，但二次 doUpdate 命中 LRU 缓存零请求）
+  // 权重权威源在后端：首刷前拉一次 defaults（幂等 once；失败走快照兜底）
   await state.loadDefaults()
+  const signature = requestSignature()
+  if (signature === inFlightSignature) return
+  inFlightSignature = signature
   const { transactionId, signal } = startTransaction()
-  await updateLayer(transactionId, signal)
+  try {
+    await updateLayer(transactionId, signal)
+  } finally {
+    if (inFlightSignature === signature) inFlightSignature = null
+  }
 }
 
 watch(
@@ -171,27 +196,35 @@ onUnmounted(() => {
           draggable
           @drop="(z: HTMLElement) => onDrop('candidates', z)"
         >
-          <PaginatedListPanel
-            :items="candidates"
-            :page-size="4"
-            :loading="state.isRequesting"
-            title="候选格名单"
-            empty-text="暂无候选"
-            :show-favorite="false"
-            :fly-to="flyToCandidate"
-          >
-            <template #item="{ item, index }">
-              <span class="cell-rank">{{ index + 1 }}</span>
-              <span class="cell-name">{{ item.name }}</span>
-              <span class="cell-score">{{ item.score.toFixed(3) }}</span>
-            </template>
-          </PaginatedListPanel>
+          <div class="candidates-body">
+            <p v-if="totalCells" class="list-note" data-testid="candidate-total">
+              共 {{ totalCells.toLocaleString() }} 格 · 按得分取前 {{ candidates.length }} ·
+              仅含水陆交界格 · 距既有港口 ≤ {{ state.maxPortDistanceKm }} km · 点击行定位
+            </p>
+            <PaginatedListPanel
+              :items="candidates"
+              :page-size="4"
+              :loading="state.isRequesting"
+              title="候选格名单"
+              empty-text="暂无候选"
+              :show-favorite="false"
+              :fly-to="flyToCandidate"
+            >
+              <template #item="{ item, index }">
+                <span class="cell-rank">{{ index + 1 }}</span>
+                <span class="cell-name">{{ item.name }}</span>
+                <span class="cell-score">{{ item.score.toFixed(3) }}</span>
+              </template>
+            </PaginatedListPanel>
+          </div>
         </GCSPanel>
       </template>
       <template #right>
         <GCSPanel v-bind="placements.control">
           <SiteSuitabilityControlPanel />
         </GCSPanel>
+      </template>
+      <template #layers>
         <GCSPanel v-bind="placements.layers">
           <LayerControlPanel />
         </GCSPanel>
@@ -210,6 +243,27 @@ onUnmounted(() => {
 
 .ss-page :deep(.GCS-panel) {
   pointer-events: auto;
+}
+
+.candidates-body {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 说明行是兄弟节点，列表要自己吃掉剩余高度：height:100% 会连带说明行溢出面板 */
+.candidates-body :deep(.paginated-list-panel) {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+}
+
+.list-note {
+  margin: 0;
+  padding: 6px 10px 0;
+  font-size: var(--GCS-font-size-xs);
+  color: var(--GCS-text-secondary);
 }
 
 /* 候选名单三列（对齐旧版选址页名单的排布：排名 / 名称 / 得分） */

@@ -24,11 +24,11 @@ import {
   useOwnedLayers,
   useStackablePanels,
 } from '@/core'
-import { DEFAULT_LAYER_ORDER, loadStatic, logger, showToast } from '@/shared'
+import { DEFAULT_LAYER_ORDER, isFiniteLngLat, loadStatic, logger, showToast } from '@/shared'
 import { useMapStore, useTaskStore } from '@/stores'
 import type { MapRenderer, RoutePathResult } from '@/types'
-import type { TaskSlot } from '@/types/task'
 import { pingluImageryIndexSchema, tilesetJsonSchema } from '@/types/schemas'
+import type { TaskSlot } from '@/types/task'
 
 import RouteControlPanel from './components/RouteControlPanel.vue'
 import { fitViewForPath } from './composables/pathFit'
@@ -226,7 +226,7 @@ function handleRendererClick(event: CustomEvent<{ coordinate: [number, number] |
   if (!coordinate || !Array.isArray(coordinate) || coordinate.length < 2) return
   const lng = Number(coordinate[0])
   const lat = Number(coordinate[1])
-  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return
+  if (!isFiniteLngLat({ lng, lat })) return
   void panelRef?.value?.handleMapPick(lng, lat)
 }
 
@@ -491,6 +491,8 @@ onUnmounted(() => {
           @cleared="handleCleared"
           @dock="handleDock"
         />
+      </template>
+      <template #layers>
         <GCSPanel :w="4" :h="4" anchor="top-right" :offset-x="0" :offset-y="5.5">
           <LayerControlPanel
             :layer-order="[...DEFAULT_LAYER_ORDER, ROUTE_PATH_LAYER_ID]"

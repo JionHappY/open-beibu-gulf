@@ -4,6 +4,7 @@ import { CHART_COLORS, CHART_GRID, chartColor, useTheme } from '@/shared'
 import { chartAxisLineOption, chartTitleOption } from '@/visualization/charts/chartTheme'
 import type { UseEChartsReturn } from '@/visualization/composables/useECharts'
 import { useECharts } from '@/visualization/composables/useECharts'
+import type { ChartSeries } from '@/types'
 
 /** 图表基础 props（LineChart / BarChart 通用） */
 interface ChartBaseProps {
@@ -11,7 +12,7 @@ interface ChartBaseProps {
   xData?: string[]
   // data 允许 null（无数据空档，ECharts 原生支持）
   // yAxisIndex：该系列绑定的数值轴（双轴图使用；省略默认 0 即左轴）
-  series?: Array<{ name: string; data: Array<number | null>; yAxisIndex?: number }>
+  series?: ChartSeries[]
   xMin?: string
   xMax?: string
   yUnit?: string

@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 
 import { EmptyState } from '@/shared'
+import type { ChartSeries } from '@/types'
 
 import { useChartBase } from './composables/useChartBase'
 
@@ -9,7 +10,7 @@ interface Props {
   title?: string
   xData?: string[]
   // data 允许 null（无数据空档，ECharts 原生支持），禁止调用方折叠为 0
-  series?: Array<{ name: string; data: Array<number | null> }>
+  series?: ChartSeries[]
   xMin?: string
   xMax?: string
   /** y 轴单位（如「万吨」）；F4 起由 ForecastPage 从接口 unit 透传 */

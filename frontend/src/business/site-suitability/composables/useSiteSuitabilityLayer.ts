@@ -1,7 +1,8 @@
 /**
- * useSiteSuitabilityLayer — 新选址分析热力图层（单元五）：
+ * useSiteSuitabilityLayer — 新选址分析评分图层（单元五）：
  * 注册经 useOwnedLayers（归属册），更新走 BusinessLayerManager.updateData；
- * 渲染为热力图（weightField='score'），权重/过滤变化由页面防抖后调 update。
+ * 渲染为分级着色方块（choropleth，见 ../choropleth.ts——不是 kde 热区，
+ * 梯度按分数分档算出来），权重/过滤变化由页面防抖后调 update。
  * 请求直连统一入口 useApiRequest（契约 schema 校验在 HTTP 边界）。
  * 成功响应发布到 store.data（左上得分分布 / 左下 Top-N 面板消费）。
  */
@@ -16,8 +17,9 @@ import {
   handleAuthError,
   isAuthError,
   showError,
-  LAYER_DEFAULTS,
+  PORT_FEATURE_COLOR,
   SITE_SUITABILITY_LAYER_KEY,
+  withAlpha,
   useApiRequest,
   useSlowRequestOffer,
 } from '@/shared'
@@ -28,6 +30,7 @@ import type { LayerOptions, LayerType, MapRenderer } from '@/types'
 import type { SiteSuitabilityResponseParsed } from '@/types/schemas'
 import { siteSuitabilityResponseSchema } from '@/types/schemas'
 
+import { binAlpha, choroplethFeatures } from '../choropleth'
 import { useSiteSuitabilityRequest } from './useSiteSuitabilityRequest'
 
 const LAYER_LABEL = '选址分析'
@@ -48,28 +51,34 @@ const SITE_SUITABILITY_ROUTE_PATH = '/site-suitability'
  * 取 0.02°：对区域级热力图视觉无损，payload 已回到"秒开"量级；需要更细时调小该值即可。
  */
 const DISPLAY_RESOLUTION_DEG = 0.02
-const LAYER_TYPE: LayerType = 'heatmap'
-
-/** 热力图色带与渲染参数（与预测图层同款形式，weightField 改 score）；色带单源 LAYER_DEFAULTS.heatmapGradient（D21-4） */
-const GRADIENT = [...LAYER_DEFAULTS.heatmapGradient]
+const LAYER_TYPE: LayerType = 'geojson'
 
 /**
- * 展示阈值（v4 后续迭代 2026-10-05 用户选定「阈值渲染」）：只上图 score ≥ 本值的格——
- * 全量渲染会把中低分格也涂成实色，'哪里适宜'反而不可见（用户实测'全图都是'）。
- * 左上面板/Top-N 仍消费全量分布（store.setData 不受影响），本阈值只作用于图层。
- * 调整口径：与左侧候选名单阈值视觉对齐即可，无文献锚点（作者设定）。
+ * 图层数据：评分格 → 分级着色方块。
+ *
+ * 以前这里做的是 `filter(score >= 0.7)` 再喂 kde（radius 18 / blur 14）——低分格被整片
+ * 抹掉、高分格被模糊成一团，用户看到的是「点数据画的彩色缓冲区」。现在每格画成与聚合
+ * 分辨率等大的方块，颜色按**本次结果的五分位**分 5 档（同一品牌蓝，透明度表达高低）。
+ *
+ * 低分不再被滤掉：最低档仍有 0.16 的透明度，让「不推荐但也没被排除」的格看得见，
+ * 否则地图上大片空白，读者无从判断是"没有数据"还是"分数低"。
  */
-const MIN_DISPLAY_SCORE = 0.7
-
-/** 图层渲染只保留达标格（GeoJSON FeatureCollection 过滤，不引业务类型） */
-function filterByScore(features: SiteSuitabilityResponseParsed['features']) {
-  return features.filter(
-    (f) => Number((f.properties as { score?: number }).score) >= MIN_DISPLAY_SCORE
-  )
+function toLayerData(
+  features: SiteSuitabilityResponseParsed['features']
+): ReturnType<typeof choroplethFeatures> {
+  const points = features.flatMap((f) => {
+    const [lng, lat] = f.geometry.coordinates
+    const score = Number((f.properties as { score?: number }).score)
+    return Number.isFinite(lng) && Number.isFinite(lat) ? [{ lng, lat, score }] : []
+  })
+  return choroplethFeatures(points, DISPLAY_RESOLUTION_DEG)
 }
 
 function getLayerOptions(): LayerOptions {
-  return { weightField: 'score', radius: 18, blur: 14, gradient: GRADIENT }
+  return {
+    // 档位在数据侧算好（choropleth 按本次结果五分位切），样式侧只查表
+    featureFill: (props) => withAlpha(PORT_FEATURE_COLOR, binAlpha(Number(props.bin))),
+  }
 }
 
 interface UseSiteSuitabilityLayerReturn {
@@ -140,6 +149,8 @@ export function useSiteSuitabilityLayer(): UseSiteSuitabilityLayerReturn {
     return {
       ...Object.fromEntries(Object.entries(weights).map(([k, v]) => [`w_${k}`, v])),
       min_land_frac: state.minLandFrac,
+      max_land_frac: state.maxLandFrac,
+      max_port_distance_km: state.maxPortDistanceKm,
       // 性能治本（2026-10-02）：全量 14 万格 ≈ 28.8MB 响应 ⇒ 浏览器解析即卡。
       // 热力图按 ~1km 粗格聚合（服务端 AVG + 众数）在视觉上等价，payload 降 30-50×。
       resolution: DISPLAY_RESOLUTION_DEG,
@@ -175,7 +186,7 @@ export function useSiteSuitabilityLayer(): UseSiteSuitabilityLayerReturn {
     if (!result || !Array.isArray(result.features)) return
     state.setData(result)
     manager.updateData(SITE_SUITABILITY_LAYER_KEY, {
-      data: filterByScore(result.features),
+      data: toLayerData(result.features),
       options: getLayerOptions(),
     })
   }
@@ -209,7 +220,7 @@ export function useSiteSuitabilityLayer(): UseSiteSuitabilityLayerReturn {
         //（旧事务的 finally 见事务已失效不会回写，否则 loading 会永久悬停）
         state.setIsRequesting(false)
         manager.updateData(SITE_SUITABILITY_LAYER_KEY, {
-          data: filterByScore(cached.features),
+          data: toLayerData(cached.features),
           options: getLayerOptions(),
         })
         return
@@ -244,7 +255,7 @@ export function useSiteSuitabilityLayer(): UseSiteSuitabilityLayerReturn {
       state.setData(geojson)
       requestCache.set(key, geojson)
       manager.updateData(SITE_SUITABILITY_LAYER_KEY, {
-        data: filterByScore(geojson.features),
+        data: toLayerData(geojson.features),
         options: getLayerOptions(),
       })
     } catch (e) {

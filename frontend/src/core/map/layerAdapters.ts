@@ -5,6 +5,9 @@
  */
 
 import type { FeatureCollection } from 'geojson'
+import type { FeatureLike } from 'ol/Feature'
+import { Fill, Style } from 'ol/style'
+import type { StyleFunction } from 'ol/style/Style'
 
 import { logger } from '@/shared'
 import type {
@@ -61,6 +64,21 @@ export function resolveLayerPanelState(
 const MAX_FEATURES = 500_000
 
 /** 要素数硬上限：三个数据守卫共用同一文案与阈值 */
+/**
+ * 把业务侧的 per-feature 填充色回调包成 OL 样式函数。
+ *
+ * 业务层只回一个 CSS 颜色（`LayerOptions.featureFill`），OL 的 Style/Fill 构造留在核心层——
+ * 否则 `business/**` 就得 import 'ol/style'，而 OLRenderer 体量已冻结（z016：新增内容另开文件），
+ * 也不该再往里加代码。
+ */
+function withFeatureFill(options: LayerOptions): LayerOptions {
+  const fill = options.featureFill
+  if (!fill) return options
+  const style: StyleFunction = (feature: FeatureLike): Style =>
+    new Style({ fill: new Fill({ color: fill(feature.getProperties()) }) })
+  return { ...options, style }
+}
+
 function assertMaxFeatures(count: number): void {
   if (count > MAX_FEATURES) {
     throw new Error(`[layerAdapters] 要素数超上限（${MAX_FEATURES}），实际 ${count}，请分批或裁剪`)
@@ -319,7 +337,7 @@ export const LAYER_ADAPTERS: Record<LayerType, LayerAdapter> = {
     engines: DEFAULT_ENGINES,
     create: (renderer, key, data, options) => {
       assertFeatureCollection(data)
-      renderer.addGeoJsonLayer(key, data, options)
+      renderer.addGeoJsonLayer(key, data, withFeatureFill(options))
     },
     update: (renderer, key, data, options) => {
       assertFeatureCollection(data)
@@ -331,10 +349,10 @@ export const LAYER_ADAPTERS: Record<LayerType, LayerAdapter> = {
         }
       ).updateGeoJsonLayer
       if (typeof updater === 'function') {
-        updater.call(renderer, key, data, options)
+        updater.call(renderer, key, data, withFeatureFill(options))
       } else {
         renderer.removeLayer(key)
-        renderer.addGeoJsonLayer(key, data, options)
+        renderer.addGeoJsonLayer(key, data, withFeatureFill(options))
       }
     },
     remove: removeLayerAdapter,

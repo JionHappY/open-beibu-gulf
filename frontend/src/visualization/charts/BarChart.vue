@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import type { ChartSeries } from '@/types'
 
 import { EmptyState } from '@/shared'
 
@@ -9,7 +10,7 @@ interface Props {
   title?: string
   xData?: string[]
   // data 允许 null（无数据空档，ECharts 原生支持），禁止调用方折叠为 0
-  series?: Array<{ name: string; data: Array<number | null>; yAxisIndex?: number }>
+  series?: ChartSeries[]
   /** 左轴单位（如「万吨」）；F4 起由 ForecastPage 从接口 unit 透传 */
   yUnit?: string
   /** 右轴单位：传入时渲染双 Y 轴（不同量纲系列各占一轴） */

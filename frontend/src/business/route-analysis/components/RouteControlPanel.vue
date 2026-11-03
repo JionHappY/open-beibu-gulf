@@ -559,6 +559,7 @@ defineExpose({
           :class="{ focused: poiDropOpen }"
           type="text"
           placeholder="搜索港口/设施/小区/POI（名称过滤）…"
+          aria-label="搜索地点"
           @focus="poiDropOpen = true"
           @input="onPoiInput"
         />

@@ -40,6 +40,13 @@ export const FACILITY_COLORS_MAP: Record<string, string> = {
 export const FACILITY_FALLBACK_COLOR = '#666666'
 
 /**
+ * 底图瓦片不可用时的地球底色。Cesium 的 `globe.baseColor` 默认是 #000080：
+ * 天地图不可达（内网/断网/密钥失效）时，3D 页面会露出一整片深蓝，看起来像地图坏了。
+ * 这里取与 2D 底图白底相近的中性色，让失败态仍是一张可读的浅色地图（矢量图仍在画）。
+ */
+export const MAP_IMAGERY_FALLBACK = '#e9edf2'
+
+/**
  * 取设施渲染色：唯一入口，避免图表侧手抄 `FACILITY_COLORS_MAP[key] || FACILITY_FALLBACK_COLOR`
  * （2026-10-18 收口 RadarScoreTooltip 与 useRadarChart 两处同构实现）。
  */
@@ -73,14 +80,6 @@ export const LAYER_DEFAULTS = {
   zIndexBase: 0, // 底图
   zIndexCover: 15, // 覆盖类业务层（淹没范围 / 受影响设施 / 预测图层）：叠在普通业务层之上
   zIndexOverlay: 100, // 覆盖层（水面 / 呼吸动画 / 淹没）
-} as const
-
-/** 分流页弧线/运河渲染色（canvas 色值，单一来源）。 */
-export const DIVERSION_ARC_COLORS = {
-  arc: '#2f7bff',
-  arcHighlight: '#ffb020',
-  canal: '#12b886',
-  canalHighlight: '#ffd43b',
 } as const
 
 // ===== 拖出图层（LayerIR）与任务结果芯片 =====

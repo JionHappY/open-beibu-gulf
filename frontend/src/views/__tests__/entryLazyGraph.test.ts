@@ -78,18 +78,12 @@ describe('首屏入口图的懒加载边界', () => {
     expect(offenders).toEqual([])
   })
 
-  it('五个业务模块入口仍是 manifest 的动态边', () => {
+  it('四个业务模块入口仍是 manifest 的动态边', () => {
     const manifest = result.modules.find((m) => m.source === 'frontend/src/business/manifest.ts')
     const dynamicTargets = (manifest?.dependencies ?? [])
       .filter((d) => d.dynamic)
       .map((d) => d.resolved ?? '')
-    for (const name of [
-      'diversion',
-      'flood-analysis',
-      'forecast',
-      'route-analysis',
-      'site-suitability',
-    ]) {
+    for (const name of ['flood-analysis', 'forecast', 'route-analysis', 'site-suitability']) {
       expect(dynamicTargets).toContain(`frontend/src/business/${name}/index.ts`)
     }
   })

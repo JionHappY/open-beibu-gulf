@@ -13,7 +13,7 @@
  * 异步边：卸载后才 resolve 的注册请求一律拒收，堵住「卸载后仍向 App 级单例注册」
  * 这条 921/922 反复出现的路径（裸 fetch 的回包）。
  */
-import { onScopeDispose } from 'vue'
+import { onScopeDispose, reactive } from 'vue'
 
 import { logger } from '@/shared'
 
@@ -54,7 +54,9 @@ export function useOwnedLayers(
   explicitManager?: BusinessLayerManagerLike
 ): UseOwnedLayersReturn {
   const { manager } = useBusinessLayers(explicitManager)
-  const owned = new Set<string>()
+  // reactive：`owned` 是消费侧的响应式判据（App.vue 用 owned.has(ir.id) 决定芯片高亮），
+  // 裸 Set 的 add/delete 不触发 computed ⇒ 芯片永远停在「未上图」。
+  const owned = reactive(new Set<string>())
   let disposed = false
 
   function reject(key: string): false {

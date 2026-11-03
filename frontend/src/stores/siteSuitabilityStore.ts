@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia'
 import type { Ref } from 'vue'
-import { ref } from 'vue'
+import { markRaw, ref } from 'vue'
 
 import { ENDPOINTS, logger, useApiRequest } from '@/shared'
 import type { SiteSuitabilityDefaultsParsed, SiteSuitabilityResponseParsed } from '@/types/schemas'
 import { siteSuitabilityDefaultsSchema } from '@/types/schemas'
 
 import {
+  SNAPSHOT_MAX_LAND_FRAC,
+  SNAPSHOT_MAX_PORT_DISTANCE_KM,
   SNAPSHOT_MIN_LAND_FRAC,
   SNAPSHOT_PROVENANCE,
   SNAPSHOT_WEIGHTS,
@@ -30,6 +32,10 @@ export const useSiteSuitabilityStore = defineStore('siteSuitability', () => {
   const weights: Ref<SuitabilityWeightsState> = ref({ ...SNAPSHOT_WEIGHTS })
   /** 最小陆像元占比过滤（0..1） */
   const minLandFrac: Ref<number> = ref(SNAPSHOT_MIN_LAND_FRAC)
+  /** 陆地占比上限（0..1）：0.99 = 只留与水相邻的格，1 = 不设上限 */
+  const maxLandFrac: Ref<number> = ref(SNAPSHOT_MAX_LAND_FRAC)
+  /** 距最近既有港口上限（km；0 = 不限制） */
+  const maxPortDistanceKm: Ref<number> = ref(SNAPSHOT_MAX_PORT_DISTANCE_KM)
 
   const { activeTransactionId, bumpTransactionId } = createTransactionId()
   const isRequesting: Ref<boolean> = ref(false)
@@ -53,9 +59,16 @@ export const useSiteSuitabilityStore = defineStore('siteSuitability', () => {
     isRequesting.value = v
   }
 
-  /** 写入最近一次成功响应；失败/取消不覆盖旧数据（页面卸载由 reset 清空） */
+  /**
+   * 写入最近一次成功响应；失败/取消不覆盖旧数据（页面卸载由 reset 清空）。
+   *
+   * 必须 markRaw：响应里是 8,548 个面的 GeoJSON，做成深层 reactive 后，
+   * 任何遍历它的监听（dev 下的 vue-devtools 状态面板就算一个）都要走代理 get/ownKeys。
+   * 实测拖动权重滑块 9s 内 8.1s 耗在 Vue 的 traverse 上（17 个长任务、最大 557ms、23.6fps）。
+   * 本数据是只读载荷：写一次、读多处，没有「改内部字段要触发渲染」的需求。
+   */
   function setData(v: SiteSuitabilityResponseParsed | null): void {
-    data.value = v
+    data.value = v ? markRaw(v) : null
   }
 
   /** 单准则权重写入并整体归一化（和=1；滑块语义：拉高一个，其余等比压缩） */
@@ -105,6 +118,8 @@ export const useSiteSuitabilityStore = defineStore('siteSuitability', () => {
           demand: d.weights.demand,
         }
         minLandFrac.value = d.minLandFrac
+        maxLandFrac.value = d.maxLandFrac
+        maxPortDistanceKm.value = d.maxPortDistanceKm
         defaultsSource.value = 'remote'
         logger.info('[site-suitability] defaults 后端直连成功', d.source)
       } catch (e) {
@@ -135,6 +150,8 @@ export const useSiteSuitabilityStore = defineStore('siteSuitability', () => {
   function reset(): void {
     weights.value = { ...SNAPSHOT_WEIGHTS }
     minLandFrac.value = SNAPSHOT_MIN_LAND_FRAC
+    maxLandFrac.value = SNAPSHOT_MAX_LAND_FRAC
+    maxPortDistanceKm.value = SNAPSHOT_MAX_PORT_DISTANCE_KM
     activeTransactionId.value = 0
     isRequesting.value = false
     data.value = null
@@ -147,6 +164,8 @@ export const useSiteSuitabilityStore = defineStore('siteSuitability', () => {
   return {
     weights,
     minLandFrac,
+    maxLandFrac,
+    maxPortDistanceKm,
     activeTransactionId,
     isRequesting,
     data,

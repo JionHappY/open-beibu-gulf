@@ -1,24 +1,60 @@
 {
-  "name": "beibu-gulf-open",
-  "version": "0.1.0",
-  "private": false,
+  "name": "beibu-gulf-webgis",
+  "version": "0.0.0",
+  "private": true,
   "type": "module",
   "scripts": {
+    "audit:data": "node tools/data-audit/source-registry.mjs",
+    "build": "npm run typecheck && cd frontend && vite build",
+    "build:analyze": "cd frontend && vite build --mode analyze",
+    "changelog": "node tools/gen-changelog.cjs && prettier --write CHANGELOG.md",
+    "ci:local": "npm run guard:v3 && npm run guard:mutation && npm run ratchet:dead-code && npm run ratchet:dup && npm run ratchet:deep-import && npm run metrics:derive && npm run format:check && npm run lint && npm run stylelint && npm run cruise && npm run types:check && npm run typecheck && npm run typecheck --prefix backend && node scripts/coverage-ratchet.cjs --freeze-check frontend/coverage-baseline.json && node scripts/coverage-ratchet.cjs --freeze-check backend/coverage-baseline.json && npm run test:report:fe && node scripts/coverage-ratchet.cjs frontend/coverage/coverage-summary.json frontend/coverage-baseline.json && node scripts/test-watchdog.cjs --project frontend && npm run test:tools && node scripts/ci-backend-db.cjs && npm run build",
+    "cruise": "dependency-cruiser -c .dependency-cruiser.cjs -T err frontend/src backend",
+    "dead-code:summary": "node tools/dead-code/baseline-summary.mjs",
     "dev": "cd frontend && vite",
+    "dev:e2e": "cd frontend && vite --host 127.0.0.1 --port 5199 --strictPort",
+    "e2e": "playwright test --config frontend/playwright.config.ts",
+    "dev:all": "run-p dev dev:server",
     "dev:nest": "npm --prefix backend run start:dev",
     "dev:server": "npm run dev:nest",
-    "dev:all": "run-p dev dev:server",
-    "build": "npm run typecheck && cd frontend && vite build",
-    "preview": "cd frontend && vite preview",
-    "test": "cd frontend && vitest run",
-    "test:watch": "cd frontend && vitest",
-    "typecheck": "vue-tsc --noEmit -p frontend/tsconfig.app.json",
-    "typecheck:backend": "npm --prefix backend run build",
-    "lint": "eslint . --cache",
-    "lint:fix": "eslint . --fix --cache",
+    "docs:check": "node tools/v3-guard/doc-map-check.mjs",
+    "docs:map": "node tools/doc-system/render-doc-map.mjs && npx prettier --write docs/文档地图.md",
+    "docs:review-age": "node tools/doc-system/review-age.mjs",
+    "dup:scan": "node tools/dup/scan.mjs",
+    "forecast:activity": "node tools/forecast/derive-activity.mjs",
+    "forecast:model": "node tools/forecast/throughput_model.cjs",
+    "forecast:recompute": "node tools/forecast/run-all.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "stylelint": "stylelint \"frontend/src/**/*.{css,vue}\""
+    "guard:mutation": "node tools/v3-guard/guard-red-mutation.mjs",
+    "guard:v3": "node tools/v3-guard/run-all.mjs",
+    "lint": "eslint . --cache",
+    "lint:fix": "eslint . --fix --cache",
+    "metrics:derive": "node tools/metrics/derive-status.mjs",
+    "prepare": "husky",
+    "preview": "cd frontend && vite preview",
+    "ratchet:dead-code": "node tools/dead-code/ratchet.mjs",
+    "ratchet:deep-import": "node tools/deep-import/ratchet.mjs",
+    "ratchet:dup": "node tools/dup/ratchet.mjs",
+    "review:dispatch": "node tools/audit-kit/dispatch.mjs",
+    "review:index": "node tools/audit-kit/metrics-index.mjs",
+    "review:score": "node tools/audit-kit/scorecard.mjs",
+    "stylelint": "stylelint \"frontend/src/**/*.{css,vue}\"",
+    "stylelint:fix": "stylelint \"frontend/src/**/*.{css,vue}\" --fix",
+    "test": "cd frontend && vitest run",
+    "test:gate:be": "cd backend && vitest run --reporter=default --reporter=json --outputFile=coverage/vitest-result.json",
+    "test:mutation": "node tools/mutation-probe/run.mjs",
+    "test:report:be": "npm --prefix backend run test:report",
+    "test:report:fe": "cd frontend && vitest run --coverage --reporter=default --reporter=json --outputFile=coverage/vitest-result.json",
+    "test:tools": "node scripts/check-tools-skips.mjs",
+    "test:watch": "cd frontend && vitest",
+    "test:watchdog": "node scripts/test-watchdog.cjs",
+    "tmp:clean": "node scripts/clean-tmp.cjs",
+    "typecheck": "vue-tsc --noEmit -p frontend/tsconfig.app.json && tsc --noEmit -p frontend/tsconfig.e2e.json",
+    "types:check": "node scripts/gen-api-contract.cjs --check",
+    "types:gen": "node scripts/gen-api-contract.cjs",
+    "contract:check": "npm --prefix backend run test -- test/swagger-contract.spec.ts",
+    "verify-gis": "node tools/gis-import/verify.mjs"
   },
   "dependencies": {
     "@sentry/vue": "^11.0.0",
@@ -68,5 +104,56 @@
     "vitest": "^4.1.9",
     "vue-eslint-parser": "^10.4.1",
     "vue-tsc": "^3.3.8"
-  }
+  },
+  "overrides": {
+    "brace-expansion": "^5.0.12",
+    "dompurify": "^3.4.17",
+    "fast-uri": "^4.1.4",
+    "glob": "^10.5.0",
+    "js-yaml": "^4.3.2",
+    "nanoid": "^3.3.17",
+    "postcss": "^8.5.23",
+    "protobufjs": "^8.7.1",
+    "shell-quote": "^1.12.0",
+    "source-map-js": "^1.2.2",
+    "undici": "^7.30.1"
+  },
+  "lint-staged": {
+    "frontend/src/**/*.{ts,vue,js,css}": [
+      "prettier --write"
+    ]
+  },
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ],
+    "rules": {
+      "scope-empty": [
+        2,
+        "always"
+      ]
+    }
+  },
+  "prettier": {
+    "semi": false,
+    "singleQuote": true,
+    "trailingComma": "es5",
+    "printWidth": 100,
+    "tabWidth": 2,
+    "arrowParens": "always",
+    "endOfLine": "lf",
+    "vueIndentScriptAndStyle": false
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.12.0"
+  },
+  "browserslist": [
+    "> 1%",
+    "last 2 versions",
+    "not dead",
+    "not ie 11",
+    "Chrome >= 89",
+    "Safari >= 14.1",
+    "Firefox >= 114"
+  ]
 }

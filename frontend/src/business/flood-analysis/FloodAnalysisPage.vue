@@ -43,6 +43,7 @@ import {
   type FloodImpactPayload,
 } from './composables/useFloodRequest'
 import { FLOOD_RISK_COLORS, FLOOD_RISK_DEFAULT } from './constants/colors'
+import { acceptLateResponse } from './lateResponse'
 
 // waterLevel/portImpact/profile 三 store 已并入 floodStore，统一从此取
 const floodStore = useFloodStore()
@@ -325,12 +326,12 @@ watch(
 let unmounted = false
 
 function shouldRenderForCurrentRoute() {
-  const actual = mapStore.currentRenderer?.getType?.()
-  if (!actual) return false
-  // 2026-09-10（阶段 4）：原「calculate 模式 2D/3D 均可渲染」分支已随双模式移除——
-  // 该分支在生产恒为 false（dataSource 硬编码 'fetch'），删除后行为与原生产一致（3D-only）
-  const expected = route.meta?.engine
-  return expected === actual
+  // 判据本体在 lateResponse.ts（纯函数，单测钉住「渲染器未就绪要放行」这条）
+  return acceptLateResponse({
+    actualEngine: mapStore.currentRenderer?.getType?.() ?? null,
+    expectedEngine: route.meta?.engine as string | undefined,
+    unmounted,
+  })
 }
 
 /**
@@ -341,7 +342,7 @@ function shouldRenderForCurrentRoute() {
  * （先路由后卸载）以免改变任何一处既有的求值顺序假设。
  */
 function acceptsLateResponse(): boolean {
-  return shouldRenderForCurrentRoute() && !unmounted
+  return shouldRenderForCurrentRoute()
 }
 
 /** 渲染淹没问题（v4-S3：请求已由面板发起，本函数只负责写 store + 上图） */
@@ -570,7 +571,8 @@ onUnmounted(() => {
         >
           <WaterLevelProfilePanel ref="waterPanelRef" :state-restored="stateRestored" />
         </TaskPanelSlot>
-
+      </template>
+      <template #layers>
         <GCSPanel :w="4" :h="4" anchor="top-right" :offset-x="0" :offset-y="5.5">
           <LayerControlPanel
             :layer-order="[

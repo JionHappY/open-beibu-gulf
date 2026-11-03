@@ -39,7 +39,13 @@ import { breathingAlpha, breathingSize, elapsedSeconds } from '@/core/config'
 import { buildTiandituUrl, defaultCameraCenter, MAP_CONFIG, zoomToHeight } from '@/core/config'
 import type { IndexedItem } from '@/shared'
 import { createSpatialIndex, LAYER_DEFAULTS, showError, showWarning } from '@/shared'
-import { breathingPoints, isStaleToken, logger, normalizePoint } from '@/shared'
+import {
+  breathingPoints,
+  isStaleToken,
+  logger,
+  MAP_IMAGERY_FALLBACK,
+  normalizePoint,
+} from '@/shared'
 import type {
   BaseLayerPair,
   CameraState,
@@ -62,6 +68,7 @@ import {
   setupCameraDebounce,
   unbindPerf,
 } from '../perf/cameraPerf'
+import { createImageryErrorBinding } from '../imageryFallback'
 import { type LayerState, MapRenderer } from './MapRenderer'
 
 /** 相机默认俯仰角（度）：-90° 俯视（引擎切换刻意不传递倾斜状态——OL 无 pitch 概念） */
@@ -443,7 +450,6 @@ export class CesiumRenderer extends MapRenderer {
   _rootTileErrorKeys: Set<string>
   /** 地形 provider.errorEvent 具名回调（destroyEvents 随实例注销，防止闭包持有已销毁 renderer） */
   _terrainErrorHandler: ((err: unknown) => void) | null
-  _imageryErrorLogged: boolean
   /** 底图 errorEvent 具名回调（供 destroyEvents 注销；provider 常驻单例 Viewer，须随 renderer 销毁摘除，5.2-1） */
   _imageryErrorHandler: ((err: unknown) => void) | null
   /** 挂载了 errorEvent 的底图 provider（destroyEvents 逐个 removeEventListener 用） */
@@ -486,7 +492,6 @@ export class CesiumRenderer extends MapRenderer {
     this._rootTileErrorKeys = new Set<string>()
     this._terrainErrorHandler = null
     /** 底图瓦片失败 warn 只打一次（防每个瓦片刷屏） */
-    this._imageryErrorLogged = false
     this._imageryErrorHandler = null
     this._imageryErrorProviders = []
     this._webglContextLostHandler = null
@@ -686,22 +691,17 @@ export class CesiumRenderer extends MapRenderer {
     const viewer = this.viewer
     if (!viewer) return
 
-    // errorEvent 在 ImageryProvider 上而非 ImageryLayerCollection（挂后者抛 TypeError 致 3D 初始化失败）；首次失败 warn 一次
-    // 5.2-1：回调提为具名函数并持到实例字段（_imageryErrorHandler/_imageryErrorProviders），
-    // destroyEvents 逐个 removeEventListener——provider 挂单例 Viewer 常驻，不移除则闭包永久持有首个 renderer 实例
-    this._imageryErrorHandler = (err: unknown) => {
-      if (this._imageryErrorLogged) return
-      this._imageryErrorLogged = true
-      logger.warn(
-        '[CesiumRenderer] 底图瓦片加载失败（首次）:',
-        err instanceof Error ? err.message : err
-      )
-    }
-    const attachImageryErrorLog = (provider: UrlTemplateImageryProvider) => {
-      if (!provider?.errorEvent || !this._imageryErrorHandler) return
-      provider.errorEvent.addEventListener(this._imageryErrorHandler)
-      this._imageryErrorProviders.push(provider)
-    }
+    // 底图瓦片错误处理（含失败态兜底）在同目录 imageryFallback：渲染器有体量棘轮，新增逻辑不落这里
+    const imagery = createImageryErrorBinding<UrlTemplateImageryProvider>({
+      onFirstError: () => {
+        viewer.scene.globe.baseColor = Color.fromCssColorString(MAP_IMAGERY_FALLBACK)
+        viewer.scene.canvas
+          .closest('.unified-map-wrapper')
+          ?.setAttribute('data-imagery-fallback', 'true')
+      },
+    })
+    this._imageryErrorHandler = imagery.handler
+    this._imageryErrorProviders = imagery.providers
 
     // UrlTemplateImageryProvider 不识别 {layerCode}/{key} 占位符（原样发送致天地图请求失败底图空白，
     // OL 自实现模板替换所以正常），须预替换为字面值
@@ -718,10 +718,10 @@ export class CesiumRenderer extends MapRenderer {
       })
 
     const imageBaseProvider = tiandituProvider(MAP_CONFIG.BASE_LAYERS.image.layers[0])
-    attachImageryErrorLog(imageBaseProvider)
+    imagery.attach(imageBaseProvider)
     const imageBaseLayer = viewer.imageryLayers.addImageryProvider(imageBaseProvider)
     const imageAnnotationProvider = tiandituProvider(MAP_CONFIG.BASE_LAYERS.image.layers[1])
-    attachImageryErrorLog(imageAnnotationProvider)
+    imagery.attach(imageAnnotationProvider)
     const imageAnnotationLayer = viewer.imageryLayers.addImageryProvider(imageAnnotationProvider)
     const vectorBaseProvider = viewer.imageryLayers.addImageryProvider(
       tiandituProvider(MAP_CONFIG.BASE_LAYERS.vector.layers[0])

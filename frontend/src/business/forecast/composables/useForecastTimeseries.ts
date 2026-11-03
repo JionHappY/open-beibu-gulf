@@ -14,6 +14,7 @@ import { useForecastStore } from '@/stores'
 import type { ForecastDataSource } from '@/types/schemas'
 
 import { fromMonthOrdinal, toMonthOrdinal } from '../timeline'
+import { toLookup, yoyAt } from '../yoy'
 
 import { guardForecastAuth, useForecastRequest } from './useForecastRequest'
 
@@ -37,7 +38,8 @@ export function useForecastTimeseries(): UseForecastTimeseriesReturn {
   async function load(transactionId: number, signal: AbortSignal): Promise<void> {
     try {
       const indicator = forecastState.activeIndicator
-      const granularity = forecastState.timeGranularity
+      // 粒度固定为月：年粒度在数据不足 10 年时不可读，入口已移除（G1）
+      const granularity = 'month' as const
       const confidence = forecastState.confidenceThresholds[indicator] || DEFAULT_CONFIDENCE
       // 运河情景仅 cargo 有文献锚点（04-B10）：非 cargo 一律按基线请求与缓存
       const scenario =
@@ -85,19 +87,15 @@ export function useForecastTimeseries(): UseForecastTimeseriesReturn {
 
       // 12 点窗口（当前时间往前 11 步，月/年粒度通用），钳制在数据范围内防止空白
       const [sliderYear, sliderMonth] = forecastState.currentTime.split('-').map(Number)
-      const isYear = granularity === 'year'
-      const fmt = (y: number, m: number) =>
-        isYear ? String(y) : `${y}-${String(m || 1).padStart(2, '0')}`
+      const fmt = (y: number, m: number) => `${y}-${String(m || 1).padStart(2, '0')}`
       const dataMin = allData[0].time
       const dataMax = allData[allData.length - 1].time
 
-      const rawStart = isYear
-        ? fmt(sliderYear - 11, 1)
-        : (() => {
-            // D4：绝对月序收口 timeline.toMonthOrdinal/fromMonthOrdinal（原第三份内联口径）
-            const [y, m] = fromMonthOrdinal(toMonthOrdinal(sliderYear, sliderMonth) - 11)
-            return fmt(y, m)
-          })()
+      // 12 点窗口起点：绝对月序收口 timeline.toMonthOrdinal/fromMonthOrdinal（原第三份内联口径）
+      const rawStart = (() => {
+        const [y, m] = fromMonthOrdinal(toMonthOrdinal(sliderYear, sliderMonth) - 11)
+        return fmt(y, m)
+      })()
       const rawEnd = fmt(sliderYear, sliderMonth)
       const windowStart = rawStart >= dataMin ? rawStart : dataMin
       const windowEnd = rawEnd <= dataMax ? rawEnd : dataMax
@@ -114,6 +112,18 @@ export function useForecastTimeseries(): UseForecastTimeseriesReturn {
       }))
       // F4：y 轴单位随数据入 store（LineChart :y-unit 消费）；缓存命中同路径
       forecastState.chart.lineUnit = entry?.unit ?? ''
+      if (forecastState.growthMode) {
+        // 同比视图：逐点取 t-12（前期值从同一份全量序列查，不发新请求）；
+        // 查不到前期就留 null —— 图上空档，不画成 0%
+        forecastState.chart.lineSeries = (entry?.allSeries ?? []).map((s) => {
+          const lookup = toLookup(s.data ?? [])
+          return {
+            name: s.portName,
+            data: (s.data ?? []).filter(inWindow).map((d) => yoyAt(lookup, d.time, 'month')),
+          }
+        })
+        forecastState.chart.lineUnit = '%'
+      }
     } catch (e) {
       logger.error('[ForecastTimeseries] load error:', e)
       if (guardForecastAuth(e, router)) return

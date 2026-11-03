@@ -86,6 +86,10 @@ describe('文本 token 对比度（WCAG AA）', () => {
     expectAA('--GCS-text-inverse', '--GCS-color-primary-hover')
   })
 
+  it('选中态 chip 的文字对浅蓝底 ≥4.5:1（primary 4.34 不够，用 hover 档）', () => {
+    expectAA('--GCS-color-primary-hover', '--GCS-bg-active')
+  })
+
   it('渲染色副本与 CSS 主色同值（改一处必红）', () => {
     expect(rgb(PORT_FEATURE_COLOR)).toEqual(rgb(token(root, '--GCS-color-primary')))
   })

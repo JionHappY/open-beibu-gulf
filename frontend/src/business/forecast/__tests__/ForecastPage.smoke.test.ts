@@ -34,6 +34,9 @@ vi.mock('@/business/forecast/composables/useForecastRequest', () => ({
     isTransactionValid: h.isTransactionValid,
     cancelAll: h.cancelAll,
   }),
+  // 冒烟测试里真实 adapter 必失败（jsdom 无网络）⇒ 错误分支会调用它；
+  // 漏掉这个导出会让 catch 里再抛 TypeError，变成 unhandled rejection。
+  guardForecastAuth: () => false,
 }))
 
 vi.mock('@/business/forecast/composables/useForecastLayer', () => ({
@@ -47,9 +50,13 @@ vi.mock('@/business/forecast/composables/useForecastLayer', () => ({
 // token/setToken/clearToken 必须补齐：真实 useAuth 顶层从此处解构 token，
 // 缺失会让 useFavorites 模块顶层 watch([user, token]) 拿到 undefined
 //（「Invalid watch source」Vue warn）
-vi.mock('@/shared/composables/useApiRequest', async () => {
+// 保留真实导出（ApiError 等）：errorHandler 用 instanceof 判类型，
+// 只替换 useApiRequest 会让 ApiError 变成 undefined，错误分支再抛一次。
+vi.mock('@/shared/composables/useApiRequest', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/shared/composables/useApiRequest')>()
   const { ref } = await import('vue')
   return {
+    ...actual,
     useApiRequest: () => ({
       apiRequest: h.apiRequest,
       token: ref(''),

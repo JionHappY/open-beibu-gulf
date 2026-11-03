@@ -148,6 +148,8 @@ describe('TaskHandlers 委托接线', () => {
       expect(siteSuitabilityService.compute).toHaveBeenCalledWith({
         weights: { inundation: 0.43, terrain: 0.09, land: 0.21, access: 0.11, demand: 0.17 },
         minLandFrac: 0.5,
+        maxLandFrac: 0.99,
+        maxPortDistanceKm: 50,
         resolution: 0.02,
         weightsSource: 'query',
       })

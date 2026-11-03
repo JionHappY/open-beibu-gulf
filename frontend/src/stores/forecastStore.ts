@@ -17,7 +17,6 @@ import { createTransactionId } from './factories'
  */
 export interface ForecastSavedState {
   currentTime: string
-  timeGranularity: string
   playSpeed: number
   activeIndicator: string
   canalScenario: string
@@ -33,7 +32,6 @@ export const useForecastStore = defineStore('forecast', () => {
   // timeRange 死状态已删除（currentTime 与 timeRange.current 双持「当前时间」，
   // 全仓业务 0 消费；start/end 由 BASE_YEAR/END_YEAR 派生）
 
-  const timeGranularity: Ref<string> = ref('month')
   const isPlaying: Ref<boolean> = ref(false)
   const playSpeed: Ref<number> = ref(500)
   const activeIndicator: Ref<string> = ref('cargo')
@@ -45,6 +43,13 @@ export const useForecastStore = defineStore('forecast', () => {
     container: DEFAULT_CONFIDENCE,
     activity: DEFAULT_CONFIDENCE,
   })
+
+  /**
+   * 同比增速视图（第四张指标卡）：为 true 时折线/柱图按同比百分比重建。
+   * 不是第四个数据指标——后端只有 cargo/container/activity 三份数据，
+   * 增速由同一序列的 t 与 t-12 期直接算，不发新请求、不新增图层。
+   */
+  const growthMode: Ref<boolean> = ref(false)
 
   const activeForecastLayer: Ref<string | null> = ref(null)
   // F-7：原 dataCache/currentData 无业务写路径（死状态，currentData 恒 null），已移除；
@@ -69,7 +74,7 @@ export const useForecastStore = defineStore('forecast', () => {
   // 重新加载（requestCache 命中即零请求重建），快照只存源数据不存派生视图。
   const chart = reactive({
     lineXData: [] as string[],
-    lineSeries: [] as Array<{ name: string; data: number[] }>,
+    lineSeries: [] as Array<{ name: string; data: Array<number | null> }>,
     /** 折线图 y 轴单位（接口 unit 透传；F4 前被适配器丢弃，图无单位标注） */
     lineUnit: '',
     /**
@@ -101,10 +106,6 @@ export const useForecastStore = defineStore('forecast', () => {
     currentTime.value = time
   }
 
-  function setTimeGranularity(granularity: string): void {
-    timeGranularity.value = granularity
-  }
-
   function setActiveIndicator(indicator: string): void {
     activeIndicator.value = indicator
   }
@@ -115,6 +116,10 @@ export const useForecastStore = defineStore('forecast', () => {
 
   function setConfidenceThreshold(indicator: string, value: number): void {
     confidenceThresholds.value[indicator] = value
+  }
+
+  function setGrowthMode(on: boolean): void {
+    growthMode.value = on
   }
 
   function setIsPlaying(playing: boolean): void {
@@ -129,7 +134,6 @@ export const useForecastStore = defineStore('forecast', () => {
   /** 快照恢复（跨页面登录返回）：一次性批量写回（禁止调用方逐字段直改 state） */
   function restoreState(saved: ForecastSavedState): void {
     currentTime.value = saved.currentTime
-    timeGranularity.value = saved.timeGranularity
     playSpeed.value = saved.playSpeed
     activeIndicator.value = saved.activeIndicator
     // 旧快照无 canalScenario 字段，兜底基线
@@ -152,10 +156,10 @@ export const useForecastStore = defineStore('forecast', () => {
 
   function reset(): void {
     currentTime.value = '2026-06'
-    timeGranularity.value = 'month'
     isPlaying.value = false
     playSpeed.value = 500
     activeIndicator.value = 'cargo'
+    growthMode.value = false
     canalScenario.value = 'baseline'
     confidenceThresholds.value = {
       cargo: DEFAULT_CONFIDENCE,
@@ -199,10 +203,10 @@ export const useForecastStore = defineStore('forecast', () => {
 
   return {
     currentTime,
-    timeGranularity,
     isPlaying,
     playSpeed,
     activeIndicator,
+    growthMode,
     canalScenario,
     confidenceThresholds,
     activeForecastLayer,
@@ -213,8 +217,8 @@ export const useForecastStore = defineStore('forecast', () => {
     bumpTransactionId,
     setIsRequesting,
     setCurrentTime,
-    setTimeGranularity,
     setActiveIndicator,
+    setGrowthMode,
     setCanalScenario,
     setConfidenceThreshold,
     setIsPlaying,

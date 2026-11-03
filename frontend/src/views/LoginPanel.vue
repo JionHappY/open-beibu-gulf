@@ -127,6 +127,7 @@ async function handleSubmit() {
         class="form-input"
         type="text"
         placeholder="用户名"
+        aria-label="用户名"
         autocomplete="username"
         @keydown.enter="handleSubmit"
       />
@@ -135,6 +136,7 @@ async function handleSubmit() {
         class="form-input"
         type="password"
         :placeholder="mode === 'register' ? '至少6位，含大小写字母和数字' : '密码'"
+        aria-label="密码"
         autocomplete="current-password"
         @keydown.enter="handleSubmit"
       />
@@ -144,6 +146,7 @@ async function handleSubmit() {
         class="form-input"
         type="password"
         placeholder="确认密码"
+        aria-label="确认密码"
         autocomplete="new-password"
         @keydown.enter="handleSubmit"
       />

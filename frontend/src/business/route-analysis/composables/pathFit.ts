@@ -9,7 +9,7 @@
  * 前端再抄一份 111320 会被 `geo.test.mjs` 判红（实测踩到）。路径长度是 bbox 对角线的上界，
  * 按它取高度只会略宽、不会裁掉路径末端；2D 仍由渲染器按 heightToZoom 反推。
  */
-export interface PathView {
+interface PathView {
   center: { lng: number; lat: number }
   /** 3D 相机高度（米） */
   height: number

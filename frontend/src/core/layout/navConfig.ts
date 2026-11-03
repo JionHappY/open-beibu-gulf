@@ -5,7 +5,7 @@
  * 项类型：home/profile 静态项（路由 / 与 /profile）；business 业务模块项。
  */
 
-import { readonly, ref } from 'vue'
+import { computed, readonly, ref } from 'vue'
 
 /** 导航项类型 */
 type NavItemType = 'home' | 'profile' | 'business'
@@ -29,6 +29,14 @@ const _navItems = ref<NavItem[]>([])
 
 /** 只读导航项列表（供 BottomNavBar / AppLayout 消费） */
 export const navItems = readonly(_navItems)
+
+/**
+ * 业务模块项（抽屉业务行 / dock 半圆 / 首页入口方格共用）。
+ * 「哪些项算业务」只在这里判一次：消费方再各写一遍 filter 就是第二份口径。
+ */
+export const businessNavItems = computed<NavItem[]>(() =>
+  _navItems.value.filter((i) => i.type === 'business')
+)
 
 /**
  * 注册导航项（业务层入口在 App.vue setup 中一次性调用）

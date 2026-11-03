@@ -77,6 +77,13 @@ export interface LayerOptions {
   opacity?: number
   // GeoJSON 图层 per-feature 样式回调（OL 渲染器消费）
   style?: unknown
+  /**
+   * GeoJSON 图层 per-feature 填充色（OL 渲染器消费）。
+   *
+   * 与 `style` 的区别：`style` 要调用方构造 OL 的 Style 实例，业务层就得 import 'ol/style'；
+   * 这个回调只回一个 CSS 颜色，把 OL 类型留在渲染器里。用了它时 `style` 让位。
+   */
+  featureFill?: (props: Record<string, unknown>) => string
   // GeoJSON 图层加载失败回调（Cesium 渲染器消费）
   onError?: (err: unknown) => void
   // ── 热力图选项（2D Only）──

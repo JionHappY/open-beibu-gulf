@@ -1,7 +1,7 @@
-<!-- 预测分析控制面板（4×4）：上半为 4 个指标按钮（三态）+ 置信度滑块，
-     下半为时间轴卡片（点击才展开滑块）+ 3 个可点击刻度 -->
+<!-- 预测分析控制面板（4×4）：上半为 4 个指标按钮（三态）+ 情景系数滑块，
+     下半为裸露时间轴（挂载即自动播放）+ 情景下拉 -->
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
 
 import { useSliderFocus } from '@/core'
 import {
@@ -12,6 +12,7 @@ import {
   type IconName,
   ROW_HEIGHT_CELL,
   SliderSelectCard,
+  showToast,
   useGCS,
 } from '@/shared'
 import { useForecastStore } from '@/stores'
@@ -23,7 +24,6 @@ import {
   stepToTime as timelineStepToTime,
   timelineYears,
   yearMarkPosition,
-  yearMaxSteps,
 } from '../timeline'
 
 const forecastState = useForecastStore()
@@ -36,8 +36,7 @@ const { cellPixel, css } = useGCS()
 const { cell8px, cell16px } = css
 /** 按钮高度：固定行高，系数取自 panelCapacity 的 ROW_HEIGHT_CELL（与容量公式共用同一份比例） */
 const btnHeightCss = computed(() => `${cellPixel.value * ROW_HEIGHT_CELL}px`)
-/** 字体档位：0.175cell 标签、0.2cell 图标、0.15cell 小字、0.125cell 角标 */
-const labelFontSizeCss = computed(() => `${cellPixel.value * 0.175}px`)
+/** 字体档位：0.2cell 图标、0.15cell 小字、0.125cell 角标 */
 const iconFontSizeCss = computed(() => `${cellPixel.value * 0.2}px`)
 const smallFontSizeCss = computed(() => `${cellPixel.value * 0.15}px`)
 // CONFIRM_DELAY 两面板共用，统一放 shared/constants/ui
@@ -52,21 +51,43 @@ const INDICATORS = [
   { key: 'activity', label: '港口吞吐活跃度', icon: 'activity' },
 ] as const satisfies readonly { key: string; label: string; icon: IconName }[]
 
+/**
+ * 第四张卡：同比增速视图（2×2 的第二行右格，自上而下读）。
+ * 不是第四个数据指标——后端只有三份序列；增速在折线/柱图上由同一序列的 t 与 t-12 期算，
+ * 不发请求、不新增图层，所以它不进 INDICATORS（那个数组决定热力图条目数）。
+ */
+const GROWTH_CELL = { key: 'growth', label: '同比增速', icon: 'percent' } as const
+const CELLS = [...INDICATORS, GROWTH_CELL] as const
+
 // selected 由 store activeIndicator 派生（getter）——
 // 快照恢复 restoreState 设置 activeIndicator 后按钮高亮自动一致（原本地双源：恢复非 cargo 时按钮仍亮 cargo）
-const btnStates = reactive(
-  Object.fromEntries(
-    INDICATORS.map((i) => [
-      i.key,
-      {
-        get selected() {
-          return forecastState.activeIndicator === i.key
-        },
-        selecting: false,
+interface BtnState {
+  selected: boolean
+  selecting: boolean
+}
+
+const INDICATOR_STATES = Object.fromEntries(
+  INDICATORS.map((i) => [
+    i.key,
+    {
+      get selected() {
+        return forecastState.activeIndicator === i.key
       },
-    ])
-  )
-)
+      selecting: false,
+    },
+  ])
+) as Record<string, BtnState>
+
+const btnStates = reactive<Record<string, BtnState>>({
+  ...INDICATOR_STATES,
+  // 第四格不是数据指标：高亮跟随增速视图开关，任何时候都不进「选择中」滑块态
+  growth: {
+    get selected() {
+      return forecastState.growthMode
+    },
+    selecting: false,
+  },
+})
 
 /**
  * 定时器登记处：本组件 4 条链（confirm:指标键 按钮确认 / confidence 置信度防抖 /
@@ -103,14 +124,27 @@ function startNamedInterval(name: string, delay: number, fn: () => void): void {
   timers.set(name, () => clearInterval(handle))
 }
 
+/** 所有指标卡退出「选择中」并撤掉各自的确认计时器（切指标 / 切增速视图前统一收口） */
+function resetAllCells(): void {
+  for (const k of Object.keys(btnStates)) {
+    btnStates[k].selecting = false
+    clearTimer(k)
+  }
+}
+
 function toggleBtn(key: string) {
+  if (key === GROWTH_CELL.key) {
+    resetAllCells()
+    forecastState.setGrowthMode(!forecastState.growthMode)
+    return
+  }
+  // 碰任何真指标都退出增速视图：增速是「看这张图的方式」，不是第四个并列指标。
+  // 放在分支之前——点「已选中」的那个指标也会走下面 else 分支，同样要退。
+  forecastState.setGrowthMode(false)
   const s = btnStates[key]
   if (!s.selected) {
     // 取消其他按钮的 selecting 计时器并复位（selected 已派生，无需直写）
-    Object.keys(btnStates).forEach((k) => {
-      btnStates[k].selecting = false
-      clearTimer(k)
-    })
+    resetAllCells()
     forecastState.setActiveIndicator(key)
     s.selecting = true
     resetTimer(key)
@@ -151,8 +185,6 @@ function confirmAll() {
 function handleGlobalClick(e: Event) {
   const target = e.target as HTMLElement
   if (!target.closest('.forecast-ctrl')) confirmAll()
-  // 时间轴卡片展开态点外部收起（卡片自身 click.stop，点卡片不会走到这里）
-  if (!target.closest('.time-section')) timeCardOpen.value = false
 }
 
 function getConf(key: string) {
@@ -187,9 +219,12 @@ watch(
 
 onMounted(() => {
   document.addEventListener('click', handleGlobalClick)
+  document.addEventListener('keydown', onKeydown)
+  hintOnce()
 })
 onUnmounted(() => {
   document.removeEventListener('click', handleGlobalClick)
+  document.removeEventListener('keydown', onKeydown)
   // 卸载清理一次收口：按钮确认计时器 / 置信度防抖（卸载后不再写 store）/
   // 刷新防抖（v4-S3：与页面 cancelAll 互补，这边防的是"还没发出去"的那一次）/ 播放。
   // cancel 在 owned-layers 白名单内（在途请求取消语义，定时器撤销同属取消）；
@@ -200,23 +235,15 @@ onUnmounted(() => {
 })
 
 // ===== 时间滑块 =====
-/** 时间轴卡片展开态：默认收起（无 range），点击卡片进入选择态才渲染滑块；点时间区外回到已选态 */
-const timeCardOpen = ref(false)
-
-const isYearMode = computed({
-  get: () => forecastState.timeGranularity === 'year',
-  set: (v) => forecastState.setTimeGranularity(v ? 'year' : 'month'),
-})
-
 // 步数上限收口 ../timeline（D21-1：两条公式原在此手抄——timeline 同款函数即
 // H-3 越界事故的收口正本，面板改调函数后手抄清零）
-const maxSteps = computed(() => (isYearMode.value ? yearMaxSteps() : monthMaxSteps()))
+const maxSteps = computed(() => monthMaxSteps())
 
-// 步数换算收口 ../timeline（年/月双基共用一索引；年串切月 m 缺省兜 1，防 NaN——审查 H-3）
-const currentStep = computed(() => currentTimeToStep(forecastState.currentTime, isYearMode.value))
+// 步数换算收口 ../timeline（月步；历史快照的无月份串由 m 缺省兜 1，防 NaN——审查 H-3）
+const currentStep = computed(() => currentTimeToStep(forecastState.currentTime))
 
 function stepToTime(step: number) {
-  return timelineStepToTime(step, isYearMode.value)
+  return timelineStepToTime(step)
 }
 
 /** 时间轴滑块输入（SliderSelectCard 已抽出 number，无需重复解析事件对象） */
@@ -224,16 +251,29 @@ function onTimelineSliderInput(value: number) {
   forecastState.setCurrentTime(stepToTime(value))
 }
 
+/** 裸露 range 的 input 事件 → 同上（原生控件给的是字符串） */
+function onTimeRangeInput(e: Event) {
+  onTimelineSliderInput(Number((e.target as HTMLInputElement).value))
+}
+
 /** 刻度年份（起止+中点）与标签：年份域单源在 ../timeline，位置公式同源（不手抄年数差） */
 const YEAR_MARKS = timelineYears().map((year) => ({ year, label: `${year}.1` }))
 
 function jumpToYear(year: number) {
-  forecastState.setCurrentTime(isYearMode.value ? String(year) : `${year}-01`)
+  forecastState.setCurrentTime(`${year}-01`)
 }
 
 const displayTime = computed(() => {
   const t = forecastState.currentTime
-  return isYearMode.value ? t + '年' : t.replace('-', '年') + '月'
+  return t.replace('-', '年') + '月'
+})
+
+/** 气泡跟随滑块的点：按当前步在轨道上的百分比定位（首尾各留半个拇指宽由 translateX(-50%) 抵） */
+const bubblePosCss = computed(() => {
+  const max = maxSteps.value
+  if (max <= 0) return '0%'
+  const pct = (currentStep.value / max) * 100
+  return `${Math.min(100, Math.max(0, pct))}%`
 })
 
 // ===== 播放 =====
@@ -255,11 +295,52 @@ function startPlayback() {
       stopPlayback()
       return
     }
+    // 后台标签页不推进：推一帧就发一次 forecast 请求，切走后继续推等于空烧后端
+    // （浏览器只把 setInterval 节流到秒级，不会停）。回到前台自动续上，位置不丢。
+    if (document.hidden) return
     forecastState.setCurrentTime(stepToTime(currentStep.value + 1))
   })
 }
 function stopPlayback() {
   clearNamedTimer('playback')
+}
+
+/**
+ * 默认自动播放（用户定稿：撤掉 ▶ 键）：进页面即推时间轴，推到末帧停。
+ * 不回绕——每推一帧发一次 forecast 请求，回绕会无限打 API（后端有"请求过于频繁"限流）。
+ * 想再看一遍：空格重播。
+ */
+let autoStarted = false
+watch(
+  maxSteps,
+  (n) => {
+    if (autoStarted || n <= 0) return
+    autoStarted = true
+    forecastState.setIsPlaying(true)
+    startPlayback()
+  },
+  { immediate: true }
+)
+
+/** 空格 = 播放/暂停；在输入框/可编辑区里不劫持（避免影响 slider 之外的键入） */
+function onKeydown(e: KeyboardEvent) {
+  if (e.code !== 'Space') return
+  const target = e.target as HTMLElement | null
+  if (target?.closest('input, textarea, select, [contenteditable="true"]')) return
+  e.preventDefault()
+  togglePlay()
+}
+
+/**
+ * 一次性提示（走 toast，不常驻占位）：
+ * ①撤掉 ▶ 键后怎么控制播放；②热力点的空间分布是示意性插值（原常驻脚注，W17 口径不减，
+ * 只是不再占面板位置）。
+ */
+function hintOnce() {
+  if (sessionStorage.getItem('gcs.forecast.hint')) return
+  sessionStorage.setItem('gcs.forecast.hint', '1')
+  showToast('空格键 播放/暂停')
+  showToast('热力点空间分布为示意性插值，非实测点位')
 }
 </script>
 
@@ -268,7 +349,7 @@ function stopPlayback() {
     <!-- ===== 上半：4 个指标按钮（2×2）===== -->
     <div class="btn-grid" data-overflow-exit="scroll">
       <div
-        v-for="ind in INDICATORS"
+        v-for="ind in CELLS"
         :key="ind.key"
         :class="[
           'btn-cell',
@@ -281,8 +362,10 @@ function stopPlayback() {
           :selecting="btnStates[ind.key].selecting"
           :selected="btnStates[ind.key].selected"
           :label="ind.label"
-          :status-text="`${(getConf(ind.key) * 100).toFixed(0)}%`"
-          :slider-value="btnStates[ind.key].selecting ? getConf(ind.key) : null"
+          :status-text="ind.key === GROWTH_CELL.key ? '' : `×${getConf(ind.key).toFixed(2)}`"
+          :slider-value="
+            btnStates[ind.key].selecting && ind.key !== GROWTH_CELL.key ? getConf(ind.key) : null
+          "
           :slider-min="0.8"
           :slider-max="1.2"
           :slider-step="0.05"
@@ -318,30 +401,25 @@ function stopPlayback() {
       </div>
     </div>
 
-    <!-- ===== 下半：时间轴（滑块收进统一卡片，点击才展开；专注模式与刻度跳年保留） ===== -->
+    <!-- ===== 下半：时间轴（裸露滑块；时间只在滑动时以气泡跟手显示，不常驻占位） ===== -->
     <div class="time-section">
       <div class="time-grid">
-        <div class="time-card">
-          <!-- 三态选择卡片（公共组件 SliderSelectCard）：默认=按钮，点击进入选择态才渲染滑块 -->
-          <SliderSelectCard
-            :selecting="timeCardOpen"
-            :selected="true"
-            label="时间轴"
-            :status-text="displayTime"
-            :slider-value="timeCardOpen ? currentStep : null"
-            :slider-min="0"
-            :slider-max="maxSteps"
-            :slider-step="1"
-            @toggle="timeCardOpen = true"
-            @update:slider-value="onTimelineSliderInput"
+        <div class="time-card" :style="{ '--pos': bubblePosCss }">
+          <span class="time-bubble">{{ displayTime }}</span>
+          <input
+            class="time-range"
+            type="range"
+            min="0"
+            :max="maxSteps"
+            step="1"
+            :value="currentStep"
+            aria-label="时间轴"
+            @input="onTimeRangeInput"
             @pointerdown="beginSliderFocusOnRange"
             @pointerup="endSliderFocus"
             @pointercancel="endSliderFocus"
           />
         </div>
-        <label class="gr-toggle time-granularity">
-          <input v-model="isYearMode" type="checkbox" />年
-        </label>
         <div class="time-slider-wrap">
           <div class="t-ticks">
             <span
@@ -351,23 +429,16 @@ function stopPlayback() {
               :class="{
                 't-tick--start': i === 0,
                 't-tick--end':
-                  i === YEAR_MARKS.length - 1 &&
-                  yearMarkPosition(m.year, isYearMode, maxSteps) >= 100,
+                  i === YEAR_MARKS.length - 1 && yearMarkPosition(m.year, maxSteps) >= 100,
               }"
-              :style="{ left: yearMarkPosition(m.year, isYearMode, maxSteps) + '%' }"
+              :style="{ left: yearMarkPosition(m.year, maxSteps) + '%' }"
               @click="jumpToYear(m.year)"
               >{{ m.label }}</span
             >
           </div>
         </div>
-        <div class="time-acts">
-          <button class="act-btn" @click="togglePlay">
-            {{ forecastState.isPlaying ? '⏸' : '▶' }}
-          </button>
-        </div>
       </div>
     </div>
-    <div class="forecast-note">空间分布为示意性插值，非实测点位。</div>
   </div>
 </template>
 
@@ -383,17 +454,20 @@ function stopPlayback() {
   gap: v-bind(cell16px);
 }
 
-/* 按钮网格：2 列 1.8fr，行高 0.8cell，间距 0.2cell */
+/* 按钮网格：2×2 自上而下读（货物/集装箱，活跃度/同比增速）。三格横排会让第四格
+   无处安放，也会变成左右扫读；竖排顺序与业务阅读一致。 */
 .btn-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1.8fr);
-  grid-auto-rows: v-bind(btnHeightCss);
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: minmax(0, 1fr);
   gap: v-bind(cell16px);
-  flex: 1;
+
+  /* 撑满面板剩余高度：原来 flex:none 固定 0.8cell，4×4 面板下面空出一大片 */
+  flex: 1 1 auto;
   min-height: 0;
 
-  /* 容量出口（c043 口径随 2026-09-30 反转废止，此处保留滚动可达性）：条目超出可见高时
-     不被 GCSPanel 的 overflow:hidden 裁掉，可滚可达（D21-2 同步） */
+  /* 容量出口（c043）：面板变矮时按钮不被 GCSPanel 的 overflow:hidden 裁掉，仍可滚可达。
+     单行 3 个指标在 1440/900 下不会触发滚动条；保留声明是为了小视口不静默截断。 */
   overflow-y: auto;
 }
 
@@ -453,36 +527,110 @@ function stopPlayback() {
 /* ===== 时间轴（滑块收进统一卡片；控件行高 0.8cell，与卡片行高同源） ===== */
 .time-section {
   flex-shrink: 0;
+
+  /* 气泡带：胶囊画在滑块上方这段留白里，居中于「情景行底边」与「滑块顶边」之间，
+     否则 bottom:100% 会直接压到情景按钮上（用户截图复现）。 */
+
+  padding-top: 20px;
+
+  /* 不再 margin-top:auto 顶到底：指标网格已 flex:1 吃掉剩余高度，
+     再贴底会在情景行与时间轴之间留一条空带 */
+  margin-top: 0;
 }
 
 .time-grid {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr;
   align-items: center;
-  column-gap: v-bind(cell8px);
 }
 
+/* 裸露滑块行：整行即一个可拖的 range；当前时间只在滑动时以气泡跟手显示 */
 .time-card {
+  position: relative;
   grid-column: 1;
   grid-row: 1;
-  height: v-bind(btnHeightCss);
-}
-
-.time-granularity {
-  grid-column: 2;
-  grid-row: 1;
-}
-
-.gr-toggle {
   display: flex;
   align-items: center;
-  gap: v-bind(cell8px);
+  height: v-bind(btnHeightCss);
+  padding: 0;
+
+  /* 不再套一层描边卡片：时间轴与浸没页的水位滑块同一种裸露形态，
+     外框只会让它看起来像「另一个可点的按钮」 */
+  border: none;
+  background: transparent;
+}
+
+.time-bubble {
+  position: absolute;
+  bottom: calc(100% + 4px);
+
+  /* 气泡在 padding-top 的留白带内垂直居中：4px 上移 + 20px 带高 ⇒ 视觉居中间距约 11px */
+  left: var(--pos, 0%);
+  transform: translateX(-50%);
+  padding: 2px 8px;
+  border-radius: var(--GCS-radius-md);
+  background: var(--GCS-color-primary);
+  color: var(--GCS-text-inverse);
   font-size: v-bind(smallFontSizeCss);
-  color: var(--GCS-text-secondary);
+  line-height: 1.2;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 2;
+  box-shadow: var(--GCS-shadow-md, 0 4px 12px rgb(0 0 0 / 18%));
+  transition: opacity var(--GCS-duration-fast, 0.15s);
+}
+
+.time-card:hover .time-bubble,
+.time-card:focus-within .time-bubble {
+  opacity: 1;
+}
+
+.time-range {
+  flex: 1;
+  appearance: none;
+  min-width: 0;
+
+  /* 命中区 24px（WCAG 2.5.8）：视觉轨道仍是 14px，多出来的高度由透明盒吃掉，
+     否则手机上手指按偏一两像素就滑不动。 */
+  height: 24px;
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+  margin: 0;
+}
+
+.time-range::-webkit-slider-runnable-track {
+  height: var(--GCS-slider-thumb-size);
+  border-radius: calc(var(--GCS-slider-thumb-size) / 2);
+  background: linear-gradient(to right, var(--GCS-border-default), var(--GCS-color-primary));
+}
+
+.time-range::-webkit-slider-thumb {
+  appearance: none;
+  width: var(--GCS-slider-thumb-size);
+  height: var(--GCS-slider-thumb-size);
+  border-radius: var(--GCS-radius-round);
+  background: var(--GCS-color-primary);
+  border: 2px solid var(--GCS-bg-panel);
+  box-shadow: var(--GCS-shadow-sm);
   cursor: pointer;
 }
 
-.gr-toggle input {
+.time-range::-moz-range-track {
+  height: var(--GCS-slider-thumb-size);
+  border-radius: calc(var(--GCS-slider-thumb-size) / 2);
+  background: linear-gradient(to right, var(--GCS-border-default), var(--GCS-color-primary));
+}
+
+.time-range::-moz-range-thumb {
+  width: var(--GCS-slider-thumb-size);
+  height: var(--GCS-slider-thumb-size);
+  border-radius: var(--GCS-radius-round);
+  background: var(--GCS-color-primary);
+  border: 2px solid var(--GCS-bg-panel);
+  box-shadow: var(--GCS-shadow-sm);
   cursor: pointer;
 }
 
@@ -498,10 +646,10 @@ function stopPlayback() {
   position: absolute;
   bottom: 0;
 
-  /* 与卡片内滑块同宽：卡片 1px 边框 + 8px 内边距各占 9px，滑块 width:80% 的两侧留白用 margin 10% 复刻 */
+  /* 与卡片内滑块同宽：卡片左右各 1px 边框 + 8px 内边距，滑块撑满剩余宽度 */
   left: 9px;
   right: 9px;
-  margin: 0 10%;
+  margin: 0;
   height: 18px;
 }
 
@@ -533,44 +681,8 @@ function stopPlayback() {
   transform: translateX(-100%);
 }
 
-.time-acts {
-  grid-column: 3;
-  grid-row: 1;
-  display: flex;
-  justify-content: center;
-}
-
-.act-btn {
-  padding: v-bind(cell8px) v-bind(cell16px);
-  background: var(--GCS-bg-container);
-  border: 1px solid var(--GCS-border-default);
-  border-radius: var(--GCS-radius-lg);
-  font-size: v-bind(labelFontSizeCss);
-  cursor: pointer;
-  color: var(--GCS-text-regular);
-}
-
-.act-btn:hover {
-  /* hover 底改通用 --GCS-bg-hover token（原用边框色充底）；
-     面板内操作钮与地图悬浮 GCSButton 职责可区分，抽 FlatButton 留待按钮体系重构 */
-  background: var(--GCS-bg-hover);
-}
-
 /* ing 态图标反色（其余视觉由 .btn-cell.ing 组合提供；选择卡片样式归 SliderSelectCard） */
 .btn-cell.ing .ind-icon {
   color: var(--GCS-text-inverse);
-}
-
-/* 数据口径脚注（W17）：热力散射点的**空间分布**是示意性插值（每港 40 点、按距离衰减加随机权重
-   铺在港口周围 0.025–0.05°，见 backend/src/modules/forecast/services/forecast-engine.ts
-   generateSpatialValues），**指标值本身仍是官方吞吐量/真数据派生**——脚注只披露空间口径，
-   不能让人以为数值也是编的。与 diversion 的 .transfer-note 同型（4×4 面板内一行小字）。
-   flex-shrink:0 且不占 .btn-grid 的 flex:1，故只压缩按钮网格的可滚动区，不改变其容量语义。 */
-.forecast-note {
-  flex-shrink: 0;
-  padding: 0 v-bind(cell8px);
-  font-size: v-bind(smallFontSizeCss);
-  line-height: 1.4;
-  color: var(--GCS-text-muted);
 }
 </style>

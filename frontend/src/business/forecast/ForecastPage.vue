@@ -18,6 +18,7 @@ import { ChartLoading } from '@/shared'
 import { BarChart, LineChart } from '@/visualization'
 
 import ForecastControlPanel from './components/ForecastControlPanel.vue'
+import { useDiversionShare } from './composables/useDiversionShare'
 import { useForecastLayer } from './composables/useForecastLayer'
 import { provideForecastOrchestrator } from './composables/useForecastOrchestrator'
 
@@ -33,6 +34,17 @@ const FORECAST_PANEL_ORDER: string[] = ['cargo', 'activity', 'container'].map(fo
 
 const forecastState = useForecastStore()
 const mapStore = useMapStore()
+
+/** G2：分流结论并入预测页——三港能吃到多少，跟着当前时点的年份走 */
+const { ports: sharePorts, total: shareTotal } = useDiversionShare()
+
+/** 万吨取整 + 千分位；占比取整百分比 */
+const shareTotalText = computed(() =>
+  shareTotal.value.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+)
+function sharePct(share: number): string {
+  return `${Math.round(share * 100)}%`
+}
 
 /**
  * P1-1 降级角标：只有接口显式标记 'engine-fallback' 才渲染。
@@ -74,7 +86,6 @@ useProfileSnapshot({
 function saveForecastState(): void {
   forecastState.saveState({
     currentTime: forecastState.currentTime,
-    timeGranularity: forecastState.timeGranularity,
     playSpeed: forecastState.playSpeed,
     activeIndicator: forecastState.activeIndicator,
     canalScenario: forecastState.canalScenario,
@@ -171,6 +182,7 @@ onUnmounted(() => {
         </GCSPanel>
         <GCSPanel
           v-if="!isStacked('bar')"
+          class="bar-panel"
           :w="4"
           :h="4"
           anchor="top-left"
@@ -179,13 +191,31 @@ onUnmounted(() => {
           draggable
           @drop="(z: HTMLElement) => onDrop('bar', z)"
         >
+          <!-- key：双轴↔单轴切换时强制重建实例。ECharts 的 notMerge:false + replaceMerge:['series']
+               只换系列、不删轴，轴数变少会留下上一轮的 TEU 幽灵右轴（同比增速把两指标并成百分比后量纲统一）。
+               键必须跟着「轴数」而不是 growthMode：切增速的那一帧 barUnitRight 还是旧值，
+               要等异步数据回来才变空，那时才真的少了一条轴。 -->
           <BarChart
+            :key="forecastState.chart.barUnitRight ? 'dual' : 'single'"
             title="港口对比"
             :x-data="forecastState.chart.barXData"
             :series="forecastState.chart.barSeries"
             :y-unit="forecastState.chart.barUnit"
             :y-unit-right="forecastState.chart.barUnitRight"
           />
+          <!-- G2：分流结论（三港分摊）并入预测页；无数据时整行不渲染，不留空壳 -->
+          <div
+            v-if="sharePorts.length"
+            class="share-line"
+            data-testid="diversion-share"
+            :title="`量产口径：西江→运河转移量 ${shareTotalText} 万吨，按港分摊`"
+          >
+            <span class="share-line__label">西江→运河</span>
+            <b class="share-line__total">{{ shareTotalText }}<i>万吨</i></b>
+            <span v-for="p in sharePorts" :key="p.id" class="share-line__port">
+              {{ p.name }} {{ sharePct(p.share) }}
+            </span>
+          </div>
           <ChartLoading v-if="forecastState.isRequesting" />
           <div
             v-if="isBarFallback"
@@ -200,6 +230,8 @@ onUnmounted(() => {
         <GCSPanel :w="4" :h="4" anchor="top-right" :offset-x="0" :offset-y="1.25">
           <ForecastControlPanel />
         </GCSPanel>
+      </template>
+      <template #layers>
         <GCSPanel :w="4" :h="4" anchor="top-right" :offset-x="0" :offset-y="5.5">
           <LayerControlPanel :layer-order="[...DEFAULT_LAYER_ORDER, ...FORECAST_PANEL_ORDER]" />
         </GCSPanel>
@@ -219,6 +251,51 @@ onUnmounted(() => {
 
 .forecast-page :deep(.GCS-panel) {
   pointer-events: auto;
+}
+
+/* G2 分流结论行：面板底部留 20px 白，份额行绝对定位落在白里。
+   不用流内块 + flex 压图表——流内块会让固定高面板溢 23px；
+   flex 压图表则把 ECharts 容器（height:100%）算成 0。 */
+.bar-panel {
+  position: relative;
+  padding-bottom: 20px;
+}
+
+.share-line {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  height: 20px;
+  align-items: center;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--GCS-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.share-line__label {
+  color: var(--GCS-text-muted);
+}
+
+.share-line__total {
+  color: var(--GCS-text-primary);
+  font-size: 13px;
+}
+
+.share-line__total i {
+  margin-left: 2px;
+  font-size: 10px;
+  font-style: normal;
+  color: var(--GCS-text-muted);
+}
+
+.share-line__port {
+  color: var(--GCS-text-secondary);
 }
 
 /* P1-1 降级角标：绝对定位覆盖在图表右上角，不参与布局流 ⇒ 正常路径（不渲染）布局零变化。

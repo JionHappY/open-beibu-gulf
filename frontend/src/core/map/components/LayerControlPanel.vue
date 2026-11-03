@@ -5,7 +5,7 @@
  * 底图互斥单选（baseLayerKey 为权威源）；显示顺序由 props.layerOrder 注入。
  */
 
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import { resolveLayerPanelState } from '@/core/map/layerAdapters'
 import { useBusinessLayers } from '@/core/map/composables/useBusinessLayers'
@@ -53,7 +53,7 @@ const mapStore = useMapStore()
 
 const layerCatalog = computed(() => mapStore.layerCatalog)
 const { manager: businessLayerManager } = useBusinessLayers()
-const { cellPixel, css } = useGCS()
+const { cellPixel, css, navCompact } = useGCS()
 // 解构出 CSS 变量供 v-bind() 使用（cell8px=0.1cell 面板边缘；cell16px=0.2cell 按钮间间隙）
 const { cell8px, cell16px } = css
 
@@ -63,6 +63,49 @@ const btnHeightCss = computed(() => `${cellPixel.value * ROW_HEIGHT_CELL}px`) //
 /** 字体大小：0.175cell = 14px（基准），0.1cell = 8px（小字） */
 const labelFontSizeCss = computed(() => `${cellPixel.value * 0.175}px`) // 14px
 const iconFontSizeCss = computed(() => `${cellPixel.value * 0.2}px`) // 16px
+
+/**
+ * 紧凑档（<640）按钮回到 GCS 的 2×1 尺寸。
+ *
+ * 依据（用户 2026-11-02 截图）：390 宽下原 `repeat(2, 1.8fr)` 会把按钮撑到 113px，
+ * 比 dock 单元（70）和城市按钮都宽一档，同一屏里出现两把尺子。
+ * 这里按「容器实际宽度反推 cell」，让按钮恒为 2cell×1cell，一行 3 个（窄）或 4 个（≥520）。
+ * 用 ResizeObserver 而不是窗口宽度：抽屉/控制台内宽度与窗口不等宽。
+ */
+const gridRef = ref<HTMLElement | null>(null)
+const gridWidth = ref(0)
+let gridResizeObserver: ResizeObserver | null = null
+onMounted(() => {
+  const el = gridRef.value
+  if (!el || typeof ResizeObserver === 'undefined') return
+  gridResizeObserver = new ResizeObserver((entries) => {
+    gridWidth.value = entries[0]?.contentRect.width ?? 0
+  })
+  gridResizeObserver.observe(el)
+})
+onUnmounted(() => {
+  gridResizeObserver?.disconnect()
+  gridResizeObserver = null
+})
+
+/** 紧凑档列数：可用宽 ≥520 放 4 个 2cell 按钮，否则 3 个 */
+const compactCols = computed(() => (gridWidth.value >= 520 ? 4 : 3))
+
+/** 紧凑档单元边长：按列数反推，封顶 cellPixel（70），下限 28 防除零/挤成线 */
+const compactCell = computed(() => {
+  const width = gridWidth.value
+  if (!width) return cellPixel.value
+  const gapPx = cellPixel.value * 0.2
+  const perButton = (width - gapPx * (compactCols.value - 1)) / (compactCols.value * 2)
+  return Math.max(28, Math.min(cellPixel.value, Math.floor(perButton)))
+})
+
+const compactGridStyle = computed(() => ({
+  '--layer-cols': String(compactCols.value),
+  '--layer-row-h': `${compactCell.value}px`,
+  '--layer-gap': `${Math.round(cellPixel.value * 0.2)}px`,
+  '--layer-font': `${Math.max(11, Math.round(compactCell.value * 0.24))}px`,
+}))
 
 /**
  * 图层按钮列表（按显示顺序）：业务条目以 BLM（业务图层管理器）registry 的
@@ -262,7 +305,13 @@ function handleToggle(key: string) {
 
 <template>
   <div class="layer-panel">
-    <div class="layer-grid" data-overflow-exit="scroll">
+    <div
+      ref="gridRef"
+      class="layer-grid"
+      :class="{ 'layer-grid--compact': navCompact }"
+      :style="navCompact ? compactGridStyle : undefined"
+      data-overflow-exit="scroll"
+    >
       <template v-for="item in panelRows" :key="item.key">
         <button
           v-if="item.kind === 'layer'"
@@ -327,6 +376,26 @@ function handleToggle(key: string) {
   height: 100%;
   align-content: start;
   overflow-y: auto;
+}
+
+/**
+ * 紧凑档：按钮恒为 2×1 GCS（宽 2 行高 1），一行 3/4 个。
+ * 列数与行高由 compactGridStyle 反推写入 CSS 变量，避免在样式里再写一套断点。
+ */
+.layer-grid--compact {
+  grid-template-columns: repeat(var(--layer-cols), 1fr);
+  grid-auto-rows: var(--layer-row-h);
+  gap: var(--layer-gap);
+}
+
+.layer-grid--compact .layer-btn {
+  flex-direction: row;
+  gap: 6px;
+  font-size: var(--layer-font);
+}
+
+.layer-grid--compact .layer-icon {
+  font-size: calc(var(--layer-font) * 1.1);
 }
 
 .layer-btn {

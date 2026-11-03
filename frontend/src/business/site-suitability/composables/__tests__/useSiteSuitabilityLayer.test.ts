@@ -82,6 +82,7 @@ describe('useSiteSuitabilityLayer（BLM 注册/更新 + 事务取消）', () => 
         weightsSource: 'ahp-default',
         kdeP99: 0,
         minLandFrac: 0.5,
+        maxLandFrac: 0.99,
       },
     })
     const scope = effectScope()
@@ -97,6 +98,8 @@ describe('useSiteSuitabilityLayer（BLM 注册/更新 + 事务取消）', () => 
     expect(call[0]).toBe('/site-suitability/map')
     expect(call[1].params.w_inundation).toBe(0.4299)
     expect(call[1].params.min_land_frac).toBe(0.5)
+    // 上限 0.99：只留"格内有水"的交界带，否则内陆格回流（G3 空间约束）
+    expect(call[1].params.max_land_frac).toBe(0.99)
     await vi.waitFor(() => expect(mockManager.updateData).toHaveBeenCalled())
     expect(mockManager.updateData.mock.calls[0][0]).toBe('site-suitability-main')
   })
@@ -126,6 +129,7 @@ describe('useSiteSuitabilityLayer（BLM 注册/更新 + 事务取消）', () => 
         weightsSource: 'ahp-default',
         kdeP99: 0,
         minLandFrac: 0.5,
+        maxLandFrac: 0.99,
       },
     })
     await new Promise((r) => setTimeout(r, 20))
@@ -235,6 +239,7 @@ describe('useSiteSuitabilityLayer（BLM 注册/更新 + 事务取消）', () => 
             weightsSource: 'ahp-default',
             kdeP99: 0,
             minLandFrac: 0.5,
+            maxLandFrac: 0.99,
           },
         },
       })
@@ -255,7 +260,7 @@ describe('阈值渲染（v4 后续迭代：只上图 score ≥ 0.7 的格）', (
     useMapStore().currentRenderer = fakeRenderer as never
   })
 
-  it('低分格被过滤、达标格上图（删过滤 ⇒ 全图实色红复现，必红）', async () => {
+  it('低分格不再被滤掉，按秩分档上图（改回阈值过滤必红）', async () => {
     mockApiRequest.mockResolvedValue({
       type: 'FeatureCollection',
       features: [
@@ -286,6 +291,7 @@ describe('阈值渲染（v4 后续迭代：只上图 score ≥ 0.7 的格）', (
         weightsSource: 'ahp-default',
         kdeP99: 0,
         minLandFrac: 0.5,
+        maxLandFrac: 0.99,
       },
     })
     const scope = effectScope()
@@ -297,12 +303,16 @@ describe('阈值渲染（v4 后续迭代：只上图 score ≥ 0.7 的格）', (
     })
     await scope.run(async () => undefined)
     await vi.waitFor(() => expect(mockManager.updateData).toHaveBeenCalled())
-    console.log('CALLS-FULL:', JSON.stringify(mockManager.updateData.mock.calls))
-    console.log('T4-DUMP:', JSON.stringify(mockManager.updateData.mock.calls))
-    const data = mockManager.updateData.mock.calls[0]?.[1]?.data
-    console.log('THRESH-DUMP:', JSON.stringify(mockManager.updateData.mock.calls))
-    const scores = (data as Array<{ properties: { score: number } }>).map((f) => f.properties.score)
-    // 0.95/0.75 达标上图，0.3/0.1 被阈值滤掉
-    expect(scores).toEqual([0.95, 0.75])
+    const data = mockManager.updateData.mock.calls[0]?.[1]?.data as {
+      features: Array<{ properties: { score: number; bin: number }; geometry: { type: string } }>
+    }
+    // 四个格全部上图：低分不再被滤掉（滤掉会让读者分不清"没有数据"与"分数低"），
+    // 改为按秩分档——0.1/0.3/0.75/0.95 各占一档
+    expect(data.features).toHaveLength(4)
+    // 要素顺序沿用响应顺序，档位按秩：0.95→3、0.75→2、0.3→1、0.1→0
+    expect(data.features.map((f) => f.properties.score)).toEqual([0.95, 0.75, 0.3, 0.1])
+    expect(data.features.map((f) => f.properties.bin)).toEqual([3, 2, 1, 0])
+    // 画的是方块，不是点（点的 kde 就是用户说的"彩色缓冲区"）
+    expect(data.features.every((f) => f.geometry.type === 'Polygon')).toBe(true)
   })
 })

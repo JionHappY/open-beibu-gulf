@@ -32,7 +32,9 @@ type ForecastTimeSeriesResult = Pick<TimeSeriesResponseParsed, 'series' | 'unit'
 }
 
 interface ForecastComparisonParams {
-  time: string
+  /** 省略即「不按时点裁剪」：响应本来就带回每港 historical+forecast 全量，
+   *  调用方（对比图）按时点本地取值，避免自动播放每帧重打一次接口 */
+  time?: string
   confidence: number
   /** 运河情景（仅 cargo 有意义；缺省不传参，后端默认 baseline） */
   scenario?: string
@@ -83,7 +85,7 @@ export const forecastAdapter = {
       {
         method: 'GET',
         params: {
-          time: params.time,
+          ...(params.time ? { time: params.time } : {}),
           confidence: params.confidence,
           ...scenarioParam(params.scenario),
         },

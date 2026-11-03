@@ -9,7 +9,7 @@
  *
  * 判据边界（如实声明）：本判据的**全仓断言只覆盖 `@/shared/constants/colors` 一族**——
  * 该族本笔前恰 1 处（被删的别名层），本笔后 0 处。全仓另有 5 处 `@/shared/…` 深路径
- * 不属本族、也不属本单元处置面（`business/diversion/panels.ts` 与
+ * 不属本族、也不属本单元处置面（`business/site-suitability/panels.ts` 与
  * `business/site-suitability/panels.ts` 的 `constants/panels` 是 barrel 缺项，
  * `shared/components/GCSModal.vue` 两处与 `ErrorBoundary.vue` 一处）；按 §四-5/§四-7
  * 不顺手跨模块改，已登记台账待裁。

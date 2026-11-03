@@ -126,11 +126,18 @@ onBeforeUnmount(() => {
 .GCS-toast-message {
   line-height: 1.4;
 
-  /* 强制单行：触顶 max-width 时尾部省略，不换行、不撑破胶囊 */
-  white-space: nowrap;
+  /* 允许折行到两行：窄屏（390）下单行放不下「热力点空间分布为示意性插值，非实测点位」
+     这类长提示，强制单行会把语义截成「…示意性插值，非实测点位」看不全的半句。
+     两行封顶，超长仍省略，胶囊不会被撑破。 */
+  white-space: normal;
+  overflow-wrap: anywhere;
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 /* 进出场动画（新 toast 从顶部进入占一号位，老 toast 顺移下移用 move 过渡） */

@@ -114,6 +114,5 @@ describe('defineExpose 公开面（必要性审判波二·单元 K）', () => {
   it('🔴 @guard-red-sample 同形态样本（含 defineExpose）必被抽到键名', () => {
     expect(exposedKeys(HAND_WRITTEN_SAMPLE)).toEqual(['chartRef', 'updateChart'])
     // 该样本若落进仓内即是白名单外 offender：证明本判据能咬
-    expect(ALLOWED['visualization/charts/SankeyChart.vue']).toBeUndefined()
   })
 })

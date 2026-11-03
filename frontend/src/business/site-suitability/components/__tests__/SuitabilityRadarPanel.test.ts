@@ -87,6 +87,7 @@ function fixture() {
       weightsSource: 'ahp-final',
       kdeP99: 0,
       minLandFrac: 0.5,
+      maxLandFrac: 0.99,
     },
   }
 }

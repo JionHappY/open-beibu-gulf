@@ -6,8 +6,8 @@ import type { LayerType } from '@/types'
 
 import {
   BusinessLayerManager,
-  layerFailureMessage,
   type LayerErrorPayload,
+  layerFailureMessage,
 } from '../BusinessLayerManager'
 
 /** mock catalog 条目 */
@@ -1148,5 +1148,101 @@ describe('D1 定向用例：创建失败不留半截 id（回滚三面）', () =
     expect(renderer.clearPendingVisibility).toHaveBeenCalledWith('d1-imagery')
     // add 确实尝试过（失败路径走的是契约 false，不是没进 adapter）
     expect(renderer.addImageOverlayLayer).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('图层生命周期收口：查询、移除与销毁', () => {
+  let store: ReturnType<typeof createMockMapStore>
+  let mgr: BusinessLayerManager
+  beforeEach(() => {
+    store = createMockMapStore()
+    mgr = new BusinessLayerManager(store)
+  })
+
+  it('updateData 未注册即抛错，并指名先 register（静默跳过会藏住接线错）', () => {
+    expect(() => mgr.updateData('ghost', { data: {} })).toThrow(/未注册/)
+    expect(() => mgr.updateData('ghost', { data: {} })).toThrow(/register/)
+    expect(mgr.has('ghost')).toBe(false)
+  })
+
+  it('remove 时渲染器清理抛错，仍删 registry 与目录条目（残留条目会把 A 页图层画到 B 页）', () => {
+    const renderer = createMock3dRenderer()
+    renderer.removeLayer.mockImplementation(() => {
+      throw new Error('renderer 崩了')
+    })
+    store.currentRenderer = renderer as unknown as MapRenderer
+
+    mgr.register('boom', {
+      label: '会炸的图层',
+      layerType: '3dtiles',
+      data: { url: '/static/a/tileset.json' },
+      visible: true,
+    })
+    expect(mgr.has('boom')).toBe(true)
+
+    expect(() => mgr.remove('boom')).not.toThrow()
+    expect(mgr.has('boom')).toBe(false)
+    expect(store.removeLayer).toHaveBeenCalledWith('boom')
+  })
+
+  it('removeAllFromRenderer 遇到单个 key 抛错不中断，继续清其余图层（registry 不动）', () => {
+    const renderer = createMock3dRenderer()
+    renderer.removeLayer.mockImplementation((k: string) => {
+      if (k === 'bad') throw new Error('bad layer')
+    })
+    store.currentRenderer = renderer as unknown as MapRenderer
+
+    mgr.register('bad', {
+      label: '坏图层',
+      layerType: '3dtiles',
+      data: { url: '/static/a/tileset.json' },
+      visible: true,
+    })
+    mgr.register('good', {
+      label: '好图层',
+      layerType: '3dtiles',
+      data: { url: '/static/b/tileset.json' },
+      visible: true,
+    })
+
+    expect(() => mgr.removeAllFromRenderer(renderer as unknown as MapRenderer)).not.toThrow()
+    // registry 保留：这是「清视觉实例、不注销」的语义
+    expect(mgr.has('bad')).toBe(true)
+    expect(mgr.has('good')).toBe(true)
+    expect(renderer.removeLayer).toHaveBeenCalledWith('good')
+  })
+
+  it('isLayerVisible 优先采信渲染器实况，渲染器没有该方法时退回 registry 意图', () => {
+    const renderer = createMock3dRenderer() as ReturnType<typeof createMock3dRenderer> & {
+      isLayerVisible?: (k: string) => boolean
+    }
+    store.currentRenderer = renderer as unknown as MapRenderer
+    mgr.register('q', {
+      label: '查询图层',
+      layerType: '3dtiles',
+      data: { url: '/static/a/tileset.json' },
+      visible: true,
+    })
+    // 渲染器无 isLayerVisible ⇒ 退回 meta.visible
+    expect(mgr.isLayerVisible('q')).toBe(true)
+
+    // 渲染器有该方法且回答 false（图层其实没上屏）⇒ 以实况为准，不谎报蓝色
+    renderer.isLayerVisible = () => false
+    expect(mgr.isLayerVisible('q')).toBe(false)
+
+    expect(mgr.isLayerVisible('not-registered')).toBe(false)
+  })
+
+  it('destroy 清空 registry、未上屏清单与 mapStore 引用', () => {
+    store.currentRenderer = createMock3dRenderer() as unknown as MapRenderer
+    mgr.register('a', { label: 'A', layerType: '3dtiles', data: null, visible: true })
+    expect(mgr.notMountedLayers().length).toBe(1)
+
+    mgr.destroy()
+
+    expect(mgr.has('a')).toBe(false)
+    expect(mgr.getMeta('a')).toBeNull()
+    expect(mgr.notMountedLayers()).toEqual([])
+    expect(mgr.isLayerVisible('a')).toBe(false)
   })
 })

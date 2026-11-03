@@ -31,7 +31,6 @@ const SKIP_DIR = /^(__tests__|__mocks__|node_modules|dist|\.local)$/
 
 /** 白名单：零生产消费但必须保留的返回面成员（每条都有实测理由，不是「先留着」） */
 const ALLOWED: Record<string, string[]> = {
-  'business/diversion/composables/useDiversionLayer.ts': ['clearDiversionLayers'],
   'core/map/composables/useOwnedLayers.ts': ['releaseAll'],
   'shared/composables/useLatestRequest.ts': ['getCurrentSignal'],
 }

@@ -134,42 +134,53 @@ describe('v4 异步任务域（/nest-api/task）', () => {
   const poll = (taskId: string) => request(app.getHttpServer()).get(`/nest-api/task/${taskId}`)
 
   it('V1 提交立即返回 taskId，且不等待计算完成', async () => {
-    // handler 睡 HANDLER_MS：只要提交不阻塞，返回耗时必然远小于它。
-    // 阈值取「睡眠时长的一半」而不是写死 200ms——本用例曾被全量跑（多 worker 抢 CPU）
-    // 拖到 240ms 而红，属墙钟脆断：真正要钉的是「不等计算完成」，不是某台机器的手速。
-    const HANDLER_MS = 1500
+    // 判据从「墙钟阈值」换成「可控闸门」：
+    // 原来的 `elapsed < HANDLER_MS / 2` 在多 worker 抢 CPU 时会把提交本身拖过阈值而红
+    // （AGENTS.md §五 记录在册的已知 flake）。真正要钉的不是某台机器的手速，而是
+    // 「提交返回时 handler 还没跑完」——用闸门直接测这件事，与调度快慢无关。
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let handlerFinished = false
+
     stub(
       'flood-areas',
       tracked('flood-areas', async () => {
-        await settle(HANDLER_MS)
+        await gate
+        handlerFinished = true
         return { waterLevel: 2.5, value: 42 }
       })
     )
 
-    const started = Date.now()
-    const res = await submit({
-      domain: 'flood-areas',
-      route: '/flood-analysis',
-      priority: 'high',
-      params: { waterLevel: 2.5 },
-    }).expect(ENVELOPE_OK)
-    const elapsed = Date.now() - started
+    try {
+      const res = await submit({
+        domain: 'flood-areas',
+        route: '/flood-analysis',
+        priority: 'high',
+        params: { waterLevel: 2.5 },
+      }).expect(ENVELOPE_OK)
 
-    expect(res.body.code).toBe(200)
-    expect(typeof res.body.data.taskId).toBe('string')
-    expect(res.body.data.status).toBe('pending')
-    // 若提交在等计算，耗时 ≥ HANDLER_MS（1500ms）；取一半为界，给全量并发留足余量
-    expect(elapsed).toBeLessThan(HANDLER_MS / 2)
+      expect(res.body.code).toBe(200)
+      expect(typeof res.body.data.taskId).toBe('string')
+      expect(res.body.data.status).toBe('pending')
+      // 若提交在等计算，这里 handler 必然已经跑完（闸门已放行）
+      expect(handlerFinished).toBe(false)
 
-    // 最终能查到结果（V2）
-    const done = await waitFor(async () => {
-      const r = await poll(res.body.data.taskId)
-      return r.body.data.status === 'done' ? r.body.data : undefined
-    })
-    expect(done.result).toEqual({ waterLevel: 2.5, value: 42 })
-    expect(done.progress).toBe(1)
-    expect(typeof done.startedAt).toBe('number')
-    expect(typeof done.finishedAt).toBe('number')
+      // 最终能查到结果（V2）
+      release()
+      const done = await waitFor(async () => {
+        const r = await poll(res.body.data.taskId)
+        return r.body.data.status === 'done' ? r.body.data : undefined
+      })
+      expect(done.result).toEqual({ waterLevel: 2.5, value: 42 })
+      expect(done.progress).toBe(1)
+      expect(typeof done.startedAt).toBe('number')
+      expect(typeof done.finishedAt).toBe('number')
+    } finally {
+      // 断言失败也要放行，否则在飞任务会卡住 drainQueue 并把后面用例拖红
+      release()
+    }
   })
 
   it('V2 查询返回完整视图字段（queuePosition/retryCount/时间戳）', async () => {

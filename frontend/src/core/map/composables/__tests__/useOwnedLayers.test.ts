@@ -11,7 +11,7 @@
  * onScopeDispose(releaseAll) 删掉，第一条立刻红。
  */
 import { mount } from '@vue/test-utils'
-import { defineComponent, h } from 'vue'
+import { computed, defineComponent, h, nextTick, watchEffect } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { BUSINESS_LAYER_MANAGER_KEY, useOwnedLayers } from '@/core'
@@ -44,6 +44,29 @@ const MOUNT_OPTS = (manager: unknown) => ({
 })
 
 describe('useOwnedLayers — 图层归属结构约束', () => {
+  it('owned 是响应式判据：注册/注销后 computed 立即重算（芯片高亮靠它，裸 Set 不行）', async () => {
+    const { manager } = fakeManager()
+    const seen: boolean[] = []
+    const wrapper = mount(
+      defineComponent({
+        setup() {
+          const owned = useOwnedLayers('t')
+          const hasA = computed(() => owned.owned.has('a'))
+          watchEffect(() => seen.push(hasA.value))
+          return { owned, hasA }
+        },
+        template: '<div />',
+      }),
+      MOUNT_OPTS(manager)
+    )
+    expect(seen[seen.length - 1]).toBe(false)
+    ;(
+      wrapper.vm as unknown as { owned: { register: (k: string, d: unknown) => boolean } }
+    ).owned.register('a', DESC)
+    await nextTick()
+    expect(seen[seen.length - 1]).toBe(true)
+  })
+
   it('注册即登记：作用域销毁自动清掉本 owner 全部图层（页面不写 remove）', () => {
     const { manager, calls } = fakeManager()
     const wrapper = mount(

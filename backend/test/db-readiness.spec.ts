@@ -15,8 +15,10 @@ import { DbService } from '../src/infra/db/db.service'
 // tools/db/verify-data-readiness.sql（部署后可直接对线上库执行）。
 //
 // 无库环境（V3_INTEGRATION_DB 未设）整体跳过，与 spatial.repository.spec 同口径。
-// 注：本地 beibu-gulf-data 若未建 roads_noded（d138 记录的环境缺口），route 段会显式变红——
-// 这是「环境未就绪」的 loud failure，CI（pgrouting 镜像 + ci-seed.sh）为基准。
+// 注：本地 beibu-gulf-data 若只导入过旧 v1 路网（只有 roads_edges，没有 v2 的
+// roads_vertices / route_class_profile），route 段会显式变红——这是「环境未就绪」的
+// loud failure，CI（pgrouting 镜像 + ci-seed.sh）为基准。缺表时由段首「先决条件」用例
+// 指名缺哪个关系、该跑哪个脚本，依赖它的两条用例跳过，不再各抛一次 relation does not exist。
 const withDb = process.env.V3_INTEGRATION_DB !== undefined
 
 /** 生产补丁落地自检锚值（2026-09-12 自检：12 / 1 / valid / 20982.70） */
@@ -120,6 +122,30 @@ describe.skipIf(!withDb)('数据就绪守卫（真库 / beibu-gulf-data）', () 
   // ─────────── route 域：有向图结构（2026-09-13 v2 质变） ───────────
 
   describe('route 域：roads_edges 有向图（迁移一致性）', () => {
+    /** v2 路网的必需关系：缺失时给出导入指引，并让依赖它们的用例跳过（只留一条红） */
+    let missingRelations: string[] = []
+    beforeAll(async () => {
+      const res = await db.query<{ tablename: string }>(
+        `SELECT tablename FROM pg_tables
+          WHERE schemaname = 'public'
+            AND tablename IN ('roads_edges', 'roads_vertices', 'route_class_profile')`
+      )
+      const have = new Set(res.rows.map((r) => r.tablename))
+      missingRelations = ['roads_edges', 'roads_vertices', 'route_class_profile'].filter(
+        (t) => !have.has(t)
+      )
+    })
+
+    it('先决条件：v2 路网的三个关系都在（缺表时给导入指引，而不是抛 relation does not exist）', () => {
+      // 本地库的常见形态：旧 v1 只有 roads_edges，没有 v2 的 vertices / 等级档。
+      // 直接跑下面的查询只会抛 `relation "roads_vertices" does not exist`，
+      // 看日志的人不知道该跑哪个脚本——所以先在这里指名缺什么、该跑什么。
+      expect(
+        missingRelations,
+        `缺少关系：${missingRelations.join('、')} —— 先跑 tools/roads/roads-graph-build.sql（v2 按 OSM node id 建图）`
+      ).toEqual([])
+    })
+
     it('pgrouting 扩展已安装', async () => {
       const res = await db.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM pg_extension WHERE extname = 'pgrouting'`
@@ -135,7 +161,8 @@ describe.skipIf(!withDb)('数据就绪守卫（真库 / beibu-gulf-data）', () 
       expect(Number(res.rows[0].n)).toBeGreaterThan(0)
     })
 
-    it('每条边的两端都在 roads_vertices 中（缺顶点会让 pgr 静默丢边）', async () => {
+    it('每条边的两端都在 roads_vertices 中（缺顶点会让 pgr 静默丢边）', async (ctx) => {
+      if (missingRelations.length) ctx.skip()
       const res = await db.query<{ n: string }>(
         `SELECT count(*)::text AS n
            FROM roads_edges e
@@ -145,7 +172,8 @@ describe.skipIf(!withDb)('数据就绪守卫（真库 / beibu-gulf-data）', () 
       expect(res.rows[0].n).toBe('0')
     })
 
-    it('道路等级全部在 route_class_profile 中有定义（未映射等级会静默变成不可通行）', async () => {
+    it('道路等级全部在 route_class_profile 中有定义（未映射等级会静默变成不可通行）', async (ctx) => {
+      if (missingRelations.length) ctx.skip()
       const res = await db.query<{ n: string; classes: string | null }>(
         `SELECT count(*)::text AS n, string_agg(DISTINCT e.class, ', ') AS classes
            FROM roads_edges e

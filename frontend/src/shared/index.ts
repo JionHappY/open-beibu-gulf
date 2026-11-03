@@ -2,6 +2,8 @@
 // 组件经 index.ts 聚合导出，消费方一律走 @/shared，禁止深路径穿透。
 export * from './composables/useApiRequest'
 export * from './composables/useAuth'
+export * from './composables/useEscapeClose'
+export * from './composables/useFocusTrap'
 export * from './composables/useFavorites'
 export * from './composables/useLatestRequest'
 export * from './composables/usePanelDrag'
@@ -45,5 +47,6 @@ export { default as PaginatedListPanel } from './components/PaginatedListPanel.v
 export { default as PanelTitle } from './components/PanelTitle.vue'
 export { default as PlanSaveModal } from './components/PlanSaveModal.vue'
 export { default as SliderSelectCard } from './components/SliderSelectCard.vue'
+export { default as SliderNaked } from './components/SliderNaked.vue'
 // 图标名表：名 → 内联 SVG path 的唯一权威源
 export * from './components/icons'

@@ -327,6 +327,20 @@ body {
   display: none;
 }
 
+/* 手机档（<640px）：地图只占上半屏，下半屏让给控制台。
+   断点由 useGCS 的 layoutTierFor 判定、以 body class 下发，这里不重复写媒体查询。 */
+.layout-console .unified-map-wrapper {
+  height: 46vh;
+  inset: auto 0;
+}
+
+/* 手机档 dock 半圆展开时收起控制台：两层按钮叠在一起就谁也读不清了。
+   中转带是例外——它是拖拽的起点，手指还按着时芯片不能先从屏上消失；
+   位置在控制台顶，压不到弧上。 */
+.dock-fan-open .mobile-console > :not(.console-rail) {
+  visibility: hidden;
+}
+
 /* 面板内滚动条统一走主题 token（暗色不再出现 UA 浅色条） */
 .GCS-panel * {
   scrollbar-width: thin;
@@ -395,7 +409,7 @@ body {
 /* 通用 LineChart/BarChart 挂载点（预测页折线/柱状直接作为 GCSPanel 内容）：
    外层 .line-chart-container/.bar-chart-container 被 .GCS-panel > * 改 auto 后，
    内部 height:100% 的 .line-chart/.bar-chart 失去高度参考而塌缩为 0。直接给挂载点固定高度，
-   并反向撑开 auto 外层容器；diversion 内嵌 .bar-chart 同值命中，与 R2 一致不冲突。 */
+   并反向撑开 auto 外层容器；业务页内嵌 .bar-chart 同值命中，与 R2 一致不冲突。 */
 .GCS-drawer__body .GCS-panel .line-chart,
 .GCS-drawer__body .GCS-panel .bar-chart {
   height: 220px !important;
@@ -501,7 +515,10 @@ body {
 .gcs-chip.sel {
   background: var(--GCS-bg-active);
   border-color: var(--GCS-color-primary);
-  color: var(--GCS-color-primary);
+
+  /* 选中态文字对 bg-active 只有 4.34:1（12px 正文要 4.5），换 primary-hover 一档：
+     同色系、更深，对 bg-active 5.7:1；边框仍用 primary 保持品牌色不变 */
+  color: var(--GCS-color-primary-hover);
   font-weight: 600;
 }
 
