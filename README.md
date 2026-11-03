@@ -84,6 +84,8 @@ psql -f db/db-schema.sql ...
 未验证（本仓为源码级抽取，未从零装依赖）：
 
 - `npm install` 从零安装（本次验证借用主仓 `node_modules`）；
+- 后端**运行时**启动：已用 `JWT_SECRET=… PORT=3001 node dist/src/main.js` 实测，Nest 路由正常挂载
+  （本仓不内置 dotenv：`.env` 不会自动读入，需按上面的 `set -a` 显式导出）；
 - `docker compose up` 起库后 5 个路由的端到端连通（E2E 未随仓）。
 
 ## 许可
