@@ -27,7 +27,7 @@ backend/       NestJS 后端（src 源码 + test 用例 + data 样例 + static �
 db/            建表与种子 SQL（PostGIS）
 data/          数据来源与假设登记（见 data/README.md）
 docs/          3 张界面截图
-Dockerfile / docker-compose.yml / nginx.conf   部署用（本地开发不需要）
+deploy/        部署用（Dockerfile / docker-compose.yml / nginx.conf），本地开发不需要
 ```
 
 仓内只保留跑起来必需的配置：`package.json`、`package-lock.json`、`tsconfig.json`
@@ -50,7 +50,7 @@ npm --prefix backend test
 npm run dev:server       # http://localhost:3000
 
 # 数据库
-docker compose up -d postgis
+docker compose -f deploy/docker-compose.yml up -d postgis
 psql -f db/db-schema.sql ...
 ```
 

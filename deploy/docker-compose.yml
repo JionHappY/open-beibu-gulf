@@ -1,3 +1,4 @@
+name: beibu-gulf-open
 # 北部湾港 WebGIS 智慧分析平台 —— 本地/生产一键编排（v3 三服务版）
 # 用法：docker compose up --build
 #   前端：      http://localhost:80（nginx，同域反代）
@@ -7,8 +8,8 @@ services:
   # 前端 + nginx（唯一对外暴露 80/443；API/DEM/瓦片均同域反代）
   app:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: deploy/Dockerfile
       # 2026-08-09：前端构建需要天地图 key（vite build 打包进产物）。
       # 值读自 compose 同目录 .env（服务器部署时在项目目录配置 VITE_TIANDITU_KEY=新key）
       args:
@@ -27,28 +28,28 @@ services:
     # ≈ 1300m。原注释按「上限之和 < 物理内存」配置，漏算宿主机开销，是 09-10 OOM 成因。
     mem_limit: 64m
     env_file:
-      - ./backend/.env
+      - ../backend/.env
     environment:
       - NODE_ENV=production
     volumes:
       # 静态真数据：app 与 nest 共享同一宿主目录（nest 侧 ro；数据资产不烘焙进镜像）
-      - ./backend/data:/app/backend/data
+      - ../backend/data:/app/backend/data
       # DEM 静态产物（tif 67MB 被 gitignore、CI 镜像不含；本地含 → CI/本地镜像不一致）。
-      - ./backend/static/dem:/app/backend/static/dem
-      - ./backend/static/terrain:/app/backend/static/terrain
+      - ../backend/static/dem:/app/backend/static/dem
+      - ../backend/static/terrain:/app/backend/static/terrain
       # 平陆运河 3D Tiles + 离线影像块（9.8MB 随仓库分发，与 dem/terrain 同走宿主挂载、不烘焙进镜像）。
       # 缺这一行的后果是静默的：nginx 的 /static/ alias 指向空目录 → 前端 fetch 404 被 catch 成
       # 一条 logger.warn，控制面板连按钮都不渲染，线上看不出"接了 3D Tiles"这件事失败过。
-      - ./backend/static/pinglu:/app/backend/static/pinglu
+      - ../backend/static/pinglu:/app/backend/static/pinglu
       # 钦州港交付包 + 自建层 / 城区桥（B5 裁定①，2026-10-05：gitignored 大资产走宿主挂载）。
       # ⚠ 部署顺序：先把两个目录放上服务器（scp 到 /opt/beibu-gulf/backend/static/）再 up -d——
       # Docker 对缺失的宿主路径会自动建成空目录，得到「挂载成功但 404」的假象（§8.21 落地链）。
       # 部署前哨在 CI deploy 步骤（.github/workflows/ci.yml「阶段 1.6」）：compose pull/up 之前
       # 逐项 test -s 五个 tileset.json，缺任一即 fail-loud 且不启动新容器（§8.21「外部挂载 + 部署前哨」）。
-      - ./backend/static/qinzhou-port:/app/backend/static/qinzhou-port
-      - ./backend/static/bridges-city:/app/backend/static/bridges-city
+      - ../backend/static/qinzhou-port:/app/backend/static/qinzhou-port
+      - ../backend/static/bridges-city:/app/backend/static/bridges-city
       # TLS 证书（可选）：将 fullchain.pem + privkey.pem 放入 ./certs/ 即启用 HTTPS
-      - ./certs:/etc/nginx/certs:ro
+      - ../certs:/etc/nginx/certs:ro
     ports:
       - '80:80'
       - '443:443'
@@ -76,7 +77,7 @@ services:
     env_file:
       # JWT_SECRET 等运行时密钥由部署侧 .env 注入，不烘焙进镜像
       #（原仅 app 服务挂 env_file，nest 靠"注释约定"注入 → 容器实际拿不到，启动即 FATAL）
-      - ./backend/.env
+      - ../backend/.env
     environment:
       NODE_ENV: production
       # 端口统一 3000（nginx 反代目标不变）；PG 走 compose 服务名 postgis
@@ -105,7 +106,7 @@ services:
       APP_IMAGE_TAG: nest-${IMAGE_TAG:-nest-latest}
       # JWT_SECRET 由部署 .env 注入（backend/.env），不烘焙进镜像
     volumes:
-      - ./backend/data:/app/backend/data:ro
+      - ../backend/data:/app/backend/data:ro
     depends_on:
       postgis:
         condition: service_healthy
