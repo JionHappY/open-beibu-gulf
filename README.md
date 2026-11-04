@@ -22,13 +22,17 @@
 ## 目录
 
 ```
-frontend/           Vue 3 前端（src 源码 + public 静态资产 + e2e 未随仓）
-backend/            NestJS 后端（src 源码 + test 用例 + data 样例 + static 元数据）
-db/                 建表与种子 SQL（PostGIS）
-data/               数据来源与假设登记（见 data/README.md）
-docker-compose.yml  PostGIS 服务
-Dockerfile          后端镜像
+frontend/      Vue 3 前端（src 源码 + public 静态资产）
+backend/       NestJS 后端（src 源码 + test 用例 + data 样例 + static 元数据）
+db/            建表与种子 SQL（PostGIS）
+data/          数据来源与假设登记（见 data/README.md）
+docs/          3 张界面截图
+Dockerfile / docker-compose.yml / nginx.conf   部署用（本地开发不需要）
 ```
+
+仓内只保留跑起来必需的配置：`package.json`、`package-lock.json`、`tsconfig.json`
+（前端/后端各自的 `vite.config.js`、`vitest.config.*`、`tsconfig*.json` 随目录）。
+**不带** lint / 依赖图 / commit hook 之类工具链配置——它们不参与运行，也不参与测试。
 
 ## 快速开始
 
@@ -67,7 +71,8 @@ psql -f db/db-schema.sql ...
 | `docs/`（论文期文档，83 件） | 不带 |
 | `scripts/`、`.github/`、`.husky/` 门禁 | 不带 |
 | 大体积 DEM / 倾斜摄影 / 影像 | 只带元数据 |
-| 完整 CI 脚本（ci:local 等） | 只留 `test` / `typecheck` / `build` / `lint` |
+| 完整 CI 脚本（ci:local 等） | 只留 `dev` / `build` / `test` / `typecheck` |
+| lint / 依赖图 / commit hook / e2e 配置（eslint、dependency-cruiser、husky、playwright） | 不带：不参与运行与测试 |
 | `backend/test/data-freshness.spec.ts`（比对数据戳记与 git 改动日） | 不带：本仓单次提交必然误红，语义依赖主仓逐日提交历史 |
 
 ## 验证状态（2026-11-04）
