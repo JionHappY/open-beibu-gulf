@@ -103,7 +103,7 @@ describe('planSchema（存量记录形态回归：fixture 固化，环境无关�
   })
 
   // 能红性：把 createdAt/updatedAt 改回 z.string()，下列两条即失败。
-  // 依据：DB 里两列是 TEXT 且无 NOT NULL（tools/db/db-schema.sql:22-23），null 是合法存量值。
+  // 依据：DB 里两列是 TEXT 且无 NOT NULL（database/01-schema.sql:22-23），null 是合法存量值。
   it('🔴 createdAt/updatedAt 为 null 时仍通过（W45：DDL 无 NOT NULL）', () => {
     const plan = { ...legacyPlanFixtures[0], createdAt: null, updatedAt: null }
     const result = planSchema.safeParse(plan)

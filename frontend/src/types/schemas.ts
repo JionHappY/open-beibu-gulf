@@ -370,7 +370,7 @@ export const planSchema = z.object({
   savedXiaoqu: z.array(z.unknown()).optional(),
   // weights 由后端持久化（旧数据 null），前端声明但当前不消费
   weights: z.record(z.string(), z.number()).nullable().optional(),
-  // 两列在 DDL 里是 TEXT 且无 NOT NULL（tools/db/db-schema.sql:22-23），存量行可为 null；
+  // 两列在 DDL 里是 TEXT 且无 NOT NULL（database/01-schema.sql:22-23），存量行可为 null；
   // 契约写必填时一条 null 行会让整批 plans 解析失败（W45，同类缺陷 f2093c95 修过一次）
   createdAt: z.string().nullable(),
   updatedAt: z.string().nullable(),
@@ -514,7 +514,7 @@ export const favoriteItemSchema = z.object({
   lng: z.number().nullable(),
   lat: z.number().nullable(),
   snapshot: z.record(z.string(), z.unknown()).nullable().optional(),
-  // 同上：favorites.created_at 为 TEXT NULL（tools/db/db-schema.sql:81），null 须透传
+  // 同上：favorites.created_at 为 TEXT NULL（database/01-schema.sql:81），null 须透传
   // 而不是让整批收藏解析失败
   savedAt: z.string().nullable(),
 })
