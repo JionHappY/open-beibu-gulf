@@ -18,7 +18,6 @@ services:
     # 镜像由 CI 构建推送 GHCR（服务器 1.6G 内存扛不住 docker 内构建：vite/nest/pip
     # 峰值 3-5G 会 OOM 卡死系统——部署只 pull 不 build）；build 段保留供本地 dev 用。
     image: ghcr.io/andy38586/beibu-gulf-project:app-${IMAGE_TAG:-app-latest}
-    container_name: beibu-gulf-webgis
     # 削峰（2026-09-10，15:30 修订；算法服务退役后为三容器）：为每容器设上限以防单容器失控。
     # 实测 nginx+静态驻留仅 8.4MB，128m → 64m（仍有 7 倍余量）。
     # ⚠️ 关键澄清：mem_limit 是「上限」不是「预留」——调低它**不会**释放物理内存，
@@ -70,7 +69,6 @@ services:
       context: ./backend
       dockerfile: Dockerfile.nest
     image: ghcr.io/andy38586/beibu-gulf-project:nest-${IMAGE_TAG:-nest-latest}
-    container_name: beibu-nest
     # 削峰（15:30 修订）：实测稳态仅 43MB（原注释「~250MB」高估约 6 倍）；320m → 192m。
     # 属防御性收紧防单容器失控，**不释放物理内存**（mem_limit 是上限非预留）。
     mem_limit: 192m
@@ -140,7 +138,6 @@ services:
     #   ② 防止将来有人把 image 改成可拉取 tag 时静默改变行为。
     image: local/postgis-pgrouting:16-3.4
     pull_policy: never
-    container_name: beibu-postgis
     # 削峰（15:30 修订）：实测稳态仅 95MB（原注释「150-300MB」为估算）；384m → 320m。
     # 属防御性收紧防单容器失控，**不释放物理内存**（mem_limit 是上限非预留）。
     # 限参（shared_buffers/work_mem 小档）保留；max_connections=20 与 nest/算法池式连接匹配
@@ -160,9 +157,9 @@ services:
       # ⇒ 现场永久丢失，只能凭 dmesg/cgroup 反证"非 OOM、非段错误、非磁盘"，成因不可考。
       #
       # 现在改为 logging_collector 落盘到 beibu-pglogs 卷 ⇒ 跨容器重建仍可查。
-      # ⚠️ 代价（务必知道）：开启后 stderr 被收集器接管，**`docker logs beibu-postgis` 会变得很安静**。
-      #    改用： docker exec beibu-postgis sh -c 'ls -lt /var/log/postgresql/ | head'
-      #           docker exec beibu-postgis sh -c 'tail -100 $(ls -t /var/log/postgresql/*.log | head -1)'
+      # ⚠️ 代价（务必知道）：开启后 stderr 被收集器接管，**`docker logs <postgis 容器>` 会变得很安静**。
+      #    改用： docker compose exec postgis sh -c 'ls -lt /var/log/postgresql/ | head'
+      #           docker compose exec postgis sh -c 'tail -100 $(ls -t /var/log/postgresql/*.log | head -1)'
       # ⚠️ 留存缺口：PG **不会自动删除**旧日志文件（只有轮转、没有保留策略）。当前配置
       #    每 20MB 或每 1 天轮转一个文件，长期会缓慢累积。建议在宿主机加一条定时清理，如：
       #      find /var/lib/docker/volumes/beibu-gulf-project_beibu-pglogs/_data -name '*.log' -mtime +30 -delete
@@ -196,6 +193,8 @@ services:
       - beibu-pgdata:/var/lib/postgresql/data
       # 日志落盘卷：让 PG 日志跨容器重建存活（见上方 command 段的起因说明）
       - beibu-pglogs:/var/log/postgresql
+      # 建表 SQL 只读挂载：README 的初始化循环在容器内执行 /database/0*.sql
+      - ../database:/database:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U postgres -d beibu-gulf-data']
       interval: 5s
