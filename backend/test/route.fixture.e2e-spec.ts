@@ -9,7 +9,7 @@ import { AppModule } from '../src/app.module'
 //
 // 为什么单独成文件：本套件的期望拓扑来自 `backend/test/seed/roads-graph-fixture.sql`
 //（3 条合成边 A/B/C，坐标 108.6/21.6 等测点，其中 edge C 是 oneway=1 的单向边），
-// 而该夹具经 `ci-seed.sh` 第 ④ 步只灌 CI 的临时库，seed 注释明令「**严禁灌 beibu-gulf-data/生产库**」。
+// 而该夹具 `backend/test/seed/roads-graph-fixture.sql` 只灌 CI 的临时库，seed 注释明令「**严禁灌 beibu-gulf-data/生产库**」。
 // ⇒ 在任何"有真实路网"的机器上，这里断言的拓扑根本不存在，跑必失败（实测 2 failed）。
 //
 // 故门控变量**独立**为 V3_ROADS_FIXTURE，而非项目级的 V3_INTEGRATION_DB：

@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common'
 
 import { DbService } from '../../../infra/db/db.service'
 
-// 选址统一因子格网取数（SQL 收口本层；表与列见 tools/db/db-schema-gis.sql
+// 选址统一因子格网取数（SQL 收口本层；表与列见 database/02-schema-gis.sql
 // suitability_cells 段与 tools/site-suitability/materialize-cells.sql）。
 
 interface SuitabilityCellRow {
@@ -38,7 +38,7 @@ export class SiteSuitabilityRepository {
    * **类目量 land_class 取众数**（AVG 会把类别号平均成无意义的数）。
    *
    * 出库经纬度与原聚合分组都显式 ST_Transform 到 4326：源表 geom 为 4490
-   * （db-schema-gis.sql），前端契约只认 4326，不依赖「两个地理坐标系数值接近」。
+   * （02-schema-gis.sql），前端契约只认 4326，不依赖「两个地理坐标系数值接近」。
    */
   async fetchCellsAt(
     minLandFrac: number,

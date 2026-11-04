@@ -12,12 +12,12 @@ import { DbService } from '../src/infra/db/db.service'
 //
 // 定位：把「仓库脚本 ↔ 库对象」的一致性固化为断言。任何迁移脚本 / seed 漂移
 //（boundary 导入被删、路由索引漏建）都会在这里变红。生产侧同款只读检查见
-// tools/db/verify-data-readiness.sql（部署后可直接对线上库执行）。
+// database/verify-readiness.sql（部署后可直接对线上库执行）。
 //
 // 无库环境（V3_INTEGRATION_DB 未设）整体跳过，与 spatial.repository.spec 同口径。
 // 注：本地 beibu-gulf-data 若只导入过旧 v1 路网（只有 roads_edges，没有 v2 的
 // roads_vertices / route_class_profile），route 段会显式变红——这是「环境未就绪」的
-// loud failure，CI（pgrouting 镜像 + ci-seed.sh）为基准。缺表时由段首「先决条件」用例
+// loud failure，CI（pgrouting 镜像 + 手动灌入 database/ *.sql）为基准。缺表时由段首「先决条件」用例
 // 指名缺哪个关系、该跑哪个脚本，依赖它的两条用例跳过，不再各抛一次 relation does not exist。
 const withDb = process.env.V3_INTEGRATION_DB !== undefined
 
@@ -87,7 +87,7 @@ describe.skipIf(!withDb)('数据就绪守卫（真库 / beibu-gulf-data）', () 
   // ─────────── 选址域：物化表行数与 NULL 对账（d144） ───────────
   //
   // CI 合成种子只灌 7 格 suitability_cells；terrain_factors / access_factors 不在
-  // CI seed 内，故 access_factors 的行数对账只进生产 SQL（verify-data-readiness.sql）。
+  // CI seed 内，故 access_factors 的行数对账只进生产 SQL（verify-readiness.sql）。
   describe('选址域：物化表行数与 NULL 对账', () => {
     it('suitability_cells 行数 > 0 且结构列无 NULL；可空因子计数可查', async () => {
       const res = await db.query<{
@@ -225,8 +225,8 @@ describe.skipIf(!withDb)('数据就绪守卫（真库 / beibu-gulf-data）', () 
 
   // ─────────── 迁移登记（z050）：拦住「代码上线、库没跟上」 ───────────
   //
-  // 只断言「表存在且非空」：不在此处手抄迁移清单（清单在 tools/db/schema-migrations.sql，
-  // 抄一份进来即是 RC1 的第二副本）。CI 由 ci-seed.sh 灌 schema-migrations.sql；
+  // 只断言「表存在且非空」：不在此处手抄迁移清单（清单在 database/04-migrations.sql，
+  // 抄一份进来即是 RC1 的第二副本）。CI 手动灌入 database/04-migrations.sql；
   // 生产/本地库须先跑一次历史补录（步骤见该脚本头注释）。
   describe('迁移登记：schema_migrations', () => {
     it('schema_migrations 表存在且已补录（非空）', async () => {

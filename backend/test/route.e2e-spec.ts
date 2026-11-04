@@ -14,7 +14,7 @@ import { AppModule } from '../src/app.module'
 //
 // ⚠️ 夹具依赖的用例不在此文件（2026-09-15 拆分原因）：
 // 原文件里有两条用例断言的是**合成夹具图**（backend/test/seed/roads-graph-fixture.sql：3 条合成边
-// A/B/C，坐标 108.6/21.6 等假点，其中 edge C 是 oneway=1 的单向边）。该夹具经 ci-seed.sh 第 ④ 步
+// A/B/C，坐标 108.6/21.6 等假点，其中 edge C 是 oneway=1 的单向边）。该夹具经 backend/test/seed/roads-graph-fixture.sql 手动灌入
 // 灌入 CI 临时库，而 seed 注释明令「**严禁灌 beibu-gulf-data/生产库**」——所以在任何"有真实路网"的机器上，
 // 这两条的期望拓扑根本不存在，必然失败（实测：本地真库 2 failed → watchdog RESULT_FAILED_TESTS → 退出 1，push 被拦）。
 //

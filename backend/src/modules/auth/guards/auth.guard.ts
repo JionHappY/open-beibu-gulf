@@ -14,7 +14,7 @@ import { UsersRepository } from '../repositories/users.repository'
  * 带有效 Cookie 刷新页面即被登出（登录态无法跨刷新保持）。
  * 收口做法：视图字段集必须 ⊇ 前端消费侧的必填字段集。
  *
- * `created_at` 列当前可为空（`db-schema.sql` 历史遗留），故如实标注 nullable；
+ * `created_at` 列当前可为空（`01-schema.sql` 历史遗留），故如实标注 nullable；
  * 新建用户由 `UsersRepository.create()` 保证有值。
  */
 export interface AuthUserView {

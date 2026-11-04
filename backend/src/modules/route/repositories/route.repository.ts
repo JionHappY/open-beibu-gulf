@@ -345,7 +345,7 @@ JOIN ${ROUTING_TABLE} r ON r.id = t.edge_id
    * 该写法是迁移期留下的，因为当时 `pgr_withPoints` 恒返 0 行、几何拼接从未被执行而没暴露；
    * 2026-09-10 寻路修好后第一次跑到即 500（实测）。
    *
-   * 出库坐标统一显式 ST_Transform 到 4326：源表 geom 为 4490（db-schema-gis.sql），
+   * 出库坐标统一显式 ST_Transform 到 4326：源表 geom 为 4490（02-schema-gis.sql），
    * 前端契约只认 4326，不能依赖「两个地理坐标系数值接近」的隐式口径。
    */
   async segmentGeometry(
